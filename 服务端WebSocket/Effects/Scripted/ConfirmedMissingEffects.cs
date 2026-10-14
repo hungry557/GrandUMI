@@ -7,7 +7,7 @@ namespace GrandUMI.Effects.Scripted;
 internal static class ConfirmedMissingHelpers
 {
     public static bool HasProperty(CardInstance card, string property)
-        => card.Info.Property.Split('/', StringSplitOptions.RemoveEmptyEntries).Contains(property);
+        => card.HasProperty(property);
 
     public static CardInstance? BattleOpponent(GameState state, int owner, Guid selfId)
     {
@@ -145,7 +145,7 @@ public sealed class OP12_081_Koala : IScriptedEffect
             var battle = ctx.State.CurrentBattle;
             if (battle?.AttackerCardId != ctx.Source.Id || !battle.TargetIsLeader) return;
             if (me.Characters.Count(card => ctx.State.CurrentCostOf(ctx.OwnerIndex, card) >= 8) >= 2)
-                AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+                await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
             return;
         }
 
@@ -155,6 +155,13 @@ public sealed class OP12_081_Koala : IScriptedEffect
             || !Guid.TryParse(idValue?.ToString(), out var enteredId)) return;
         var entered = ctx.State.Players[enteredOwner].Characters.FirstOrDefault(card => card.Id == enteredId);
         if (entered is null) return;
+        // 生命【触发】造成的登场不属于“通常登场”或“通过角色效果登场”，不能触发克尔拉。
+        // 触发卡发动前已从生命区移到废弃区，不能只依赖 from 区域判断。
+        if (ctx.Vars.TryGetValue("lifeTriggerOrigin", out var lifeTriggerOrigin)
+            && lifeTriggerOrigin is true) return;
+        // 兼容旧快照及旧调用方曾直接记录的 life 来源。
+        if (ctx.Vars.TryGetValue("from", out var from)
+            && string.Equals(from?.ToString(), "life", StringComparison.OrdinalIgnoreCase)) return;
         bool highCost = entered.Info.Cost >= 8;
         bool throughCharacterEffect = ctx.Vars.TryGetValue("effectSourceKind", out var kind)
             && string.Equals(kind?.ToString(), CardKind.Character.ToString(), StringComparison.Ordinal);
@@ -229,7 +236,7 @@ public sealed class ST36_004_Bartolomeo : IScriptedEffect
             "选择必须丢弃的 1 张《超新星》卡牌", costs);
         if (discarded is null) return;
         AtomicOps.DiscardHand(me, discarded);
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 2);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 2);
     }
 }
 
@@ -268,18 +275,31 @@ public sealed class ST36_005_EustassKid : IScriptedEffect
         var redirectTargets = me.Characters
             .Where(card => card.Info.Power >= 5000 && card.MatchesName("尤斯塔斯·基德"))
             .ToList();
+        if (me.Leader.Info.Power >= 5000 && me.Leader.MatchesName("尤斯塔斯·基德"))
+            redirectTargets.Insert(0, me.Leader);
         if (redirectTargets.Count == 0 || ctx.State.CurrentBattle is null) return;
         if (!await ctx.Prompts.ConfirmOptional(ctx.OwnerIndex,
                 "尤斯塔斯·基德【对方的攻击时】：将生命顶或底翻至背面并变更攻击对象？")) return;
         var paidLife = await ChooseLifeEdge(ctx, edgeCards, "选择翻至背面朝下的生命牌");
         if (paidLife is null) return;
-        var target = await ConfirmedMissingHelpers.ChooseUpToOne(ctx, "OwnCharacter",
-            "选择新的攻击对象“尤斯塔斯·基德”", redirectTargets);
+        var chosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OwnLeaderOrCharacter",
+            "选择新的攻击对象“尤斯塔斯·基德”",
+            redirectTargets.Select(card => card.Id.ToString()).ToList(), 1, 1,
+            new Dictionary<string, object?>
+            {
+                ["choiceCards"] = redirectTargets.Select(card => new { id = card.Id.ToString(), number = card.Info.Number }).ToList(),
+            });
+        var target = chosen.Count == 0
+            ? null
+            : redirectTargets.FirstOrDefault(card => card.Id.ToString() == chosen[0]);
         if (target is null) return;
         paidLife.IsLifeFaceUp = false;
         me.TurnOnceUsed.Add(key);
-        ctx.State.CurrentBattle.TargetIsLeader = false;
-        ctx.State.CurrentBattle.TargetCardId = target.Id;
+        bool targetsLeader = target.Id == me.Leader.Id;
+        ctx.State.CurrentBattle.TargetIsLeader = targetsLeader;
+        ctx.State.CurrentBattle.TargetCardId = targetsLeader ? null : target.Id;
+        ctx.State.CurrentBattle.ReplacedByBlockerCardId = null;
+        ctx.State.CurrentBattle.BlockerDeclared = false;
     }
 
     private static async Task<CardInstance?> ChooseLifeEdge(
@@ -428,7 +448,7 @@ public sealed class OP15_012_Buggy : IScriptedEffect
     {
         if (ctx.Trigger == EffectTrigger.OnKO)
         {
-            AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+            await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
             return;
         }
 
@@ -459,7 +479,7 @@ public sealed class OP15_037_ResultsSpeak : IScriptedEffect
     {
         if (ctx.Trigger == EffectTrigger.OnLifeRevealTrigger)
         {
-            AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+            await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
             return;
         }
         var me = ctx.State.Players[ctx.OwnerIndex];
@@ -472,6 +492,7 @@ public sealed class OP15_037_ResultsSpeak : IScriptedEffect
         {
             me.Deck.Remove(picked);
             me.Hand.Add(picked);
+            ctx.BroadcastReveal(picked);
         }
         var rest = top.Where(me.Deck.Contains).ToList();
         if (rest.Count > 1)
@@ -538,7 +559,7 @@ public sealed class OP15_041_Orlumbus : IScriptedEffect
         var me = ctx.State.Players[ctx.OwnerIndex];
         if (ctx.Trigger == EffectTrigger.OnKO)
         {
-            AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+            await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
             return;
         }
         string key = $"OP15-041-act:{ctx.Source.Id}";
@@ -562,16 +583,16 @@ public sealed class OP15_056_FlameFlameFruit : IScriptedEffect
     public bool HandlesTrigger(EffectTrigger trigger)
         => trigger == EffectTrigger.EventMain || trigger == EffectTrigger.OnLifeRevealTrigger;
 
-    public Task Resolve(EffectContext ctx)
+    public async Task Resolve(EffectContext ctx)
     {
         var me = ctx.State.Players[ctx.OwnerIndex];
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 2);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 2);
         if (ctx.Trigger == EffectTrigger.EventMain && me.Leader.MatchesName("路西"))
         {
             AtomicOps.GiveKeyword(me.Leader, "双重攻击", KeywordDuration.ThisTurn, ctx.OwnerIndex);
             AtomicOps.AddPowerThisTurn(me.Leader, 3000);
         }
-        return Task.CompletedTask;
+        return;
     }
 }
 
@@ -587,7 +608,7 @@ public sealed class OP15_057_DressrosaKingdom : IScriptedEffect
         var me = ctx.State.Players[ctx.OwnerIndex];
         if (ctx.Trigger == EffectTrigger.OnEnterField)
         {
-            if (me.Leader.Info.HasKeyword("德莱斯罗兹")) AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+            if (me.Leader.Info.HasKeyword("德莱斯罗兹")) await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
             return;
         }
         if (ctx.Source.IsTapped) return;
@@ -598,7 +619,7 @@ public sealed class OP15_057_DressrosaKingdom : IScriptedEffect
         var discarded = await ConfirmedMissingHelpers.ChooseUpToOne(ctx, "OwnHandDiscard",
             "选择必须丢弃的 1 张事件或舞台卡牌", discardCosts);
         if (discarded is null) return;
-        AtomicOps.RestCard(ctx.Source);
+        if (!AtomicOps.RestCard(ctx.Source)) return;
         AtomicOps.DiscardHand(me, discarded);
         var targets = new List<CardInstance> { me.Leader };
         targets.AddRange(me.Characters);
@@ -615,14 +636,14 @@ public sealed class OP15_084_DrHogback : IScriptedEffect
     public bool HandlesTrigger(EffectTrigger trigger)
         => trigger == EffectTrigger.OnEnterField || trigger == EffectTrigger.OnKO;
 
-    public Task Resolve(EffectContext ctx)
+    public async Task Resolve(EffectContext ctx)
     {
         var me = ctx.State.Players[ctx.OwnerIndex];
         if (ctx.Trigger == EffectTrigger.OnEnterField && me.Leader.Info.HasKeyword("恐怖之船海盗团"))
             AtomicOps.MillTop(me, 5);
         else if (ctx.Trigger == EffectTrigger.OnKO && me.Hand.Count <= 6)
-            AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
-        return Task.CompletedTask;
+            await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
+        return;
     }
 }
 

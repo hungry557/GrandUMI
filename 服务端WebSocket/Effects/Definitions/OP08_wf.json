@@ -144,11 +144,11 @@
   },
   "OP08-010": {
     "_name": "",
-    "_matcher": "启动主要(咚!!-1)每回合1次,本回合我方1张此角色以外的《动物》角色力量+1000。",
+    "_matcher": "咚!!×1启动主要每回合1次,本回合我方最多1张此角色以外的《动物》角色力量+1000。",
     "_src": "wf-dsl",
     "activated": {
-      "cost": {
-        "donReturn": 1
+      "if": {
+        "donAttachedGte": 1
       },
       "oncePerTurn": true,
       "then": [
@@ -160,7 +160,7 @@
           "as": "$tgt",
           "filter": {
             "keyword": "动物",
-            "excludeName": "郊游熊"
+            "excludeSelf": true
           }
         },
         {
@@ -190,7 +190,7 @@
             "min": 0,
             "as": "$tgt",
             "filter": {
-              "originalPowerLte": 4000
+              "currentPowerLte": 4000
             }
           },
           {
@@ -333,7 +333,7 @@
         "max": 1,
         "as": "$tgt",
         "filter": {
-          "originalPowerLte": 5000
+          "currentPowerLte": 5000
         }
       },
       {
@@ -382,7 +382,8 @@
       "then": [
         {
           "op": "ActiveOwnDon",
-          "n": 1
+          "n": 1,
+          "chooseCount": true
         }
       ]
     }
@@ -423,7 +424,8 @@
       "then": [
         {
           "op": "ActiveOwnDon",
-          "n": 1
+          "n": 1,
+          "chooseCount": true
         }
       ]
     },
@@ -459,12 +461,12 @@
         "cost": {
           "revealHand": {
             "n": 2,
-            "keyword": "白胡子海盗团"
+            "keywordContains": "白胡子海盗团"
           }
         },
         "costPrompt": "公开2张拥有《白胡子海盗团》特征的手牌：发动此效果？",
         "if": {
-          "leaderHasKeyword": "白胡子海盗团"
+          "leaderKeywordContains": "白胡子海盗团"
         },
         "then": [
           {

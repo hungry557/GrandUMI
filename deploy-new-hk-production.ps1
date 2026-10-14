@@ -1,0 +1,66 @@
+﻿param(
+  [string]$Server = "root@186.241.65.7",
+  [string]$Commit = ""
+)
+
+$ErrorActionPreference = "Stop"
+$repo = $PSScriptRoot
+Set-Location $repo
+
+function Stop-WithError([string]$Message) { Write-Host $Message -ForegroundColor Red; exit 1 }
+if ($Server -ne "root@186.241.65.7") { Stop-WithError "安全检查失败：新正式服部署只允许 root@186.241.65.7。" }
+if ((git branch --show-current).Trim() -ne "main") { Stop-WithError "新正式服部署必须从 main 分支执行。" }
+if (git status --porcelain) { Stop-WithError "工作区存在未提交改动，已停止新正式服部署。" }
+$directAddresses = @(Resolve-DnsName -Type A direct.grand-umi.com -ErrorAction Stop |
+  Where-Object {
+    $_.Section -eq "Answer" -and
+    $_.Type -eq "A" -and
+    $_.IPAddress -and
+    [string]::Equals(
+      ([string]$_.Name).TrimEnd([char]'.'),
+      "direct.grand-umi.com",
+      [StringComparison]::OrdinalIgnoreCase)
+  } |
+  ForEach-Object { $_.IPAddress } | Sort-Object -Unique)
+if ($directAddresses.Count -ne 1 -or $directAddresses[0] -ne "186.241.65.7") {
+  Stop-WithError "低延迟直连 DNS 未独占指向新正式服：direct.grand-umi.com -> $($directAddresses -join ', ')"
+}
+$directCode = & curl.exe -s --noproxy '*' -o NUL -w "%{http_code}" -L "https://direct.grand-umi.com/backend/ready"
+if ($LASTEXITCODE -ne 0 -or $directCode -ne "200") {
+  Stop-WithError "低延迟直连 TLS/健康检查失败，HTTP $directCode。"
+}
+$target = if ($Commit) { (git rev-parse $Commit).Trim() } else { (git rev-parse HEAD).Trim() }
+if ($target -notmatch '^[0-9a-f]{40}$') { Stop-WithError "无法解析部署提交。" }
+
+$ssh = (Get-Command ssh.exe -ErrorAction Stop).Source
+$scp = (Get-Command scp.exe -ErrorAction Stop).Source
+& $ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 $Server "mkdir -p /opt/grandumi && if [ ! -d /opt/grandumi/.git ]; then git init -b main /opt/grandumi; fi"
+if ($LASTEXITCODE -ne 0) { Stop-WithError "无法初始化新正式服仓库。" }
+
+$tempDir = & {
+  . (Join-Path $repo "ops\windows\GrandUmiTemp.ps1")
+  Get-GrandUmiTempDirectory -Category "Deploy"
+}
+$short = $target.Substring(0, 12)
+$bundle = Join-Path $tempDir "grandumi-production-$short.bundle"
+$remoteBundle = "/tmp/grandumi-production-$short.bundle"
+try {
+  if (Test-Path -LiteralPath $bundle) { Remove-Item -LiteralPath $bundle -Force }
+  git bundle create $bundle main
+  if ($LASTEXITCODE -ne 0) { Stop-WithError "创建新正式服代码包失败。" }
+  & $scp -o BatchMode=yes $bundle ($Server + ":" + $remoteBundle)
+  if ($LASTEXITCODE -ne 0) { Stop-WithError "上传新正式服代码包失败。" }
+  & $ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 $Server "git -C /opt/grandumi fetch '$remoteBundle' 'refs/heads/main:refs/remotes/origin/main' && rm -f '$remoteBundle'"
+  if ($LASTEXITCODE -ne 0) { Stop-WithError "新正式服导入代码包失败。" }
+} finally {
+  if (Test-Path -LiteralPath $bundle) { Remove-Item -LiteralPath $bundle -Force }
+}
+
+$remoteStageRoot = "/opt/grandumi-stage-" + $target.Substring(0, 12)
+$remoteStageCommand = "set -Eeuo pipefail; trap 'git -C /opt/grandumi worktree remove --force $remoteStageRoot >/dev/null 2>&1 || true' EXIT; git -C /opt/grandumi worktree add --detach $remoteStageRoot '$target' >/dev/null; GRANDUMI_PRODUCTION_IP=186.241.65.7 bash $remoteStageRoot/ops/server/bootstrap-grandumi-production.sh; GRANDUMI_PRODUCTION_IP=186.241.65.7 bash $remoteStageRoot/ops/server/stage-grandumi-production.sh '$target'"
+& $ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 $Server $remoteStageCommand
+if ($LASTEXITCODE -ne 0) { Stop-WithError "新正式服预构建失败。" }
+
+& $ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 $Server "grep -Fxq '$target' /var/lib/grandumi-production-staged"
+if ($LASTEXITCODE -ne 0) { Stop-WithError "新正式服预构建版本校验失败。" }
+Write-Host "新正式服版本预构建成功（尚未切流）：$target" -ForegroundColor Green

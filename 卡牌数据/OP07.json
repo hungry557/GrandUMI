@@ -705,7 +705,9 @@
     "effectTags": [
       "OnEnterField"
     ],
-    "abilities": [],
+    "abilities": [
+      "速攻：角色"
+    ],
     "effectEvent": "",
     "rarity": "R",
     "subscript": 2,
@@ -2130,7 +2132,7 @@
     "type": "领航",
     "property": "知",
     "power": "5000",
-    "cost": "-",
+    "cost": "2",
     "keyWords": "科学家/艾格赫德",
     "counter": "",
     "effectTags": [

@@ -28,7 +28,7 @@ public class OP06_095_ShadowsGathering : IScriptedEffect
         if (ctx.Trigger == EffectTrigger.OnLifeRevealTrigger)
         {
             // 【触发】抽取 2 张卡牌，丢弃我方 1 张手牌
-            AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 2);
+            await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 2);
             if (me.Hand.Count > 0)
             {
                 var chosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OwnHand",
@@ -48,7 +48,7 @@ public class OP06_095_ShadowsGathering : IScriptedEffect
 
         // 可以将任意张数费用≤2 且《恐怖之船海盗团》的我方角色 KO，每 KO 1 张领袖再 +1000
         var cands = me.Characters
-            .Where(c => c.Info.Cost <= 2 && c.Info.HasKeyword("恐怖之船海盗团"))
+            .Where(c => ctx.State.CurrentCostOf(c) <= 2 && c.Info.HasKeyword("恐怖之船海盗团"))
             .ToList();
         if (cands.Count == 0) return;
 

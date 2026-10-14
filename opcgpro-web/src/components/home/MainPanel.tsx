@@ -1,6 +1,8 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import PlayerName from "@/components/ui/PlayerName";
+
+import { useState, useRef, useEffect, useMemo } from "react";
 import NextImage from "next/image";
 import LobbyPanel from "./LobbyPanel";
 import DeckChoosePanel from "./DeckChoosePanel";
@@ -13,8 +15,13 @@ import HistoryPanel from "./HistoryPanel";
 import CardCatalogPanel from "./CardCatalogPanel";
 import ChangelogModal from "./ChangelogModal";
 import ChatPanel from "./ChatPanel";
-import { useNetStore } from "@/store/netStore";
+import {
+  useNetStore,
+  type ChatDecorationItem,
+  type ChatDecorationSlot,
+} from "@/store/netStore";
 import { HomeRequest } from "@/net/HomeProtocol";
+import { normalizeHunterCopy } from "@/lib/rankAffiliation";
 import { LATEST_CHANGELOG } from "@/data/changelog";
 import { getAllCachedCards, loadCardSet } from "@/data/CardLoader";
 import { DEFAULT_SEARCH_SETS } from "@/data/cardSets";
@@ -26,8 +33,13 @@ import LayoutPreviewFrame from "./LayoutPreviewFrame";
 import { useLayoutSettings } from "./LayoutSettingsProvider";
 import ProfilePanel from "./ProfilePanel";
 import CardBackPlazaPanel from "./CardBackPlazaPanel";
+import CardBackReviewPanel from "./CardBackReviewPanel";
+import MaintenanceControlPanel from "./MaintenanceControlPanel";
+import AdminPanel from "./AdminPanel";
+import { useLanguage } from "@/i18n/LanguageProvider";
+import { orderOwnedChatDecorationItems } from "@/lib/chatDecorationExchange.mjs";
 
-type View = "lobby" | "deck" | "catalog" | "leaderboard" | "cardBackPlaza" | "history" | "profile";
+type View = "lobby" | "deck" | "catalog" | "leaderboard" | "exchange" | "cardBackPlaza" | "admin" | "cardBackReview" | "history" | "profile";
 type AvatarVariant = "sidebar" | "header" | "profile";
 
 // 从缓存中找一个名为"路飞"的领航卡作为默认头像
@@ -43,7 +55,7 @@ function getDefaultAvatar(): string {
 function PlayerAvatar({ variant = "sidebar" }: { variant?: AvatarVariant }) {
   const playerName = useNetStore((s) => s.playerName);
   const cloudAvatar = useNetStore((s) => s.avatar);
-  const setPlayerName = useNetStore((s) => s.setPlayerName);
+  const canChangeDisplayName = useNetStore((s) => s.canChangeDisplayName);
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -57,6 +69,10 @@ function PlayerAvatar({ variant = "sidebar" }: { variant?: AvatarVariant }) {
   }, [cloudAvatar]);
 
   const startEdit = () => {
+    if (!canChangeDisplayName) {
+      useNetStore.getState().setError("昵称仅可修改一次，当前账号已使用改名机会");
+      return;
+    }
     setDraft(playerName);
     setEditing(true);
   };
@@ -68,9 +84,9 @@ function PlayerAvatar({ variant = "sidebar" }: { variant?: AvatarVariant }) {
   const confirm = () => {
     const name = draft.trim();
     if (!name) { setEditing(false); return; }
-    setPlayerName(name);
+    if (name === playerName) { setEditing(false); return; }
     if (!HomeRequest.updateProfile(name, avatarSrc)) {
-      useNetStore.getState().setError("网络未连接，昵称仅在本次页面生效");
+      useNetStore.getState().setError("网络未连接，昵称未修改，请连接后重试");
     }
     setEditing(false);
   };
@@ -146,10 +162,17 @@ function PlayerAvatar({ variant = "sidebar" }: { variant?: AvatarVariant }) {
               <button
                 type="button"
                 onClick={startEdit}
-                className={`${variant === "profile" ? "min-h-11 w-full text-left text-lg font-bold text-white" : "min-h-8 w-full text-center text-[11px] text-gray-500"} truncate rounded-lg transition-colors hover:text-orange-300 focus-visible:outline-2 focus-visible:outline-orange-400`}
+                disabled={!canChangeDisplayName}
+                title={canChangeDisplayName ? "更改昵称（仅限一次）" : "昵称已修改，无法再次更改"}
+                className={`${variant === "profile" ? "min-h-11 w-full text-left text-lg font-bold text-white" : "min-h-8 w-full text-center text-[11px] text-gray-500"} truncate rounded-lg transition-colors hover:text-orange-300 focus-visible:outline-2 focus-visible:outline-orange-400 disabled:cursor-not-allowed disabled:text-gray-500 disabled:hover:text-gray-500`}
               >
-                {playerName || "未知"}
+                <PlayerName name={playerName || "未知"} />
               </button>
+              {variant === "profile" && (
+                <p className={`mt-1 text-xs ${canChangeDisplayName ? "text-amber-300" : "text-gray-500"}`}>
+                  {canChangeDisplayName ? "昵称可修改 1 次，确认后无法再次修改" : "昵称已修改，无法再次更改"}
+                </p>
+              )}
             </div>
           )}
         </div>
@@ -296,8 +319,17 @@ function NavIcon({ name }: { name: NavIconName }) {
   if (name === "leaderboard") {
     return <><path d="M5 20v-6h4v6M10 20V8h4v12M15 20V4h4v16" /><path d="M3 20h18" /></>;
   }
+  if (name === "exchange") {
+    return <><path d="M4 8.5 12 4l8 4.5v10A1.5 1.5 0 0 1 18.5 20h-13A1.5 1.5 0 0 1 4 18.5v-10Z" /><path d="M8 11h8M8 15h5" /><circle cx="16.5" cy="15.5" r="2.5" /></>;
+  }
   if (name === "cardBackPlaza") {
     return <><path d="M7 4h10a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z" /><path d="M9 8h6M9 16h6" /><path d="M12 10.5c-1.7-2-4.5.6 0 4 4.5-3.4 1.7-6 0-4Z" /></>;
+  }
+  if (name === "cardBackReview") {
+    return <><path d="M12 3 5 6v5c0 4.6 2.7 8 7 10 4.3-2 7-5.4 7-10V6l-7-3Z" /><path d="m9 12 2 2 4-5" /></>;
+  }
+  if (name === "admin") {
+    return <><rect x="4" y="5" width="16" height="14" rx="2" /><path d="M8 9h3v3H8zM14 9h2M14 12h2M8 16h8" /></>;
   }
   if (name === "profile") {
     return <><circle cx="12" cy="8" r="4" /><path d="M4.5 20c.8-4.2 3.3-6 7.5-6s6.7 1.8 7.5 6" /></>;
@@ -384,11 +416,302 @@ function SidebarButton({
   );
 }
 
+const CHAT_DECORATION_SLOTS: Array<{
+  slot: ChatDecorationSlot;
+  label: string;
+}> = [
+  { slot: "opening", label: "开场台词" },
+  { slot: "victory", label: "胜利宣言" },
+];
+
+const CHAT_DECORATION_RARITY_LABELS: Record<ChatDecorationItem["rarity"], string> = {
+  common: "普通",
+  rare: "稀有",
+  epic: "史诗",
+  legendary: "传说",
+};
+
+function chatDecorationPreviewClass(styleToken: string): string {
+  if (["sunset", "feast"].includes(styleToken))
+    return "border-orange-300/70 from-orange-950 via-rose-950 to-slate-950 text-orange-50";
+  if (["tide", "shock", "navy"].includes(styleToken))
+    return "border-cyan-300/70 from-cyan-950 via-blue-950 to-slate-950 text-cyan-50";
+  if (["gold", "wanted"].includes(styleToken))
+    return "border-amber-200/75 from-amber-950 via-yellow-950 to-stone-950 text-amber-50";
+  if (["haki", "emperor"].includes(styleToken))
+    return "border-fuchsia-300/75 from-fuchsia-950 via-purple-950 to-slate-950 text-fuchsia-50";
+  if (styleToken === "leaf")
+    return "border-emerald-300/70 from-emerald-950 via-teal-950 to-slate-950 text-emerald-50";
+  if (styleToken === "ember")
+    return "border-red-300/75 from-red-950 via-orange-950 to-slate-950 text-red-50";
+  return "border-slate-300/60 from-slate-700 via-slate-900 to-gray-950 text-slate-50";
+}
+
+export function ChatDecorationExchangePanel() {
+  const { locale, t } = useLanguage();
+  const connState = useNetStore((state) => state.connState);
+  const exchange = useNetStore((state) => state.chatDecorationExchange);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const snapshot = exchange.snapshot;
+  const items = useMemo(
+    () => orderOwnedChatDecorationItems(snapshot?.items ?? []),
+    [snapshot],
+  );
+  const selected = items.find((item) => item.id === selectedId)
+    ?? items[0]
+    ?? null;
+  const equippedBySlot = new Map<ChatDecorationSlot, ChatDecorationItem>(
+    items.flatMap((item) => item.equippedSlots.map((slot) => [slot, item] as const)),
+  );
+  const numberLocale = locale === "zh-CN" ? "zh-CN" : locale;
+
+  useEffect(() => {
+    if (connState === "connected") HomeRequest.requestChatDecorationExchangeSnapshot();
+  }, [connState]);
+
+  const runSelectedAction = () => {
+    if (!selected || exchange.pendingRequestId) return;
+    if (selected.owned || !selected.availableForPurchase) return;
+    HomeRequest.purchaseChatDecoration(selected.id, selected.priceBerries);
+  };
+
+  const equipSelected = (slot: ChatDecorationSlot) => {
+    if (!selected?.owned || exchange.pendingRequestId || selected.equippedSlots.includes(slot)) return;
+    HomeRequest.equipChatDecoration(selected.id, slot);
+  };
+
+  const selectedActionLabel = t(!selected
+    ? "请选择装饰"
+    : exchange.pendingAction === "purchase"
+      ? "购买确认中…"
+      : exchange.pendingAction === "equip"
+        ? "装配确认中…"
+        : exchange.pendingAction === "snapshot"
+          ? "同步余额中…"
+          : !selected.availableForPurchase
+            ? "历史拥有 · 已下架"
+            : selected.owned
+              ? "已永久拥有"
+              : snapshot && snapshot.balanceBerries < selected.priceBerries
+                ? "额度不足"
+                : "永久购买");
+  const selectedActionDisabled = !selected
+    || Boolean(exchange.pendingRequestId)
+    || !selected.availableForPurchase
+    || selected.owned
+    || (!selected.owned && Boolean(snapshot && snapshot.balanceBerries < selected.priceBerries));
+
+  return (
+    <section
+      data-chat-decoration-exchange
+      className="h-full overflow-y-auto overscroll-contain bg-[radial-gradient(circle_at_top_right,rgba(120,53,15,0.2),transparent_42%)] px-3 py-4 pb-[max(1rem,var(--layout-safe-bottom,env(safe-area-inset-bottom)))] @[640px]:px-5 @[640px]:py-5"
+    >
+      <div className="mx-auto max-w-7xl space-y-4">
+        <header className="flex flex-col gap-3 rounded-2xl border border-amber-300/20 bg-slate-950/80 p-4 shadow-xl shadow-black/20 @[720px]:flex-row @[720px]:items-center @[720px]:justify-between">
+          <div>
+            <div className="flex items-center gap-2">
+              <span aria-hidden="true" className="text-2xl">☠️</span>
+              <div>
+                <h1 className="text-xl font-black text-white">{t("聊天装饰交易所")}</h1>
+                <p className="text-xs text-slate-400">{t("永久拥有后，可分别设为自动开场台词和胜利宣言。")}</p>
+              </div>
+            </div>
+            {snapshot && <p className="mt-2 max-w-2xl text-[11px] leading-relaxed text-slate-500">{t(normalizeHunterCopy(snapshot.walletRule))}</p>}
+          </div>
+          <div className="flex min-w-[15rem] items-center justify-between gap-3 rounded-xl border border-amber-300/25 bg-amber-950/25 px-4 py-3">
+            <div>
+              <p className="text-[10px] font-black uppercase tracking-[0.16em] text-amber-300">{t("本赛季语录额度")}</p>
+              <p className="mt-1 text-2xl font-black tabular-nums text-amber-50">
+                <span data-chat-decoration-wallet-balance={snapshot?.balanceBerries ?? undefined}>
+                  {snapshot ? snapshot.balanceBerries.toLocaleString(numberLocale) : "—"}
+                </span>
+                <span className="ml-1 text-sm text-amber-300">{t("贝里")}</span>
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => HomeRequest.requestChatDecorationExchangeSnapshot()}
+              disabled={Boolean(exchange.pendingRequestId) || connState !== "connected"}
+              className="min-h-14 min-w-14 rounded-xl border border-amber-300/20 bg-slate-900 px-3 text-xs font-bold text-amber-100 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {t("刷新")}
+            </button>
+          </div>
+        </header>
+
+        {exchange.error && (
+          <div role="alert" className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-red-400/30 bg-red-950/25 px-4 py-3 text-sm text-red-200">
+            <span>{exchange.error}</span>
+            <button
+              type="button"
+              onClick={() => HomeRequest.requestChatDecorationExchangeSnapshot()}
+              disabled={Boolean(exchange.pendingRequestId) || connState !== "connected"}
+              className="min-h-14 rounded-lg bg-red-800 px-4 text-xs font-bold text-white disabled:opacity-50"
+            >
+              {t("重新同步")}
+            </button>
+          </div>
+        )}
+
+        {!snapshot ? (
+          <div className="grid min-h-72 place-items-center rounded-2xl border border-slate-800 bg-slate-950/60 p-8 text-center text-sm text-slate-500">
+            <div>
+              <div className="mx-auto mb-3 h-8 w-8 animate-spin rounded-full border-2 border-slate-700 border-t-amber-300" />
+              <p>{t(exchange.error ? "等待重新同步交易所…" : "正在读取交易所目录与权威余额…")}</p>
+            </div>
+          </div>
+        ) : selected ? (
+          <>
+            <div className="grid gap-4 rounded-2xl border border-slate-800 bg-slate-950/70 p-4 @[760px]:grid-cols-[minmax(0,1fr)_minmax(17rem,0.7fr)] @[760px]:items-center">
+              <div>
+                <div className="mb-3 flex flex-wrap items-center gap-2 text-xs">
+                  <span className="rounded-full bg-violet-950 px-2.5 py-1 font-bold text-violet-200">
+                    {t(CHAT_DECORATION_RARITY_LABELS[selected.rarity])}
+                  </span>
+                  {selected.owned && <span className="rounded-full bg-emerald-950 px-2.5 py-1 font-bold text-emerald-200">{t("已拥有")}</span>}
+                  {!selected.availableForPurchase && <span className="rounded-full bg-slate-800 px-2.5 py-1 font-bold text-slate-300">{t("历史拥有 · 已下架")}</span>}
+                  {selected.equippedSlots.length > 0 && <span className="rounded-full bg-amber-950 px-2.5 py-1 font-bold text-amber-200">{t("已装配")}</span>}
+                </div>
+                <h2 className="text-2xl font-black text-white">{t(selected.name)}</h2>
+                <p className="mt-1 text-xs text-slate-500">
+                  {selected.availableForPurchase
+                    ? t("永久所有权 · 同一句语录可同时用于开场与胜利")
+                    : t("历史藏品仍可装配和演出，不再开放购买。")}
+                </p>
+                {selected.owned && (
+                  <fieldset data-chat-decoration-equip-actions className="mt-4">
+                    <legend className="mb-2 text-[10px] font-black uppercase tracking-[0.16em] text-slate-500">
+                      {t("自动触发位置")}
+                    </legend>
+                    <div className="grid gap-2 @[520px]:grid-cols-2">
+                      {CHAT_DECORATION_SLOTS.map((option) => {
+                        const equipped = equippedBySlot.get(option.slot);
+                        const isSelectedEquipped = selected.equippedSlots.includes(option.slot);
+                        return (
+                          <div key={option.slot} className="rounded-xl border border-slate-700 bg-slate-900/85 p-2.5">
+                            <div className="mb-2 flex items-center justify-between gap-2">
+                              <span className="text-xs font-black text-slate-200">{t(option.label)}</span>
+                              <span className="max-w-[9rem] truncate text-[10px] text-slate-500">
+                                {equipped ? t(equipped.name) : t("未设置")}
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              data-chat-decoration-equip-slot={option.slot}
+                              onClick={() => equipSelected(option.slot)}
+                              disabled={Boolean(exchange.pendingRequestId) || isSelectedEquipped}
+                              aria-pressed={isSelectedEquipped}
+                              className={`min-h-14 w-full rounded-lg px-3 text-xs font-black transition-colors ${
+                                isSelectedEquipped
+                                  ? "bg-emerald-900/70 text-emerald-200 ring-1 ring-emerald-400/30"
+                                  : "bg-amber-400 text-slate-950 hover:bg-amber-300 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+                              }`}
+                            >
+                              {t(isSelectedEquipped ? `已设为${option.label}` : `设为${option.label}`)}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </fieldset>
+                )}
+                <div className="mt-4 flex flex-wrap items-center gap-3">
+                  <div>
+                    {selected.availableForPurchase ? (
+                      <p className="text-xl font-black tabular-nums text-amber-200">{selected.priceBerries.toLocaleString(numberLocale)} {t("贝里")}</p>
+                    ) : (
+                      <p className="text-sm font-black text-slate-400">{t("历史藏品 · 已下架")}</p>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    data-chat-decoration-purchase
+                    onClick={runSelectedAction}
+                    disabled={selectedActionDisabled}
+                    className="min-h-14 min-w-[10rem] rounded-xl bg-gradient-to-r from-orange-500 to-amber-400 px-5 text-sm font-black text-slate-950 shadow-lg shadow-orange-950/30 hover:from-orange-400 hover:to-amber-300 disabled:cursor-not-allowed disabled:from-slate-700 disabled:to-slate-700 disabled:text-slate-400 disabled:shadow-none"
+                  >
+                    {selectedActionLabel}
+                  </button>
+                </div>
+              </div>
+              <div>
+                <p className="mb-2 text-[10px] font-black uppercase tracking-[0.16em] text-slate-500">{t("领袖语录气泡预览")}</p>
+                <div
+                  data-chat-decoration-preview
+                  data-style-token={selected.styleToken}
+                  className={`relative rounded-2xl border bg-gradient-to-br px-5 py-4 text-sm font-bold leading-relaxed shadow-2xl ring-1 ring-white/10 ${chatDecorationPreviewClass(selected.styleToken)}`}
+                >
+                  <span className="mb-1 block text-[10px] font-black uppercase tracking-wider opacity-65">{t(selected.name)}</span>
+                  {t(selected.text)}
+                  <span aria-hidden="true" className="absolute -right-2 top-1/2 h-4 w-4 -translate-y-1/2 rotate-45 border-r border-t border-current bg-slate-950/80" />
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 @[620px]:grid-cols-2 @[1080px]:grid-cols-3">
+              {items.map((item) => {
+                const active = item.id === selected.id;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    data-chat-decoration-item={item.id}
+                    data-chat-decoration-owned={item.owned ? "true" : "false"}
+                    onClick={() => {
+                      setSelectedId(item.id);
+                    }}
+                    aria-pressed={active}
+                    className={`min-h-36 rounded-2xl border p-4 text-left transition-all focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-300 ${
+                      active
+                        ? "border-amber-300/70 bg-amber-950/25 shadow-lg shadow-amber-950/20"
+                        : "border-slate-800 bg-slate-950/65 hover:border-slate-600 hover:bg-slate-900"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="truncate text-base font-black text-white">{t(item.name)}</p>
+                        <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-slate-400">{t(item.text)}</p>
+                      </div>
+                      <span className="shrink-0 rounded-full bg-slate-800 px-2 py-1 text-[10px] font-bold text-slate-300">
+                        {t(CHAT_DECORATION_RARITY_LABELS[item.rarity])}
+                      </span>
+                    </div>
+                    <div className="mt-4 flex items-end justify-between gap-2">
+                      <span className={`text-sm font-black tabular-nums ${item.availableForPurchase ? "text-amber-200" : "text-slate-500"}`}>
+                        {item.availableForPurchase
+                          ? `${item.priceBerries.toLocaleString(numberLocale)} ${t("贝里")}`
+                          : t("历史藏品 · 已下架")}
+                      </span>
+                      <span className={`rounded-full px-2.5 py-1 text-[10px] font-bold ${
+                        item.equippedSlots.length > 0
+                          ? "bg-amber-950 text-amber-200"
+                          : item.owned
+                            ? "bg-emerald-950 text-emerald-200"
+                            : "bg-slate-800 text-slate-400"
+                      }`}>
+                        {item.equippedSlots.length > 0
+                          ? item.equippedSlots.map((slot) => t(CHAT_DECORATION_SLOTS.find((option) => option.slot === slot)?.label ?? slot)).join(" / ")
+                          : t(item.owned ? "已拥有" : "未拥有")}
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </>
+        ) : (
+          <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-10 text-center text-sm text-slate-500">{t("暂无聊天装饰。")}</div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function changelogSeenKey(account: string): string {
   return `grandumi_changelog_seen_${encodeURIComponent(account)}`;
 }
 
-export default function MainPanel() {
+export default function MainPanel({ onOpenFeedback }: { onOpenFeedback: () => void }) {
   const [view, setView] = useState<View>("lobby");
   const [showPlayerList, setShowPlayerList] = useState(false);
   const [showFriends, setShowFriends] = useState(false);
@@ -400,6 +723,8 @@ export default function MainPanel() {
   const onlineCount = useNetStore((s) => s.onlineCount);
   const connState = useNetStore((s) => s.connState);
   const incomingFriendCount = useNetStore((s) => s.incomingFriendRequests.length);
+  const maintenance = useNetStore((s) => s.maintenance);
+  const pendingCardBackReviews = useNetStore((s) => s.cardBackReviewQueue)?.length ?? 0;
   const connectionLabel = connState === "connected"
     ? "服务器已连接"
     : connState === "connecting" || connState === "handshaking"
@@ -410,6 +735,14 @@ export default function MainPanel() {
     : connState === "connecting" || connState === "handshaking"
       ? "text-yellow-400"
       : "text-red-400";
+
+  useEffect(() => {
+    if (connState === "connected") HomeRequest.requestMaintenanceState();
+  }, [connState]);
+
+  useEffect(() => {
+    if (connState === "connected" && maintenance.canManage) HomeRequest.requestCardBackReviewQueue();
+  }, [connState, maintenance.canManage]);
 
   // 每个账号在当前浏览器首次进入新版本时自动展示更新日志。
   useEffect(() => {
@@ -452,10 +785,14 @@ export default function MainPanel() {
     { view: "lobby", label: "对战" },
     { view: "deck", label: "卡组" },
     { view: "catalog", label: "图鉴" },
-    { view: "leaderboard", label: "排行" },
+    { view: "leaderboard", label: "排行榜" },
+    { view: "exchange", label: "交易所" },
     { view: "cardBackPlaza", label: "卡背" },
     { view: "profile", label: "我的" },
   ];
+  if (maintenance.canManage) {
+    mobileNavItems.splice(5, 0, { view: "admin", label: "管理" });
+  }
 
   return (
     <LayoutPreviewFrame mode={layoutMode}>
@@ -471,7 +808,7 @@ export default function MainPanel() {
       <header className="flex h-16 shrink-0 items-center justify-between border-b border-gray-800 bg-gray-900/95 px-4 pr-16 @[1024px]:hidden">
         <div>
           <p className="text-base font-black tracking-tight text-white">GrandUMI</p>
-          <p className="text-xs text-gray-500">海贼王卡牌对战</p>
+          <p className="text-xs text-gray-500">TCG博弈智能AI研究项目</p>
         </div>
         <div className="flex items-center gap-1">
           <button
@@ -497,7 +834,7 @@ export default function MainPanel() {
           <button
             type="button"
             onClick={() => setShowChat(true)}
-            aria-label="打开大厅聊天"
+            aria-label="打开聊天"
             className="flex h-11 w-11 items-center justify-center rounded-xl text-gray-300 transition-colors hover:bg-gray-800 active:bg-gray-700"
           >
             <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
@@ -518,8 +855,12 @@ export default function MainPanel() {
             <SidebarButton label="卡组" icon="deck" active={view === "deck"} onClick={() => setView("deck")} />
             <SidebarButton label={incomingFriendCount ? `好友 · ${incomingFriendCount} 条新申请` : "好友"} icon="friends" badge={incomingFriendCount} onClick={() => setShowFriends(true)} />
             <SidebarButton label="卡牌图鉴" icon="catalog" active={view === "catalog"} onClick={() => setView("catalog")} />
-            <SidebarButton label="Leader榜" icon="leaderboard" active={view === "leaderboard"} onClick={() => setView("leaderboard")} />
+            <SidebarButton label="排行榜" icon="leaderboard" active={view === "leaderboard"} onClick={() => setView("leaderboard")} />
+            <SidebarButton label="聊天装饰交易所" icon="exchange" active={view === "exchange"} onClick={() => setView("exchange")} />
             <SidebarButton label="卡背广场" icon="cardBackPlaza" active={view === "cardBackPlaza"} onClick={() => setView("cardBackPlaza")} />
+            {maintenance.canManage && (
+              <SidebarButton label="管理中心" icon="admin" badge={pendingCardBackReviews} active={view === "admin" || view === "cardBackReview"} onClick={() => setView("admin")} />
+            )}
             <SidebarButton label="我的" icon="profile" active={view === "profile"} onClick={() => setView("profile")} />
             <SidebarButton label="对局记录" icon="history" active={view === "history"} onClick={() => setView("history")} />
           </div>
@@ -531,28 +872,42 @@ export default function MainPanel() {
           </div>
         </nav>
 
-        <main className="relative min-w-0 flex-1 overflow-hidden">
-          {view === "lobby" && <LobbyPanel onGoToDeck={() => setView("deck")} />}
-          {view === "deck" && <DeckChoosePanel onDeckSelected={() => setView("lobby")} />}
-          {view === "catalog" && <CardCatalogPanel />}
-          {view === "leaderboard" && <LeaderLeaderboardPanel />}
-          {view === "cardBackPlaza" && <CardBackPlazaPanel onOpenProfile={() => setView("profile")} />}
-          {view === "history" && <HistoryPanel />}
-          {view === "profile" && (
-            <ProfilePanel
-              profileEditor={<PlayerAvatar variant="profile" />}
-              onOpenPlayers={() => setShowPlayerList(true)}
-              onOpenHistory={() => setView("history")}
-              onOpenChangelog={() => setShowChangelog(true)}
-              onOpenSettings={openSettings}
-            />
-          )}
+        <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+          {(maintenance.canManage || maintenance.enabled) && <MaintenanceControlPanel />}
+          <div className="relative min-h-0 flex-1 overflow-hidden">
+            {view === "lobby" && <LobbyPanel onGoToDeck={() => setView("deck")} />}
+            {view === "deck" && <DeckChoosePanel onDeckSelected={() => setView("lobby")} />}
+            {view === "catalog" && <CardCatalogPanel />}
+            {view === "leaderboard" && <LeaderLeaderboardPanel />}
+            {view === "exchange" && <ChatDecorationExchangePanel />}
+            {view === "cardBackPlaza" && <CardBackPlazaPanel onOpenProfile={() => setView("profile")} />}
+            {view === "admin" && (
+              <AdminPanel
+                onOpenCardBackReview={() => setView("cardBackReview")}
+                onOpenPlayers={() => setShowPlayerList(true)}
+                onReturnToLobby={() => setView("lobby")}
+              />
+            )}
+            {view === "cardBackReview" && <CardBackReviewPanel />}
+            {view === "history" && <HistoryPanel />}
+            {view === "profile" && (
+              <ProfilePanel
+                profileEditor={<PlayerAvatar variant="profile" />}
+                onOpenPlayers={() => setShowPlayerList(true)}
+                onOpenHistory={() => setView("history")}
+                onOpenChangelog={() => setShowChangelog(true)}
+                onOpenSettings={openSettings}
+                onOpenFeedback={onOpenFeedback}
+              />
+            )}
+          </div>
         </main>
       </div>
 
       <nav
         aria-label="主要导航"
-        className="grid h-16 shrink-0 grid-cols-6 border-t border-gray-800 bg-gray-900/95 @[1024px]:hidden"
+        className="grid h-16 shrink-0 border-t border-gray-800 bg-gray-900/95 @[1024px]:hidden"
+        style={{ gridTemplateColumns: `repeat(${mobileNavItems.length}, minmax(44px, 1fr))` }}
       >
         {mobileNavItems.map((item) => {
           const active = activeMobileView === item.view;
@@ -577,8 +932,8 @@ export default function MainPanel() {
 
       <PlayerListPanel open={showPlayerList} onClose={() => setShowPlayerList(false)} />
       <FriendsPanel open={showFriends} onClose={() => setShowFriends(false)} />
-      <Modal open={showChat} onClose={() => setShowChat(false)} title="大厅聊天" mobileSheet maxWidthClass="max-w-lg">
-        <div className="h-[min(70cqh,36rem)] min-h-80 overflow-hidden rounded-xl border border-gray-800 bg-gray-950">
+      <Modal open={showChat} onClose={() => setShowChat(false)} title="聊天" mobileSheet maxWidthClass="max-w-3xl">
+        <div className="h-[min(76cqh,40rem)] min-h-80 overflow-hidden rounded-xl border border-gray-800 bg-gray-950">
           <ChatPanel showHeader={false} />
         </div>
       </Modal>

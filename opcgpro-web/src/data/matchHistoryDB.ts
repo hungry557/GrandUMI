@@ -11,6 +11,11 @@
  */
 
 import type { MsgGameState } from "@/types/net";
+import { shouldHideDisconnectLoss } from "./matchHistoryPolicy";
+import {
+  createImportedMatchMeta,
+  validateReplayDocument,
+} from "./matchReplayFile";
 
 const DB_NAME = "grandumi-history";
 const DB_VERSION = 2;
@@ -22,6 +27,9 @@ const INDEX_CHUNKS_BY_MATCH = "byMatch";
 /** 保留上限：超出后按开始时间删最旧 */
 export const MAX_MATCHES = 30;
 
+/** 导入事务按较大分块写入，避免单条记录过大，同时减少 IndexedDB 请求数量。 */
+const IMPORT_CHUNK_SIZE = 128;
+
 /** 列表元信息（轻量） */
 export interface MatchMeta {
   id: string;
@@ -31,9 +39,16 @@ export interface MatchMeta {
   myLeader: string;         // 我方领航卡号
   opponentLeader: string;   // 对手领航卡号
   winnerIsMe: boolean;
+  isDraw?: boolean;
+  /** 骰点流程上线前保存的旧记录没有该字段。 */
+  diceWinnerIsMe?: boolean;
+  /** 骰点流程上线前保存的旧记录没有该字段。 */
+  isFirstPlayer?: boolean;
   gameOverReason: string;
   turnCount: number;
   snapshotCount: number;
+  /** 导入记录的本地保存时间；旧记录缺失时继续用 startedAt 参与修剪。 */
+  importedAt?: number;
 }
 
 interface SnapshotRecord {
@@ -118,12 +133,58 @@ export async function saveMatchMeta(meta: MatchMeta): Promise<void> {
   await prune();
 }
 
+/**
+ * 导入一份已经读取的回放文档。
+ *
+ * 运行时校验发生在打开写事务之前；元信息与全部快照分块使用同一事务的 add，
+ * 因而校验失败、ID 极端碰撞或任一分块写入失败都不会留下半份记录。
+ */
+export async function importReplayDocument(value: unknown): Promise<MatchMeta> {
+  const replay = validateReplayDocument(value);
+  const db = await openDB();
+  const keysTransaction = db.transaction(STORE_META, "readonly");
+  const existingKeys = await reqToPromise(
+    keysTransaction.objectStore(STORE_META).getAllKeys() as IDBRequest<IDBValidKey[]>,
+  );
+  const meta = createImportedMatchMeta(
+    replay.meta,
+    existingKeys.map(String),
+  );
+
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction([STORE_META, STORE_CHUNKS], "readwrite");
+    // 使用 add 而非 put：即使另一页面恰好先写入同 ID，也只会让本事务失败，绝不覆盖。
+    tx.objectStore(STORE_META).add(meta);
+    const chunks = tx.objectStore(STORE_CHUNKS);
+    for (let offset = 0, chunkIndex = 0; offset < replay.snapshots.length; offset += IMPORT_CHUNK_SIZE) {
+      chunks.add({
+        matchId: meta.id,
+        chunkIndex: chunkIndex++,
+        snapshots: replay.snapshots.slice(offset, offset + IMPORT_CHUNK_SIZE),
+      } as SnapshotChunkRecord);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error ?? new Error("导入回放事务已中止"));
+  });
+
+  await prune();
+  return meta;
+}
+
 /** 列出全部元信息，按开始时间倒序（最新在前）。 */
 export async function listMeta(): Promise<MatchMeta[]> {
   const db = await openDB();
   const tx = db.transaction(STORE_META, "readonly");
   const all = await reqToPromise(tx.objectStore(STORE_META).getAll() as IDBRequest<MatchMeta[]>);
-  return all.sort((a, b) => b.startedAt - a.startedAt);
+  const hidden = all.filter(shouldHideDisconnectLoss);
+  if (hidden.length > 0) {
+    // 旧版本已经落盘的断线败局也一并清除，包括回放快照占用的空间。
+    await Promise.all(hidden.map((match) => deleteMatch(match.id)));
+  }
+  return all
+    .filter((match) => !shouldHideDisconnectLoss(match))
+    .sort((a, b) => b.startedAt - a.startedAt);
 }
 
 /** 取某局完整快照流。 */
@@ -174,7 +235,11 @@ export async function clearAll(): Promise<void> {
 
 /** 超过上限时删除最旧的若干局。 */
 async function prune(): Promise<void> {
-  const metas = await listMeta(); // 已按时间倒序
+  const metas = (await listMeta()).sort((a, b) => {
+    const aRetentionTime = Number.isFinite(a.importedAt) ? a.importedAt! : a.startedAt;
+    const bRetentionTime = Number.isFinite(b.importedAt) ? b.importedAt! : b.startedAt;
+    return bRetentionTime - aRetentionTime || b.startedAt - a.startedAt || b.id.localeCompare(a.id);
+  });
   if (metas.length <= MAX_MATCHES) return;
   const toDelete = metas.slice(MAX_MATCHES);
   for (const m of toDelete) {

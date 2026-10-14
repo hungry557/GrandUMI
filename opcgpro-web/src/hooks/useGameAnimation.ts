@@ -16,7 +16,6 @@ export type AnimationEvent =
   | { type: "counter"; handIndex: number }
   | { type: "damage"; target: "leader" | "character"; success: boolean }
   | { type: "koUnit"; side: "my" | "opponent"; cardIndex: number }
-  | { type: "turnStart"; side: "my" | "opponent" }
   | { type: "turnEnd" }
   | { type: "gameOver"; isWin: boolean };
 
@@ -80,9 +79,6 @@ export function useGameAnimation(): AnimationEvent {
           cardIndex: (payload.cardIndex as number) ?? 0,
         });
         break;
-      case "TurnStart":
-        setEvent({ type: "turnStart", side: payload.currentTurn ? "my" : "opponent" });
-        break;
       case "TurnEnd":
         setEvent({ type: "turnEnd" });
         break;
@@ -92,7 +88,7 @@ export function useGameAnimation(): AnimationEvent {
       default:
         setEvent({ type: "none" });
     }
-  }, [tick, lastAction, lastActionPayload]);
+  }, [lastAction, lastActionPayload, tick]);
 
   return event;
 }

@@ -1,14 +1,80 @@
 using GrandUMI.Cards;
+using System.Collections.ObjectModel;
 
 namespace GrandUMI.Game;
+
+/// <summary>
+/// 角色区集合。角色被移出角色区时统一执行离场清理，避免各效果路径遗漏附着咚的状态恢复。
+/// </summary>
+public sealed class CharacterZone : Collection<CardInstance>
+{
+    private readonly Action<CardInstance> _onRemoved;
+
+    internal CharacterZone(Action<CardInstance> onRemoved)
+    {
+        _onRemoved = onRemoved;
+    }
+
+    public void AddRange(IEnumerable<CardInstance> cards)
+    {
+        foreach (var card in cards) Add(card);
+    }
+
+    protected override void RemoveItem(int index)
+    {
+        var removed = this[index];
+        base.RemoveItem(index);
+        _onRemoved(removed);
+    }
+
+    protected override void SetItem(int index, CardInstance item)
+    {
+        var removed = this[index];
+        base.SetItem(index, item);
+        if (!ReferenceEquals(removed, item)) _onRemoved(removed);
+    }
+
+    protected override void ClearItems()
+    {
+        var removed = this.ToList();
+        base.ClearItems();
+        foreach (var card in removed) _onRemoved(card);
+    }
+}
+
+/// <summary>排位对局中公开展示的玩家阵营与开局段位。</summary>
+public sealed record PlayerRankIdentity(
+    string Faction,
+    string Tier,
+    int? Division,
+    int PlacementGames,
+    int PlacementRequired)
+{
+    public IReadOnlyList<string> SeasonTitles { get; init; } = Array.Empty<string>();
+    public string? EquippedSeasonTitle { get; init; }
+}
 
 /// <summary>
 /// 单方玩家在对战中的完整状态
 /// </summary>
 public class PlayerState
 {
+    private Action<CardInstance>? _onFieldCardDeparted;
+
+    public PlayerState()
+    {
+        Characters = new CharacterZone(CleanupDepartingCharacter);
+    }
+
     public required string SessionId   { get; set; }
     public required string AccountName { get; set; }
+    /// <summary>对局内公开展示名；登录账号只用于身份校验和内部关联。</summary>
+    public string DisplayName { get; set; } = "";
+    public string VisibleName => string.IsNullOrWhiteSpace(DisplayName) ? AccountName : DisplayName;
+    /// <summary>仅排位对局缓存；创建或恢复房间时读取一次，避免每份快照查询数据库。</summary>
+    public PlayerRankIdentity? RankIdentity { get; set; }
+    /// <summary>各类对局公开的已佩戴赛季称号，随快照和回放保存。</summary>
+    public string? EquippedSeasonTitle { get; set; }
     /// <summary>公开外观信息：用于该玩家所有暗置主卡的卡背。</summary>
     public string CardBackId { get; set; } = "classic";
     /// <summary>该玩家卡组公开的异画选择（卡号 → 站内图片路径）。</summary>
@@ -17,8 +83,42 @@ public class PlayerState
     public required CardInstance Leader  { get; init; }
     public List<CardInstance> Hand       { get; } = new();
     /// <summary>角色区（最多 5）</summary>
-    public List<CardInstance> Characters { get; } = new();
-    public CardInstance? StageCard       { get; set; }
+    public CharacterZone Characters { get; }
+    private CardInstance? _stageCard;
+    private CardInstance? _extraStageCard;
+
+    public CardInstance? StageCard
+    {
+        get => _stageCard;
+        set
+        {
+            if (ReferenceEquals(_stageCard, value)) return;
+            var departed = _stageCard;
+            _stageCard = value;
+            CleanupDepartingStage(departed);
+        }
+    }
+    /// <summary>仅【三号船坞】存在时启用的第二舞台区。</summary>
+    public CardInstance? ExtraStageCard
+    {
+        get => _extraStageCard;
+        set
+        {
+            if (ReferenceEquals(_extraStageCard, value)) return;
+            var departed = _extraStageCard;
+            _extraStageCard = value;
+            CleanupDepartingStage(departed);
+        }
+    }
+    /// <summary>按固定槽位顺序枚举当前舞台；普通模式只会返回首槽。</summary>
+    public IEnumerable<CardInstance> StageCards
+    {
+        get
+        {
+            if (StageCard is not null) yield return StageCard;
+            if (ExtraStageCard is not null) yield return ExtraStageCard;
+        }
+    }
     public List<CardInstance> Trash      { get; } = new();
     public List<CardInstance> Deck       { get; } = new();
     public List<CardInstance> LifeArea   { get; } = new();
@@ -37,6 +137,12 @@ public class PlayerState
     /// <summary>每回合 1 次效果的使用记录（key = "卡号-效果Id"）</summary>
     public HashSet<string> TurnOnceUsed { get; } = new();
 
+    /// <summary>
+    /// 本回合已成功发动过【每回合1次】效果的卡牌实例。
+    /// 与 TurnOnceUsed 的内部 key 分离，供快照和界面统一显示“次数仍可用”标识。
+    /// </summary>
+    public HashSet<Guid> OncePerTurnEffectUsedCardIds { get; } = new();
+
     /// <summary>本回合中该玩家是否曾因卡牌效果丢弃过手牌（不含发动成本）。</summary>
     public bool HandDiscardedByEffectThisTurn { get; set; }
 
@@ -51,4 +157,55 @@ public class PlayerState
     public int TotalDonInCostArea => CostArea.Count;
     public int DeckCount => Deck.Count;
     public int LifeCount => LifeArea.Count;
+
+    /// <summary>从其实际舞台槽移除指定实例；重复或错误实例不会改变状态。</summary>
+    public bool RemoveStageCard(CardInstance card)
+    {
+        if (ReferenceEquals(StageCard, card))
+        {
+            StageCard = null;
+            return true;
+        }
+        if (ReferenceEquals(ExtraStageCard, card))
+        {
+            ExtraStageCard = null;
+            return true;
+        }
+        return false;
+    }
+
+    private void CleanupDepartingCharacter(CardInstance character)
+    {
+        // “建立时快照”只绑定当前这次留场；同一实例离场后再次登场也不得恢复旧快照资格。
+        character.FieldSnapshotSourceIds.Clear();
+        character.HexEnteredFromTrash = false;
+        character.HexEnteredFromHandByEffect = false;
+        character.HexThreeAdmiralsGranted = false;
+        character.HexHighCostEntryTurn = 0;
+        foreach (var don in CostArea)
+        {
+            if (don.State != DonState.Attached || don.AttachedToCardId != character.Id) continue;
+            don.State = DonState.Rest;
+            don.AttachedToCardId = null;
+        }
+        _onFieldCardDeparted?.Invoke(character);
+    }
+
+    private void CleanupDepartingStage(CardInstance? source)
+    {
+        if (source is null) return;
+        // 舞台离场既结束它建立的快照，也结束它作为其它快照目标的本次留场资格。
+        source.FieldSnapshotSourceIds.Clear();
+        foreach (var character in Characters)
+            character.FieldSnapshotSourceIds.Remove(source.Id);
+        // 舞台槽已先完成替换，再通知 GameState 清理来源效果；失败或同实例赋值不会触发。
+        _onFieldCardDeparted?.Invoke(source);
+    }
+
+    /// <summary>
+    /// 绑定所属牌局的离场提交回调。角色集合完成移除、舞台槽完成替换后才会调用，
+    /// 因而离场保护、替代效果与错误持有者等未提交路径不会提前清掉持续效果。
+    /// </summary>
+    internal void BindFieldDeparture(Action<CardInstance> onFieldCardDeparted)
+        => _onFieldCardDeparted = onFieldCardDeparted;
 }

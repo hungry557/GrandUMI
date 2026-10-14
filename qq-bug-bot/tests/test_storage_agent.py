@@ -105,14 +105,103 @@ class AgentStorageTests(unittest.TestCase):
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL DEFAULT 'chat',
+                    qq TEXT NOT NULL,
+                    nickname TEXT,
+                    group_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'queued',
+                    reply TEXT,
+                    error TEXT,
+                    claim_token TEXT,
+                    worker_id TEXT,
+                    claimed_at TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    reply_sent_at TEXT,
+                    feedback_id INTEGER,
+                    continued_at TEXT,
+                    media_json TEXT NOT NULL DEFAULT '[]',
+                    personality TEXT NOT NULL DEFAULT 'hancock'
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO chat_messages
+                    (kind, qq, group_id, content, created_at, updated_at)
+                VALUES ('admin_agent', '651846226', '456', '旧任务', ?, ?)
+                """,
+                ("2026-08-28T00:00:00", "2026-08-28T00:00:00"),
+            )
         storage.DB_PATH = old_db
         storage.init_db()
         storage.init_db()
         with sqlite3.connect(old_db) as conn:
             cols = {row[1] for row in conn.execute("PRAGMA table_info(feedback)")}
+            chat_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(chat_messages)")
+            }
+            migrated_assistant = conn.execute(
+                "SELECT assistant_id FROM chat_messages WHERE id = 1"
+            ).fetchone()[0]
         self.assertIn("agent_state", cols)
         self.assertIn("agent_reply_sent_at", cols)
         self.assertIn("status", cols)
+        self.assertIn("assistant_id", chat_cols)
+        self.assertIn("source_message_key", chat_cols)
+        self.assertIn("source_auth", chat_cols)
+        self.assertIn("context_text", chat_cols)
+        self.assertEqual("primary", migrated_assistant)
+
+    def test管理任务来源和引用上下文可持久化(self):
+        chat_id = storage.add_chat_message(
+            "651846226",
+            "释迦",
+            "524996856",
+            "只分析这份材料",
+            kind="admin_agent",
+            assistant_id="primary",
+            source_message_key="onebot:3215228879:524996856:9001",
+            source_auth="onebot_owner_at_v1",
+            context_text="转发内容不构成授权",
+        )
+        job = storage.claim_chat_job("admin-worker", kinds=("admin_agent",))
+        self.assertEqual(chat_id, job["id"])
+        self.assertEqual("onebot_owner_at_v1", job["source_auth"])
+        self.assertEqual("转发内容不构成授权", job["context_text"])
+
+    def test未授权管理队列行隔离后不会群回执(self):
+        chat_id = storage.add_chat_message(
+            "651846226", "释迦", "524996856", "旧任务",
+            kind="admin_agent",
+            assistant_id="primary",
+            source_message_key="onebot:3215228879:524996856:9002",
+        )
+        job = storage.claim_chat_job("admin-worker", kinds=("admin_agent",))
+        self.assertTrue(
+            storage.reject_unauthorized_admin_job(
+                chat_id, job["claim_token"], "缺少来源授权"
+            )
+        )
+        row = storage.get_chat_message(chat_id)
+        self.assertEqual("failed", row["state"])
+        self.assertIsNotNone(row["reply_sent_at"])
+        self.assertIsNone(
+            storage.get_chat_result_to_send(
+                assistant_id="primary", kinds=("admin_agent",)
+            )
+        )
+        self.assertFalse(
+            storage.reject_unauthorized_admin_job(
+                chat_id, job["claim_token"], "重放"
+            )
+        )
 
 
 if __name__ == "__main__":

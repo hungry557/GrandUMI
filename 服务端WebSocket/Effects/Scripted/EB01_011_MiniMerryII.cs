@@ -37,12 +37,12 @@ public class EB01_011_MiniMerryII : IScriptedEffect
         if (pick.Count == 0) return;
 
         // 成本：横置此舞台
-        AtomicOps.RestCard(self);
+        if (!AtomicOps.RestCard(self)) return;
         // 成本：选定角色放回卡组最下方
         var tgt = cands.First(c => c.Id.ToString() == pick[0]);
         AtomicOps.ReturnFieldToDeckBottom(ctx.State, ctx.OwnerIndex, tgt);
 
         // 效果：抽1张
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
     }
 }

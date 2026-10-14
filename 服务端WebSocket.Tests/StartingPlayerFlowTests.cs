@@ -15,6 +15,11 @@ public class StartingPlayerFlowTests
 
         Assert.False(engine.State.StartingPlayerChosen);
         Assert.Equal(-1, engine.State.FirstPlayer);
+        var deadline = Assert.IsType<DateTime>(engine.State.StartingPlayerChoiceDeadlineUtc);
+        Assert.InRange(
+            deadline,
+            DateTime.UtcNow.AddSeconds(GameEngine.StartingPlayerChoiceTimeoutSeconds - 2),
+            DateTime.UtcNow.AddSeconds(GameEngine.StartingPlayerChoiceTimeoutSeconds + 2));
         Assert.NotEmpty(engine.State.StartingDiceRounds);
         Assert.All(engine.State.StartingDiceRounds, round =>
         {
@@ -76,6 +81,7 @@ public class StartingPlayerFlowTests
 
         engine.HandleAction(chooser, "ChooseFirstPlayer", JsonSerializer.SerializeToElement(new { goFirst = false }));
         Assert.True(engine.State.StartingPlayerChosen);
+        Assert.Null(engine.State.StartingPlayerChoiceDeadlineUtc);
         Assert.Equal(loser, engine.State.FirstPlayer);
         Assert.Equal(loser, engine.State.CurrentTurnPlayer);
 
@@ -99,6 +105,25 @@ public class StartingPlayerFlowTests
         engine.HandleAction(1, "Mulligan", JsonSerializer.SerializeToElement(new { redraw = false }));
         Assert.True(engine.State.MulliganBothDone);
         Assert.Equal(1, engine.State.CurrentTurnPlayer);
+    }
+
+    [Fact]
+    public void 双方确认起手牌后_保留与重抽玩家都维持五张手牌()
+    {
+        var engine = CreateEngine(firstPlayer: 0, seed: 20260817);
+
+        Assert.All(engine.State.Players, player => Assert.Equal(5, player.Hand.Count));
+        engine.HandleAction(0, "Mulligan", JsonSerializer.SerializeToElement(new { redraw = true }));
+        engine.HandleAction(1, "Mulligan", JsonSerializer.SerializeToElement(new { redraw = false }));
+
+        Assert.True(engine.State.MulliganBothDone);
+        Assert.All(engine.State.Players, player => Assert.Equal(5, player.Hand.Count));
+        Assert.All(engine.State.StartingHandCardNumbers, cards => Assert.Equal(5, cards.Count));
+
+        using var player0 = JsonDocument.Parse(JsonSerializer.Serialize(
+            StateSnapshotBuilder.Build(engine.State, 0, "MulliganComplete")));
+        Assert.Equal(5, player0.RootElement.GetProperty("my").GetProperty("handCount").GetInt32());
+        Assert.Equal(5, player0.RootElement.GetProperty("my").GetProperty("handCardIds").GetArrayLength());
     }
 
     [Fact]
@@ -147,6 +172,13 @@ public class StartingPlayerFlowTests
         Assert.Equal(firstRound.Player1, p1Root.GetProperty("startingDiceRolls")[0].GetProperty("my").GetInt32());
         Assert.Equal(engine.State.StartingPlayerChooser == 0, p0Root.GetProperty("canChooseFirstPlayer").GetBoolean());
         Assert.Equal(engine.State.StartingPlayerChooser == 1, p1Root.GetProperty("canChooseFirstPlayer").GetBoolean());
+        Assert.Equal(
+            engine.State.StartingPlayerChoiceDeadlineUtc,
+            p0Root.GetProperty("startingPlayerChoiceDeadlineUtc").GetDateTime());
+        Assert.InRange(
+            p0Root.GetProperty("serverNowUtc").GetDateTime(),
+            DateTime.UtcNow.AddSeconds(-2),
+            DateTime.UtcNow.AddSeconds(2));
         Assert.False(spectator.RootElement.GetProperty("canChooseFirstPlayer").GetBoolean());
     }
 

@@ -58,6 +58,29 @@ public class OP08_OP14RegressionTests
     }
 
     [Fact]
+    public async Task OP08_052_OnEnter_PlaysEligibleTopCharacterDirectlyFromDeck()
+    {
+        var state = TestScene.New()
+            .MyDeckTop("OP03-012", "OP15-050")
+            .Build();
+        var me = state.Players[0];
+        var source = new CardInstance { Info = CardDatabase.Get("OP08-052")! };
+        var eligibleTop = me.Deck[0];
+        me.Characters.Add(source);
+        var prompts = new MockPromptService().QueueChoose(eligibleTop.Id.ToString());
+
+        await EffectRuntime.Resolve(state, 0, source, EffectTrigger.OnEnterField, prompts);
+
+        var prompt = Assert.Single(prompts.ChooseHistory);
+        Assert.Equal("LookTopReveal", prompt.kind);
+        Assert.Contains(eligibleTop.Id.ToString(), prompt.choices);
+        Assert.DoesNotContain(eligibleTop, me.Deck);
+        Assert.DoesNotContain(eligibleTop, me.Hand);
+        Assert.Contains(eligibleTop, me.Characters);
+        Assert.Equal("OP15-050", Assert.Single(me.Deck).Info.Number);
+    }
+
+    [Fact]
     public async Task OP14_031_OnEnter_RestsBothSelectedCharacters()
     {
         var state = TestScene.New()
@@ -124,6 +147,40 @@ public class OP08_OP14RegressionTests
         Assert.Equal(1, prompt.max);
     }
 
+    [Fact]
+    public async Task OP08_036_EventMain_DoesNotAffectCharacterRaisedAboveSevenCost()
+    {
+        var state = TestScene.New()
+            .OppCharacter("OP15-003")
+            .Build();
+        var source = new CardInstance { Info = CardDatabase.Get("OP08-036")! };
+        var target = Assert.Single(state.Players[1].Characters);
+        target.IsTapped = true;
+        target.CostModThisTurn = 12;
+        Assert.Equal(17, state.CurrentCostOf(1, target));
+
+        await EffectRuntime.Resolve(state, 0, source, EffectTrigger.EventMain, new MockPromptService());
+
+        Assert.False(target.CannotActivateNextReset);
+    }
+
+    [Fact]
+    public async Task OP08_036_EventMain_AffectsCharacterReducedToSevenCost()
+    {
+        var state = TestScene.New()
+            .OppCharacter("OP15-008")
+            .Build();
+        var source = new CardInstance { Info = CardDatabase.Get("OP08-036")! };
+        var target = Assert.Single(state.Players[1].Characters);
+        target.IsTapped = true;
+        target.CostModThisTurn = -1;
+        Assert.Equal(7, state.CurrentCostOf(1, target));
+
+        await EffectRuntime.Resolve(state, 0, source, EffectTrigger.EventMain, new MockPromptService());
+
+        Assert.True(target.CannotActivateNextReset);
+    }
+
     [Theory]
     [InlineData("OP14-110")]
     [InlineData("OP14-111")]
@@ -174,8 +231,10 @@ public class OP08_OP14RegressionTests
         Assert.Contains(state.Players[0].Trash, c => c.Id == discard.Id);
     }
 
-    [Fact]
-    public async Task OP14_113_SearchesAmazonLilyButNotKujaPirates()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task 玛格丽特可以检索亚马逊百合或九蛇海盗团并正确排序弃手(bool chooseKuja)
     {
         var state = TestScene.New().Build();
         var source = new CardInstance { Info = CardDatabase.Get("OP14-113")! };
@@ -191,8 +250,11 @@ public class OP08_OP14RegressionTests
             new CardInstance { Info = CardDatabase.Get("OP15-052")! },
         ]);
         state.Players[0].Hand.Add(discard);
+        var selected = chooseKuja ? kujaPirates : amazonLily;
+        var remaining = state.Players[0].Deck.Where(card => card != selected).Reverse().ToArray();
         var prompts = new MockPromptService()
-            .QueueChoose(amazonLily.Id.ToString())
+            .QueueChoose(selected.Id.ToString())
+            .QueueChoose(remaining.Select(card => card.Id.ToString()).ToArray())
             .QueueChoose(discard.Id.ToString());
 
         await EffectRuntime.Resolve(state, 0, source, EffectTrigger.OnEnterField, prompts);
@@ -200,8 +262,9 @@ public class OP08_OP14RegressionTests
         var search = prompts.ChooseHistory[0];
         Assert.Equal("LookTopReveal", search.kind);
         Assert.Contains(amazonLily.Id.ToString(), search.choices);
-        Assert.DoesNotContain(kujaPirates.Id.ToString(), search.choices);
-        Assert.Contains(amazonLily, state.Players[0].Hand);
+        Assert.Contains(kujaPirates.Id.ToString(), search.choices);
+        Assert.Equal(new[] { selected }, state.Players[0].Hand);
+        Assert.Equal(remaining, state.Players[0].Deck);
         Assert.Contains(discard, state.Players[0].Trash);
     }
 }

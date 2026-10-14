@@ -10,8 +10,7 @@ namespace GrandUMI.Effects.Scripted;
 ///   将其登场的场合，本回合中，该角色获得【速攻】效果。
 /// 【触发】抽取 1 张卡牌。
 ///
-/// 简化点："公开"为内部判定后通过 ConfirmOptional 询问是否登场（前端不展示翻开的具体卡面，
-///   仅在符合条件时弹出确认）。
+/// 公开的顶牌通过公共公开事件向双方展示；符合条件时再询问是否登场。
 /// </summary>
 public class OP12_058_Whitebeard : IScriptedEffect
 {
@@ -25,7 +24,7 @@ public class OP12_058_Whitebeard : IScriptedEffect
         if (ctx.Trigger == EffectTrigger.OnLifeRevealTrigger)
         {
             // 【触发】抽取 1 张卡牌
-            AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+            await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
             return;
         }
 
@@ -38,6 +37,7 @@ public class OP12_058_Whitebeard : IScriptedEffect
 
         // 公开卡组最上方 1 张
         var top = me.Deck[0];
+        ctx.BroadcastReveal(top);
         bool eligible = top.Info.Kind == CardKind.Character
                         && top.Info.Cost <= 9
                         && top.Info.HasKeyword("白胡子海盗团");
@@ -57,11 +57,7 @@ public class OP12_058_Whitebeard : IScriptedEffect
         if (!play) return;
 
         // 登场：从卡组顶移除，按 5 张上限处理后入场
-        me.Deck.Remove(top);
-        if (me.Characters.Count >= 5)
-            await AtomicOps.SqueezeCharacterSlot(ctx.State, ctx.OwnerIndex);
-        top.TurnPlayed = ctx.State.TurnCount;
-        me.Characters.Add(top);
+        await AtomicOps.PlayFromDeckFree(ctx.State, ctx.OwnerIndex, top);
 
         // 本回合获得【速攻】
         AtomicOps.GiveKeyword(top, "速攻", KeywordDuration.ThisTurn);

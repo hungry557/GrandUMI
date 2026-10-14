@@ -1,6 +1,11 @@
+using System.Reflection;
+using System.Text.Json;
 using GrandUMI.Cards;
+using GrandUMI.Effects.Rules;
 using GrandUMI.Effects.Scripted;
 using GrandUMI.Game;
+using GrandUMI.Game.Hex;
+using GrandUMI.Training;
 
 namespace GrandUMI.Effects;
 
@@ -16,26 +21,186 @@ namespace GrandUMI.Effects;
 public static class EffectRuntime
 {
     /// <summary>
+    /// 结算一张已经成功从手牌打出的事件。修订版 11 起，溢流的第二次效果必须等待第一次效果、
+    /// 其提示以及由其产生的延迟触发全部到达稳定点后才开始；两次仍属于同一个出牌动作，
+    /// 不会重复支付费用、推进出牌计数或派发“打出事件”监听。
+    /// </summary>
+    public static async Task ResolvePlayedEvent(
+        GameState state,
+        int ownerIndex,
+        CardInstance source,
+        EffectTrigger trigger,
+        IPromptService prompts)
+    {
+        if (source.Info.Kind != CardKind.Event
+            || trigger is not (EffectTrigger.EventMain or EffectTrigger.EventCounter))
+            throw new ArgumentException("只有从手牌打出的事件【主要】或【反击】效果可走事件结算入口。", nameof(trigger));
+
+        await Resolve(state, ownerIndex, source, trigger, prompts);
+        if (state.IsGameOver || !HexRules.ShouldRepeatPlayedEventEffect(state, ownerIndex, trigger)) return;
+
+        await Resolve(
+            state,
+            ownerIndex,
+            source,
+            trigger,
+            prompts,
+            new Dictionary<string, object?> { ["hexCopied"] = true },
+            hexCopy: true);
+    }
+
+    /// <summary>
     /// 在指定触发时机，对所有可响应的效果按规则顺序解析。
     /// 调用方应在状态变更后（出牌/攻击/KO/抽牌等）调用此方法。
     /// </summary>
     public static async Task TriggerEvent(GameState s, EffectTrigger trigger, IPromptService prompts, Dictionary<string, object?>? payload = null)
     {
+        await HexRules.OnGameEventAsync(s, trigger, prompts, payload);
+        if (s.IsGameOver) return;
         var candidates = CollectListeners(s, trigger, payload);
-        // 排序：回合玩家在前，同方按场上从左到右
-        candidates.Sort((a, b) =>
-        {
-            int aTurn = a.OwnerIdx == s.CurrentTurnPlayer ? 0 : 1;
-            int bTurn = b.OwnerIdx == s.CurrentTurnPlayer ? 0 : 1;
-            return aTurn.CompareTo(bTurn);
-        });
+        var effects = candidates
+            .Select(candidate => new TriggeredCandidate(candidate.OwnerIdx, candidate.Source, trigger, payload))
+            .ToList();
+        await ResolveTriggeredCandidatesInOrder(s, prompts, effects);
+    }
 
-        foreach (var c in candidates)
+    /// <summary>在离场前固定被 KO 卡的规则事实，后续复活或移区不会改变本次触发条件。</summary>
+    internal static Dictionary<string, object?> CreateKOEventPayload(GameState state, int owner, CardInstance card, string reason)
+        => new()
         {
-            await Resolve(s, c.OwnerIdx, c.Source, trigger, prompts, payload);
-            // 规则处理点：若已分胜负则中断
-            if (s.IsGameOver) return;
+            ["cardId"] = card.Id.ToString(),
+            ["owner"] = owner,
+            ["cardKind"] = card.Info.Kind.ToString(),
+            ["cardKeywords"] = card.Info.Keywords.ToArray(),
+            ["originalPower"] = state.OriginalPowerOf(owner, card),
+            ["effectsNullified"] = card.IsEffectsNullified || state.IsContinuouslyNullified(card),
+            ["reason"] = reason,
+            ["attackerId"] = reason == "battle" ? state.CurrentBattle?.AttackerCardId.ToString() : null,
+            ["actingSide"] = reason == "battle"
+                ? state.CurrentBattle?.AttackerPlayerIndex ?? 1 - owner : state.KOActingSide,
+        };
+
+    /// <summary>同一次 KO 的自身【KO时】和场上监听统一排序，后续衍生事件等待本时点全部结算。</summary>
+    internal static List<PendingTriggeredEffect> CaptureKOListenerSnapshot(
+        GameState state,
+        Dictionary<string, object?> payload)
+        => CollectListeners(state, EffectTrigger.OnAnyCharKOd, payload)
+            .Select(candidate => new PendingTriggeredEffect
+            {
+                Owner = candidate.OwnerIdx,
+                Source = candidate.Source,
+                Trigger = EffectTrigger.OnAnyCharKOd,
+            })
+            .ToList();
+
+    internal static async Task ResolveKOEffects(GameState state, int owner, CardInstance card,
+        IPromptService prompts, Dictionary<string, object?> payload,
+        IReadOnlyCollection<PendingTriggeredEffect>? listenerSnapshot = null)
+    {
+        var effects = new List<TriggeredCandidate>();
+        // 部分历史卡缺少触发索引，但已有可执行脚本；延续旧 KO 入口的兼容行为。
+        var ruleset = CardRulesetManager.For(state);
+        bool effectsNullified = payload.TryGetValue("effectsNullified", out var nullified) && nullified is true;
+        if (!effectsNullified && (HasEffectForTrigger(card, EffectTrigger.OnKO)
+            || ruleset.TryGetScriptedEffect(card.Info.Number)?.HandlesTrigger(EffectTrigger.OnKO) == true
+            || Dsl.DslInterpreter.HasTriggerDefinition(ruleset, card.Info.Number, EffectTrigger.OnKO)))
+            effects.Add(new(owner, card, EffectTrigger.OnKO, payload));
+        if (card.Info.Kind == CardKind.Character)
+        {
+            await HexRules.OnGameEventAsync(state, EffectTrigger.OnAnyCharKOd, prompts, payload);
+            if (state.IsGameOver) return;
+            effects.AddRange((listenerSnapshot ?? CaptureKOListenerSnapshot(state, payload))
+                .Select(candidate => new TriggeredCandidate(candidate.Owner, candidate.Source,
+                    candidate.Trigger, payload, AvailabilityCaptured: true)));
         }
+        bool previousDraining = _draining;
+        _draining = true;
+        try { await ResolveTriggeredCandidatesInOrder(state, prompts, effects); }
+        finally { _draining = previousDraining; }
+        if (!previousDraining && _depth == 0) await DrainPendingEnterFields(state, prompts);
+    }
+
+    /// <summary>
+    /// 在领袖受到伤害前依次询问防守方的置换效果。候选在窗口建立时冻结；玩家拒绝一张后仍可询问下一张。
+    /// 当前置换规则以“来源角色作为代价离场”作为成功提交，避免仅确认却未实际支付成本时吞掉伤害。
+    /// </summary>
+    internal static async Task<bool> TryReplaceLeaderDamageAsync(
+        GameState state,
+        int targetPlayerIndex,
+        int damage,
+        IPromptService prompts)
+    {
+        if (damage <= 0 || targetPlayerIndex < 0 || targetPlayerIndex >= state.Players.Length) return false;
+        var payload = new Dictionary<string, object?>
+        {
+            ["targetPlayerIdx"] = targetPlayerIndex,
+            ["damage"] = damage,
+        };
+        var defender = state.Players[targetPlayerIndex];
+        var candidates = new List<CardInstance> { defender.Leader };
+        candidates.AddRange(defender.Characters);
+        candidates.AddRange(defender.StageCards);
+        candidates = candidates
+            .Where(card => HasEffectForTrigger(card, EffectTrigger.PreDamageToLeader)
+                && IsTriggeredEffectAvailable(state, targetPlayerIndex, card,
+                    EffectTrigger.PreDamageToLeader, payload))
+            .ToList();
+
+        while (candidates.Count > 0 && !state.IsGameOver)
+        {
+            candidates.RemoveAll(card => state.SideOf(card) != targetPlayerIndex
+                || !HasEffectForTrigger(card, EffectTrigger.PreDamageToLeader)
+                || !IsTriggeredEffectAvailable(state, targetPlayerIndex, card,
+                    EffectTrigger.PreDamageToLeader, payload));
+            if (candidates.Count == 0) break;
+
+            var selected = candidates[0];
+            if (candidates.Count > 1)
+            {
+                var chosen = await prompts.ChooseCards(targetPlayerIndex, "EffectOrder",
+                    "多个伤害置换效果可用，请选择下一个要结算的效果",
+                    candidates.Select(card => card.Id.ToString()).ToList(), 1, 1,
+                    new Dictionary<string, object?>
+                    {
+                        ["choiceCards"] = candidates.Select(card => new
+                        {
+                            id = card.Id.ToString(),
+                            number = card.Info.Number,
+                            trigger = EffectTrigger.PreDamageToLeader.ToString(),
+                        }).ToList(),
+                    });
+                if (chosen.Count != 1) return false;
+                selected = candidates.FirstOrDefault(card => card.Id.ToString() == chosen[0]);
+                if (selected is null) return false;
+            }
+            candidates.Remove(selected);
+            if (state.SideOf(selected) != targetPlayerIndex
+                || !IsTriggeredEffectAvailable(state, targetPlayerIndex, selected,
+                    EffectTrigger.PreDamageToLeader, payload)) continue;
+
+            var replacement = new LeaderDamageReplacementCommit();
+            payload["replacementCommit"] = replacement;
+            await Resolve(state, targetPlayerIndex, selected,
+                EffectTrigger.PreDamageToLeader, prompts, payload);
+            if (replacement.Committed) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 伤害置换只有在脚本完成卡面成本后才能显式提交。不能用来源是否离场推断，
+    /// 因为等待确认期间的并发状态变化也可能让来源离场。
+    /// </summary>
+    internal static void CommitLeaderDamageReplacement(IReadOnlyDictionary<string, object?> payload)
+    {
+        if (payload.TryGetValue("replacementCommit", out var value)
+            && value is LeaderDamageReplacementCommit commit)
+            commit.Committed = true;
+    }
+
+    private sealed class LeaderDamageReplacementCommit
+    {
+        public bool Committed { get; set; }
     }
 
     // ── Wave2 反应式 watcher 基础设施 ──
@@ -49,6 +214,8 @@ public static class EffectRuntime
     private static readonly AsyncLocal<CardInstance?> _currentSourceAL = new();
     private static readonly AsyncLocal<int?> _actingSideAL = new();
     private static readonly AsyncLocal<IPromptService?> _promptsAL = new();
+    private static readonly AsyncLocal<bool> _lifeTriggerOriginAL = new();
+    private static readonly AsyncLocal<EffectLeaveReplacementProcess?> _leaveReplacementProcessAL = new();
     private static GameState? _ambient { get => _ambientAL.Value; set => _ambientAL.Value = value; }
     private static int _depth { get => _depthAL.Value; set => _depthAL.Value = value; }
     private static bool _draining { get => _drainingAL.Value; set => _drainingAL.Value = value; }
@@ -70,9 +237,55 @@ public static class EffectRuntime
     /// 免去给 136 处同步调用点改签名。</summary>
     public static IPromptService? CurrentPrompts => _promptsAL.Value;
 
-    /// <summary>由 AtomicOps 在状态变更时调用，把 watcher 事件入队到当前效果所属的 state（无效果上下文时忽略）</summary>
+    /// <summary>当前效果链是否起源于生命【触发】。
+    /// 供效果登场入队时保留规则来源；卡牌在发动触发后已经进入废弃区，不能仅靠来源区域判断。</summary>
+    public static bool CurrentEffectOriginatesFromLifeTrigger => _lifeTriggerOriginAL.Value;
+
+    /// <summary>
+    /// 一张卡牌效果的一次完整结算中已经支付的离场置换。旧卡效可能把多目标离场拆成多个步骤，
+    /// 因此不能只依赖“同时离场”目标集合；置换触发自身会继承外层效果的处理过程。
+    /// </summary>
+    private sealed class EffectLeaveReplacementProcess(GameState state)
+    {
+        public GameState State { get; } = state;
+        public List<(int Owner, Func<CardInstance, bool> Matches)> Grants { get; } = new();
+    }
+
+    internal static void RegisterEffectLeaveReplacement(
+        GameState state, int owner, Func<CardInstance, bool> matches)
+    {
+        var process = _leaveReplacementProcessAL.Value;
+        if (process is null || !ReferenceEquals(process.State, state)) return;
+        process.Grants.Add((owner, matches));
+    }
+
+    internal static bool IsEffectLeaveReplacementCovered(
+        GameState state, int owner, CardInstance card)
+    {
+        var process = _leaveReplacementProcessAL.Value;
+        return process is not null
+            && ReferenceEquals(process.State, state)
+            && process.Grants.Any(grant => grant.Owner == owner && grant.Matches(card));
+    }
+
+    /// <summary>由 AtomicOps 在状态变更时调用，把 watcher 事件入队到当前效果所属的 state（无效果上下文时忽略）。
+    /// 角色因效果离场时附带效果控制方，供“因对方的效果离场”类监听准确判定。</summary>
     public static void NotifyWatcher(EffectTrigger trigger, Dictionary<string, object?>? payload = null)
-        => _ambient?.EnqueueWatcher(trigger, payload);
+    {
+        var state = _ambient;
+        if (state is null) return;
+
+        if (trigger is EffectTrigger.OnCharLeaveField or EffectTrigger.OnAnyCharKOd or EffectTrigger.OnCharRested)
+        {
+            payload = payload is null
+                ? new Dictionary<string, object?>()
+                : new Dictionary<string, object?>(payload);
+            payload.TryAdd("actingSide", CurrentActingSide);
+            payload.TryAdd("sourceNumber", CurrentSource?.Info.Number);
+        }
+
+        state.EnqueueWatcher(trigger, payload);
+    }
 
     /// <summary>是否正在支付效果成本（DSL PayActivationCost 内为 true）。
     /// 供 OnHandDiscarded 消费端按各自规则区分成本与收益阶段；OP12-040 两者均会触发。</summary>
@@ -82,25 +295,52 @@ public static class EffectRuntime
     /// <summary>手牌因效果被丢弃时入队 OnHandDiscarded（owner=该手牌所属方）；仅效果上下文内有效。
     /// payload 额外携带丢弃来源：sourceNumber=当前结算效果的来源卡番号、actingSide=效果控制方、
     /// isCost=是否成本支付，供只关心收益阶段或只关心成本阶段的监听按各自规则判定。</summary>
-    public static void NotifyHandDiscarded(PlayerState p)
+    public static void NotifyHandDiscarded(PlayerState p, CardInstance card)
     {
         var s = _ambient;
         if (s is null) return;
         int owner = ReferenceEquals(s.Players[0], p) ? 0 : ReferenceEquals(s.Players[1], p) ? 1 : -1;
         if (owner < 0) return;
-        if (!PayingCost) p.HandDiscardedByEffectThisTurn = true;
+        NotifyHandDiscarded(s, owner, card, CurrentSource?.Info.Number, CurrentActingSide, PayingCost);
+    }
+
+    /// <summary>延迟效果仍须保留弃牌来源与监听事件，不能依赖已经结束的发动上下文。</summary>
+    internal static void NotifyHandDiscarded(GameState s, int owner, CardInstance card,
+        string? sourceNumber, int actingSide, bool isCost)
+    {
+        // ST33-004 的“因效果而被丢弃”包含效果文本冒号前的发动成本；
+        // PayingCost 仍通过 watcher payload 下发，供其他监听按各自规则区分。
+        s.Players[owner].HandDiscardedByEffectThisTurn = true;
         s.EnqueueWatcher(EffectTrigger.OnHandDiscarded, new Dictionary<string, object?>
         {
             ["owner"] = owner,
-            ["sourceNumber"] = CurrentSource?.Info.Number,
-            ["actingSide"] = CurrentActingSide,
-            ["isCost"] = PayingCost,
+            ["sourceNumber"] = sourceNumber,
+            ["actingSide"] = actingSide,
+            ["isCost"] = isCost,
+            ["cardId"] = card.Id.ToString(),
+            ["cardKind"] = card.Info.Kind.ToString(),
         });
     }
 
     /// <summary>对单个卡牌的指定触发时机解析效果</summary>
-    public static async Task Resolve(GameState s, int ownerIdx, CardInstance source, EffectTrigger trigger, IPromptService prompts, Dictionary<string, object?>? payload = null)
+    public static async Task Resolve(
+        GameState s,
+        int ownerIdx,
+        CardInstance source,
+        EffectTrigger trigger,
+        IPromptService prompts,
+        Dictionary<string, object?>? payload = null,
+        bool hexCopy = false,
+        bool lifeTriggerOrigin = false,
+        string? effectExecutionId = null,
+        bool triggerAvailabilityAlreadyCaptured = false)
     {
+        // 测试构造器、历史规则包及其它非 GameEngine 入口也必须获得统一的离场提交清理。
+        s.BindFieldDepartureLifecycle();
+        var owner = s.Players[ownerIdx];
+        int turnOnceCountBefore = owner.TurnOnceUsed.Count;
+        var turnOnceKeysBefore = owner.TurnOnceUsed.ToHashSet(StringComparer.Ordinal);
+        var cardOnceKeysBefore = source.OncePerTurnUsedKeys.ToHashSet(StringComparer.Ordinal);
         // 许多旧脚本直接操作 LifeArea，容易漏派发“生命牌离场”监听。
         // 仅最外层效果记录前后生命区的卡实例，统一补齐实际离开的生命牌事件；
         // 嵌套效果共用这一轮快照，避免同一张生命牌被重复通知。
@@ -122,24 +362,44 @@ public static class EffectRuntime
         var prevSource = _currentSourceAL.Value;
         var prevActing = _actingSideAL.Value;
         var prevPrompts = _promptsAL.Value;
+        bool prevLifeTriggerOrigin = _lifeTriggerOriginAL.Value;
+        var prevLeaveReplacementProcess = _leaveReplacementProcessAL.Value;
+        bool inheritLeaveReplacementProcess = prevLeaveReplacementProcess is not null
+            && ReferenceEquals(prevLeaveReplacementProcess.State, s)
+            && trigger is EffectTrigger.PreKO
+                or EffectTrigger.OnAllyWillBeKOd
+                or EffectTrigger.OnAllyWillLeaveField;
+        if (!inheritLeaveReplacementProcess)
+            _leaveReplacementProcessAL.Value = new EffectLeaveReplacementProcess(s);
         _ambient = s;
         _currentSourceAL.Value = source;
         _actingSideAL.Value = ownerIdx;
         _promptsAL.Value = prompts;
+        _lifeTriggerOriginAL.Value = prevLifeTriggerOrigin || lifeTriggerOrigin;
         _depth++;
         try
         {
+            var activationProbe = HexRules.NeedsActivationProbe(s, ownerIdx, source, trigger, hexCopy)
+                ? new TriggerActivationProbe(prompts)
+                : null;
             var ctx = new EffectContext
             {
                 State = s,
                 OwnerIndex = ownerIdx,
                 Source = source,
+                ExecutionId = effectExecutionId ?? s.NextEffectExecutionId(source, trigger),
                 Trigger = trigger,
-                Prompts = prompts,
+                Prompts = activationProbe?.Prompts ?? prompts,
                 Engine = (prompts as PromptSystem)?.Engine,
             };
             if (payload is not null)
                 foreach (var (k, v) in payload) ctx.Vars[k] = v;
+
+            // 静态场上效果并不属于【登场时】效果。即使 OP09-081 等效果令【登场时】无效，
+            // 角色自身的持续费用、力量与守护能力仍须完成注册，待整卡无效结束后也能自动恢复。
+            var scripted = CardRulesetManager.For(s).TryGetScriptedEffect(source.Info.Number);
+            if (trigger == EffectTrigger.OnEnterField && scripted is IFieldStaticEffect fieldStatic)
+                await fieldStatic.RegisterFieldStatic(ctx);
 
             // “发动过事件”是发动历史，而不是事件效果是否成功解决。
             // 统一在效果运行时记录，确保从手牌直接发动、反击发动和被其它效果免费发动都能被统计。
@@ -150,35 +410,85 @@ public static class EffectRuntime
                 s.Players[ownerIdx].HasActivatedBaseCost3PlusEventThisTurn = true;
             }
 
-            // 持续"效果无效"：被持续无效化的卡（整卡或该类触发），其效果不发动
-            if (source.IsEffectsNullified || s.IsContinuouslyNullified(source) || s.IsTriggerNullified(source, trigger)) return;
+            // 整卡无效仍是卡牌状态；选择性【登场时】无效则在下方按单次执行消费，
+            // 不能把持续判定写成该卡的永久禁用状态。
+            if (source.IsEffectsNullified || s.IsContinuouslyNullified(source)) return;
+
+            // 一些监听效果的卡面时机虽然匹配，但当前事件归属、回合或成本条件并不成立。
+            // 在效果排序和发动表现之前做同一份权威门禁，避免先向玩家显示“效果发动”，
+            // 随后脚本再静默 return；直接 Resolve 的测试/回放入口也必须遵守相同约束。
+            if (!triggerAvailabilityAlreadyCaptured
+                && scripted is ITriggeredEffectAvailability triggerAvailability
+                && !triggerAvailability.IsTriggerAvailable(s, ownerIdx, source, trigger, payload)) return;
+
+            // 只有卡面确实拥有并实际进入本次触发解决的效果才会消费选择性无效化。
+            // 执行标识同时绑定来源实例与触发类型；重复请求或恢复路径不会让同一执行穿透，
+            // 而静态注册已在上方完成，其它触发也不会被 OnEnterField 无效化误伤。
+            if (HasEffectForTrigger(source, trigger)
+                && s.ConsumeTriggerNullification(source, trigger, ctx.ExecutionId)) return;
+
+            // H16/H17 等“再次发动”只绑定到实际进入解决的效果。脚本中的条件失败、成本失败、
+            // 空候选静默返回均不得抢占本回合第一次复制机会。
+            activationProbe?.Begin(s);
 
             // 出牌流程会统一调用 OnEnterField，即使卡牌没有该时点效果；只为确实声明了
             // 当前触发时机的卡记录表现，避免无效果卡登场时误播“效果发动”。
             // 提示型快照会立即带走事件，无交互效果则随本批次最终快照发送。
             if (HasEffectForTrigger(source, trigger))
-                ctx.Engine?.QueueEffectActivation(ownerIdx, source, trigger);
+                ctx.Engine?.QueueEffectActivation(ownerIdx, source, trigger, ctx.ExecutionId);
 
             // 1. 优先用手写脚本
-            var scripted = ScriptedEffectRegistry.TryGet(source.Info.Number);
             if (scripted is not null && scripted.HandlesTrigger(trigger))
             {
                 await scripted.Resolve(ctx);
+                bool actuallyActivated = activationProbe?.WasActivated(s, ctx) ?? true;
+                HexRules.ApplyInventorSecondUse(
+                    s, ownerIdx, source, trigger, actuallyActivated, turnOnceKeysBefore, cardOnceKeysBefore);
+                MarkOncePerTurnCardUsedIfConsumed(s, owner, source, turnOnceCountBefore);
+                await HexRules.AfterEffectResolvedAsync(
+                    s, ownerIdx, source, trigger, prompts, hexCopy, actuallyActivated);
+                await ResolveHexCopyAsync(
+                    s, ownerIdx, source, trigger, prompts, payload, hexCopy, actuallyActivated);
                 return;
             }
 
             // 2. 已确认省略项的前置补齐层：支付旧 DSL 无法表达的成本、注册持续效果，
             // 或在旧定义不精确时完整接管该触发。返回 false 表示本次已处理/取消，不再执行 DSL。
-            if (!await DeclaredOmissionEffects.BeforeDsl(ctx)) return;
+            if (!await DeclaredOmissionEffects.BeforeDsl(ctx))
+            {
+                bool actuallyActivated = activationProbe?.WasActivated(s, ctx) ?? true;
+                HexRules.ApplyInventorSecondUse(
+                    s, ownerIdx, source, trigger, actuallyActivated, turnOnceKeysBefore, cardOnceKeysBefore);
+                MarkOncePerTurnCardUsedIfConsumed(s, owner, source, turnOnceCountBefore);
+                await HexRules.AfterEffectResolvedAsync(
+                    s, ownerIdx, source, trigger, prompts, hexCopy, actuallyActivated);
+                await ResolveHexCopyAsync(
+                    s, ownerIdx, source, trigger, prompts, payload, hexCopy, actuallyActivated);
+                return;
+            }
 
             // 3. 退回 DSL
-            await Dsl.DslInterpreter.TryResolve(ctx);
+            bool dslActivated = await Dsl.DslInterpreter.TryResolve(ctx);
 
             // 4. 后置补齐层：依赖 DSL 刚选中的同一目标，补结算条件加成、关键字或后续动作。
             await DeclaredOmissionEffects.AfterDsl(ctx);
+            bool dslActuallyActivated = dslActivated || (activationProbe?.WasActivated(s, ctx) ?? false);
+            HexRules.ApplyInventorSecondUse(
+                s, ownerIdx, source, trigger, dslActuallyActivated, turnOnceKeysBefore, cardOnceKeysBefore);
+            MarkOncePerTurnCardUsedIfConsumed(s, owner, source, turnOnceCountBefore);
+            await HexRules.AfterEffectResolvedAsync(
+                s, ownerIdx, source, trigger, prompts, hexCopy, dslActuallyActivated);
+            await ResolveHexCopyAsync(
+                s, ownerIdx, source, trigger, prompts, payload, hexCopy, dslActuallyActivated);
+        }
+        catch (OptionalEffectDeclinedException)
+        {
+            // 玩家在尚未支付成本时返回上一级并改选“不发动”，属于正常交互，不应记为效果异常。
+            return;
         }
         finally
         {
+            (prompts as PromptSystem)?.ClearOptionalConfirmation(ownerIdx, source.Id);
             if (donBefore is not null)
             {
                 foreach (var don in s.Players[ownerIdx].CostArea)
@@ -188,15 +498,123 @@ public static class EffectRuntime
             }
             _depth--;
             if (isRootResolve)
-                EnqueueLifeLeaveWatchers(s, lifeBefore0!, lifeBefore1!);
+            {
+                await HandleLifeZoneChangesAsync(s, prompts, lifeBefore0!, lifeBefore1!);
+                for (int playerIndex = 0; playerIndex < s.Players.Length && !s.IsGameOver; playerIndex++)
+                    if (s.Players[playerIndex].Deck.Count == 0)
+                        await HexRules.ResolveEmptyDeckAsync(s, playerIndex, prompts);
+            }
             _ambient = prevAmbient;
             _currentSourceAL.Value = prevSource;
             _actingSideAL.Value = prevActing;
             _promptsAL.Value = prevPrompts;
+            _lifeTriggerOriginAL.Value = prevLifeTriggerOrigin;
+            _leaveReplacementProcessAL.Value = prevLeaveReplacementProcess;
+            if (isRootResolve)
+                s.EvaluateDeckOut();
             // 最外层效果结束后，排空期间积累的【KO时】、反应式 watcher 与被效果登场卡的【登场时】。
             if (_depth == 0 && !_draining
                 && (s.PendingKOEffects.Count > 0 || s.PendingWatchers.Count > 0 || s.PendingEnterFields.Count > 0))
                 await DrainPendingEnterFields(s, prompts);
+        }
+    }
+
+    private static void MarkOncePerTurnCardUsedIfConsumed(GameState s, PlayerState owner, CardInstance source, int turnOnceCountBefore)
+    {
+        if (owner.TurnOnceUsed.Count > turnOnceCountBefore && OncePerTurnEffectCatalog.Contains(source.Info.Number, s))
+            owner.OncePerTurnEffectUsedCardIds.Add(source.Id);
+    }
+
+    private static async Task ResolveHexCopyAsync(
+        GameState state,
+        int owner,
+        CardInstance source,
+        EffectTrigger trigger,
+        IPromptService prompts,
+        Dictionary<string, object?>? payload,
+        bool alreadyCopied,
+        bool actuallyActivated)
+    {
+        if (!actuallyActivated
+            || !HasEffectForTrigger(source, trigger)
+            || !HexRules.ShouldCopyEffect(state, owner, source, trigger, alreadyCopied))
+            return;
+        var copyPayload = payload is null
+            ? new Dictionary<string, object?>()
+            : new Dictionary<string, object?>(payload);
+        copyPayload["hexCopied"] = true;
+        await Resolve(state, owner, source, trigger, prompts, copyPayload, hexCopy: true);
+    }
+
+    /// <summary>
+    /// 手写脚本仍沿用 Task 接口，无法直接返回“是否真正发动”。仅在玩家拥有复制类海克斯时，
+    /// 以权威状态变化、有效交互或公开动作作为实际发动证据，避免给所有历史脚本增加侵入式标记。
+    /// </summary>
+    private sealed class TriggerActivationProbe
+    {
+        private string? _before;
+        private bool _interactionAccepted;
+
+        public TriggerActivationProbe(IPromptService prompts)
+            => Prompts = new TrackingPromptService(prompts, () => _interactionAccepted = true);
+
+        public IPromptService Prompts { get; }
+
+        public void Begin(GameState state)
+        {
+            _interactionAccepted = false;
+            _before = Fingerprint(state);
+        }
+
+        public bool WasActivated(GameState state, EffectContext context)
+            => context.ExplicitActivationObserved
+               || _interactionAccepted
+               || (_before is not null && !string.Equals(_before, Fingerprint(state), StringComparison.Ordinal));
+
+        private static string Fingerprint(GameState state)
+        {
+            // 复用确定性回放的完整规则状态投影：它覆盖限时力量/费用、区域、标记、触发队列与
+            // 海克斯运行态，却刻意不含 tick、棋钟、Prompt 截止时间等调度字段。这样真实 Prompt
+            // 跨动作返回“不发动”不会误消费首次复制，而 P-107 这类只写限时修正的实际效果仍可识别。
+            return DeterministicReplayCheckpointProvider.BuildFullState(state).GetRawText();
+        }
+    }
+
+    private sealed class TrackingPromptService(IPromptService inner, Action markAccepted) : IPromptService
+    {
+        public async Task<List<string>> ChooseCards(
+            int playerIdx,
+            string kind,
+            string text,
+            IReadOnlyList<string> validChoices,
+            int min,
+            int max,
+            Dictionary<string, object?>? extra = null)
+        {
+            var chosen = await inner.ChooseCards(playerIdx, kind, text, validChoices, min, max, extra);
+            if (chosen.Count > 0) markAccepted();
+            return chosen;
+        }
+
+        public async Task<bool> ConfirmOptional(int playerIdx, string text)
+        {
+            // 单独确认“愿意发动”不代表成本或效果已实际落地；后续权威状态变化才计入发动。
+            return await inner.ConfirmOptional(playerIdx, text);
+        }
+
+        public async Task<int> ChooseOption(int playerIdx, string text, IReadOnlyList<string> options,
+            Dictionary<string, object?>? extra = null)
+        {
+            int selected = await inner.ChooseOption(playerIdx, text, options, extra);
+            markAccepted();
+            return selected;
+        }
+
+        public async Task<bool> AskLifeTrigger(int playerIdx, CardInstance lifeCard, bool hasRealTrigger)
+        {
+            bool accepted = await inner.AskLifeTrigger(playerIdx, lifeCard, hasRealTrigger);
+            if (accepted) markAccepted();
+            return accepted;
         }
     }
 
@@ -227,6 +645,31 @@ public static class EffectRuntime
         }
     }
 
+    private static async Task HandleLifeZoneChangesAsync(
+        GameState state,
+        IPromptService prompts,
+        HashSet<Guid> lifeBefore0,
+        HashSet<Guid> lifeBefore1)
+    {
+        EnqueueLifeLeaveWatchers(state, lifeBefore0, lifeBefore1);
+        if ((prompts as PromptSystem)?.Engine is not { } engine) return;
+
+        var addedCounts = new int[2];
+        var movedToHand = new bool[2];
+        for (int owner = 0; owner < 2; owner++)
+        {
+            var before = owner == 0 ? lifeBefore0 : lifeBefore1;
+            addedCounts[owner] = state.Players[owner].LifeArea.Count(card => !before.Contains(card.Id));
+            movedToHand[owner] = state.Players[owner].Hand.Any(card => before.Contains(card.Id));
+        }
+        for (int owner = 0; owner < 2; owner++)
+            if (addedCounts[owner] > 0)
+                await HexRules.OnLifeAddedAsync(engine, owner, addedCounts[owner]);
+        for (int owner = 0; owner < 2; owner++)
+            if (movedToHand[owner])
+                await HexRules.OnLifeMovedToHandByEffectAsync(engine, owner);
+    }
+
     /// <summary>排空旧同步 KO 的【KO时】、watcher 队列与被效果登场卡的【登场时】（带再入上限防死循环）。
     /// 反馈#203：改为 public，供 LifeRevealManager 在"纯自登场"(PlayFromTrashFree 只 EnqueueEnterField)之后
     /// 显式排空一次——否则该链路后续若无 depth-0 的 Resolve，PendingEnterFields 不会被排空，
@@ -255,7 +698,10 @@ public static class EffectRuntime
                     s.KOSourceCardId = ko.SourceCardId;
                     try
                     {
-                        await Resolve(s, ko.Owner, ko.Card, EffectTrigger.OnKO, prompts);
+                        // 延迟 KO 在事件发生时已经冻结受害卡事实与监听者集合：后续新登场者不得追溯触发，
+                        // 当时已触发但随后离场的监听者仍保留其待结算效果。
+                        await ResolveKOEffects(s, ko.Owner, ko.Card, prompts,
+                            ko.Payload, ko.ListenerSnapshot);
                     }
                     finally
                     {
@@ -309,21 +755,93 @@ public static class EffectRuntime
         var p = s.Players[ef.Owner];
         CardInstance? card = p.Characters.FirstOrDefault(c => c.Id == ef.CardId);
         if (card is null && p.StageCard is { } st && st.Id == ef.CardId) card = st;
+        if (card is null && p.ExtraStageCard is { } extraStage && extraStage.Id == ef.CardId) card = extraStage;
         if (card is null) return; // 已离场，跳过
-        await Resolve(s, ef.Owner, card, EffectTrigger.OnEnterField, prompts);
-        if (!s.IsGameOver && card.Info.Kind == CardKind.Character)
-            await TriggerEvent(s, EffectTrigger.OnAllyCharEnter, prompts,
-                new Dictionary<string, object?>
-                {
-                    ["cardId"] = card.Id.ToString(),
-                    ["owner"] = ef.Owner,
-                    ["from"] = ef.From,
-                    ["effectSourceKind"] = ef.EffectSourceKind?.ToString(),
-                    ["effectSourceNumber"] = ef.EffectSourceNumber,
-                });
+        var enterPayload = new Dictionary<string, object?>
+        {
+            ["cardId"] = card.Id.ToString(),
+            ["owner"] = ef.Owner,
+            ["from"] = ef.From,
+            ["effectSourceKind"] = ef.EffectSourceKind?.ToString(),
+            ["effectSourceNumber"] = ef.EffectSourceNumber,
+            ["lifeTriggerOrigin"] = ef.LifeTriggerOrigin,
+        };
+        if (card.Info.Kind == CardKind.Character)
+            HexRules.OnCharacterEntered(s, ef.Owner, card, ef.From, byEffect: true);
+
+        // 没有登场时效果的卡仍要经过 Resolve 注册静态场上能力，但不应作为排序候选展示。
+        if (!HasEffectForTrigger(card, EffectTrigger.OnEnterField))
+        {
+            await Resolve(s, ef.Owner, card, EffectTrigger.OnEnterField, prompts);
+            if (s.IsGameOver) return;
+        }
+
+        var effects = new List<TriggeredCandidate>();
+        if (HasEffectForTrigger(card, EffectTrigger.OnEnterField))
+            effects.Add(new TriggeredCandidate(ef.Owner, card, EffectTrigger.OnEnterField, null));
+        if (card.Info.Kind == CardKind.Character)
+            effects.AddRange(CollectListeners(s, EffectTrigger.OnAllyCharEnter, enterPayload)
+                .Select(candidate => new TriggeredCandidate(candidate.OwnerIdx, candidate.Source,
+                    EffectTrigger.OnAllyCharEnter, enterPayload)));
+        await ResolveTriggeredCandidatesInOrder(s, prompts, effects);
     }
 
     private record Candidate(int OwnerIdx, CardInstance Source);
+    private record TriggeredCandidate(
+        int OwnerIdx,
+        CardInstance Source,
+        EffectTrigger Trigger,
+        Dictionary<string, object?>? Payload,
+        bool AvailabilityCaptured = false);
+
+    /// <summary>同一规则处理点内，回合玩家优先；同一玩家有多个待发效果时由该玩家决定顺序。</summary>
+    private static async Task ResolveTriggeredCandidatesInOrder(
+        GameState state,
+        IPromptService prompts,
+        List<TriggeredCandidate> remaining)
+    {
+        while (remaining.Count > 0 && !state.IsGameOver)
+        {
+            remaining.RemoveAll(candidate => !candidate.AvailabilityCaptured
+                && !IsTriggeredEffectAvailable(state, candidate.OwnerIdx,
+                    candidate.Source, candidate.Trigger, candidate.Payload));
+            if (remaining.Count == 0) break;
+            int owner = remaining.Any(candidate => candidate.OwnerIdx == state.CurrentTurnPlayer)
+                ? state.CurrentTurnPlayer
+                : remaining[0].OwnerIdx;
+            var owned = remaining.Where(candidate => candidate.OwnerIdx == owner).ToList();
+            var selected = owned[0];
+            if (owned.Count > 1)
+            {
+                var duplicateSourceIds = owned.GroupBy(candidate => candidate.Source.Id)
+                    .Where(group => group.Count() > 1)
+                    .Select(group => group.Key)
+                    .ToHashSet();
+                string Token(TriggeredCandidate candidate) => duplicateSourceIds.Contains(candidate.Source.Id)
+                    ? $"{candidate.Source.Id}:{candidate.Trigger}"
+                    : candidate.Source.Id.ToString();
+                var tokens = owned.Select(Token).ToList();
+                var chosen = await prompts.ChooseCards(owner, "EffectOrder",
+                    "多个效果同时触发，请选择下一个要结算的效果",
+                    tokens, 1, 1,
+                    new Dictionary<string, object?>
+                    {
+                        ["choiceCards"] = owned.Select(candidate => new
+                        {
+                            id = Token(candidate),
+                            number = candidate.Source.Info.Number,
+                            trigger = candidate.Trigger.ToString(),
+                        }).ToList(),
+                    });
+                if (chosen.Count > 0)
+                    selected = owned.FirstOrDefault(candidate => Token(candidate) == chosen[0]) ?? selected;
+            }
+
+            remaining.Remove(selected);
+            await Resolve(state, selected.OwnerIdx, selected.Source, selected.Trigger, prompts, selected.Payload,
+                triggerAvailabilityAlreadyCaptured: selected.AvailabilityCaptured);
+        }
+    }
 
     private static List<Candidate> CollectListeners(GameState s, EffectTrigger trigger, Dictionary<string, object?>? payload)
     {
@@ -345,7 +863,8 @@ public static class EffectRuntime
             var attacker = atkP.Leader.Id == b.AttackerCardId
                 ? atkP.Leader
                 : atkP.Characters.FirstOrDefault(c => c.Id == b.AttackerCardId);
-            if (attacker != null && HasEffectForTrigger(attacker, trigger))
+            if (attacker != null && HasEffectForTrigger(attacker, trigger)
+                && IsTriggeredEffectAvailable(s, ai2, attacker, trigger, payload))
                 list.Add(new(ai2, attacker));
             return list;
         }
@@ -355,17 +874,53 @@ public static class EffectRuntime
             if (skipIdx.HasValue && i == skipIdx.Value) continue;
             var p = s.Players[i];
             // 领袖
-            if (HasEffectForTrigger(p.Leader, trigger))
+            if (HasEffectForTrigger(p.Leader, trigger)
+                && IsTriggeredEffectAvailable(s, i, p.Leader, trigger, payload))
                 list.Add(new(i, p.Leader));
             // 角色
             foreach (var c in p.Characters)
-                if (HasEffectForTrigger(c, trigger))
+                if (HasEffectForTrigger(c, trigger)
+                    && IsTriggeredEffectAvailable(s, i, c, trigger, payload))
                     list.Add(new(i, c));
             // 舞台
-            if (p.StageCard is not null && HasEffectForTrigger(p.StageCard, trigger))
+            if (p.StageCard is not null && HasEffectForTrigger(p.StageCard, trigger)
+                && IsTriggeredEffectAvailable(s, i, p.StageCard, trigger, payload))
                 list.Add(new(i, p.StageCard));
+            if (p.ExtraStageCard is not null && HasEffectForTrigger(p.ExtraStageCard, trigger)
+                && IsTriggeredEffectAvailable(s, i, p.ExtraStageCard, trigger, payload))
+                list.Add(new(i, p.ExtraStageCard));
         }
         return list;
+    }
+
+    internal static bool IsTriggeredEffectAvailable(
+        GameState state,
+        int ownerIndex,
+        CardInstance source,
+        EffectTrigger trigger,
+        Dictionary<string, object?>? payload)
+    {
+        var scripted = CardRulesetManager.For(state).TryGetScriptedEffect(source.Info.Number);
+        return scripted is not ITriggeredEffectAvailability availability
+            || availability.IsTriggerAvailable(state, ownerIndex, source, trigger, payload);
+    }
+
+    /// <summary>
+    /// KO 置换排序必须只展示当前规则集能够实际解决的效果。EffectTags 是从历史卡面文本迁移的
+    /// 候选索引，个别卡会同时带兼容标签，但脚本只实现其中一个引擎触发窗口。
+    /// </summary>
+    internal static bool HasResolvableKOReplacementEffect(
+        GameState state,
+        CardInstance source,
+        EffectTrigger trigger)
+    {
+        if (!HasEffectForTrigger(source, trigger)) return false;
+
+        var ruleset = CardRulesetManager.For(state);
+        var scripted = ruleset.TryGetScriptedEffect(source.Info.Number);
+        return scripted?.HandlesTrigger(trigger) == true
+            || DeclaredOmissionEffects.HandlesKOReplacementTrigger(source.Info.Number, trigger)
+            || Dsl.DslInterpreter.HasTriggerDefinition(ruleset, source.Info.Number, trigger);
     }
 
     /// <summary>
@@ -390,42 +945,141 @@ public interface IScriptedEffect
     Task Resolve(EffectContext ctx);
 }
 
+/// <summary>
+/// 手写【启动主要】效果的额外发动条件。动作入口、合法动作列表与客户端权威快照
+/// 都通过同一接口判定，避免按钮可点但结算阶段静默失败。
+/// 返回 null 表示可以发动，否则返回拒绝原因。
+/// </summary>
+public interface IActivatedMainAvailability
+{
+    string? GetActivatedMainUnavailableReason(GameState state, int ownerIndex, CardInstance source);
+}
+
+/// <summary>
+/// 手写【主要】事件在从手牌发动前必须满足的额外条件。传入的是已经计算持续减费后的实际出牌费用；
+/// 动作入口、合法动作集合与真正结算共用同一权威规则，避免事件先进入废弃区后才发现成本或目标不成立。
+/// </summary>
+public interface IEventMainAvailability
+{
+    string? GetEventMainUnavailableReason(
+        GameState state,
+        int ownerIndex,
+        CardInstance source,
+        int effectivePlayCost);
+}
+
+/// <summary>
+/// 监听型效果的当前事件可用性。卡面 EffectTags 只表示“拥有该时机”，本接口进一步判断
+/// 此次事件的归属、回合、成本与目标是否满足；不满足时不得进入效果排序或发动表现。
+/// </summary>
+public interface ITriggeredEffectAvailability
+{
+    bool IsTriggerAvailable(
+        GameState state,
+        int ownerIndex,
+        CardInstance source,
+        EffectTrigger trigger,
+        IReadOnlyDictionary<string, object?>? payload);
+}
+
+/// <summary>
+/// 角色进入场上时需要注册、但规则上不属于【登场时】的静态效果。
+/// 该注册发生在选择性触发无效判定之前，注册后的持续效果仍会随整卡无效而停用。
+/// </summary>
+public interface IFieldStaticEffect
+{
+    Task RegisterFieldStatic(EffectContext ctx);
+}
+
+/// <summary>卡牌是否包含至少一项【每回合1次】效果。</summary>
+public static class OncePerTurnEffectCatalog
+{
+    // 手写效果缺少统一元数据，集中登记卡号；实际已使用状态由 EffectRuntime 在
+    // TurnOnceUsed 成功增加后记录，取消发动或支付失败不会消耗界面标识。
+    private static readonly HashSet<string> ScriptedCards = new(StringComparer.Ordinal)
+    {
+        "EB01-002", "EB01-008", "EB01-037", "EB01-040", "EB01-047", "EB02-006", "EB02-010", "EB02-023",
+        "EB02-035", "EB02-061", "EB03-001", "EB03-008", "EB03-013", "EB03-026", "EB03-033", "EB03-061",
+        "EB04-007", "EB04-012", "EB04-031", "EB04-035", "EB04-043", "EB04-044", "OP01-002", "OP01-004",
+        "OP01-031", "OP01-051", "OP01-061", "OP01-062", "OP01-112", "OP02-025", "OP02-026", "OP02-071",
+        "OP02-093", "OP02-094", "OP03-005", "OP03-076", "OP04-024", "OP04-053", "OP04-058", "OP04-060",
+        "OP04-063", "OP04-070", "OP04-072", "OP04-090", "OP04-102", "OP04-105", "OP05-001", "OP05-002",
+        "OP05-026", "OP05-029", "OP05-031", "OP05-032", "OP05-041", "OP05-053", "OP05-060", "OP05-074",
+        "OP05-080", "OP05-098", "OP05-100", "OP05-107", "OP05-109", "OP05-119", "OP06-009", "OP06-011",
+        "OP06-015", "OP06-021", "OP06-042", "OP06-044", "OP06-062", "OP06-076", "OP06-102", "OP06-111",
+        "OP06-117", "OP06-118", "OP07-001", "OP07-010", "OP07-029", "OP07-031", "OP07-038", "OP07-042",
+        "OP07-048", "OP07-060", "OP07-097", "OP08-001", "OP08-002", "OP08-021", "OP08-046", "OP08-056",
+        "OP08-057", "OP08-067", "OP08-074", "OP08-079", "OP08-101", "OP08-105", "OP09-022", "OP09-023",
+        "OP09-032", "OP09-061", "OP09-074", "OP09-084", "OP09-093", "OP10-001", "OP10-003", "OP10-022", "OP10-034",
+        "OP10-036", "OP10-037", "OP10-042", "OP10-066", "OP10-071", "OP10-074", "OP10-086", "OP10-092", "OP10-102",
+        "OP10-118", "OP11-001", "OP11-012", "OP11-022", "OP11-031", "OP11-041", "OP11-043", "OP11-062",
+        "OP11-071", "OP11-072", "OP11-073", "OP11-074", "OP11-077", "OP11-088", "OP11-101", "OP11-102",
+        "OP11-107", "OP11-117", "OP12-001", "OP12-004", "OP12-008", "OP12-020", "OP12-041", "OP12-053",
+        "OP12-061", "OP12-069", "OP12-081", "OP12-091", "OP12-099", "OP13-002", "OP13-017", "OP13-026",
+        "OP13-046", "OP13-078", "OP13-079", "OP13-081", "OP13-100", "OP14-001", "OP14-009", "OP14-016", "OP14-020",
+        "OP14-029", "OP14-041", "OP14-060", "OP14-068", "OP14-079", "OP14-080", "OP14-092", "OP14-105",
+        "OP15-001", "OP15-002", "OP15-003", "OP15-008", "OP15-010", "OP15-017", "OP15-022", "OP15-023",
+        "OP15-041", "OP15-058", "OP15-114", "OP16-001", "OP16-018", "OP16-022", "OP16-041", "OP16-080",
+        "OP17-001", "OP17-010", "OP17-020", "OP17-025", "OP17-030", "OP17-034", "OP17-040", "OP17-048",
+        "OP17-049", "OP17-053", "OP17-058", "OP17-062", "OP17-063", "OP17-064", "OP17-072", "OP17-101",
+        "P-011", "P-073", "P-076", "P-077", "P-086", "P-095", "P-096", "P-111", "P-122", "P-148", "PRB01-001",
+        "PRB02-002", "ST02-010", "ST03-007", "ST04-001", "ST05-010", "ST09-010", "ST10-002", "ST10-006",
+        "ST10-007", "ST10-011", "ST10-014", "ST12-001", "ST12-010", "ST13-001", "ST13-002", "ST13-003",
+        "ST15-005", "ST19-003", "ST19-004", "ST19-005", "ST20-002", "ST22-001", "ST22-005", "ST25-003",
+        "ST31-001", "ST34-001", "ST36-005", "OP18-001", "OP18-021", "OP18-022", "OP18-060", "OP18-119", "EB05-010",
+        "EB05-001", "EB05-006", "EB05-013", "EB05-053", "EB05-057", "EB05-061", "ST38-001",
+    };
+
+    public static bool Contains(string cardNumber, GameState? state = null)
+        => ScriptedCards.Contains(cardNumber)
+           || (state is null
+               ? Dsl.DslInterpreter.HasOncePerTurnEffect(cardNumber)
+               : CardRulesetManager.For(state).HasOncePerTurnEffect(cardNumber));
+}
+
 public static class ScriptedEffectRegistry
 {
-    private static readonly Dictionary<string, IScriptedEffect> _byNumber = new();
-    private static readonly object _scanLock = new();
-    private static volatile bool _scanned;
+    private static readonly Dictionary<string, IScriptedEffect> LegacyOverrides = new(StringComparer.OrdinalIgnoreCase);
 
     public static IScriptedEffect? TryGet(string number)
-    {
-        if (!_scanned) ScanAll();
-        return _byNumber.TryGetValue(number, out var e) ? e : null;
-    }
+        => LegacyOverrides.TryGetValue(number, out var legacy)
+            ? legacy
+            : CardRulesetManager.Current.TryGetScriptedEffect(number);
 
-    public static void Register(IScriptedEffect effect) => _byNumber[effect.CardNumber] = effect;
+    /// <summary>仅保留给旧测试/调试代码；线上规则热更新必须通过不可变规则包激活。</summary>
+    public static void Register(IScriptedEffect effect) => LegacyOverrides[effect.CardNumber] = effect;
 
-    private static void ScanAll()
+    internal static IReadOnlyDictionary<string, IScriptedEffect> ScanAssembly(
+        Assembly assembly,
+        bool rejectDuplicates = false)
     {
-        // 必须加锁且 _scanned 置位放在填充之后：否则并发下另一线程见 _scanned==true 即跳过扫描，
-        // 但此时 _byNumber 尚未填充完，TryGet 返回 null → 脚本卡效果被漏判（如领袖永续被动不注册）。
-        lock (_scanLock)
+        var effects = new Dictionary<string, IScriptedEffect>(StringComparer.OrdinalIgnoreCase);
+        Type[] types;
+        try
         {
-            if (_scanned) return;
-            // 反射扫描当前程序集中所有 IScriptedEffect 实现
-            var asm = typeof(ScriptedEffectRegistry).Assembly;
-            foreach (var t in asm.GetTypes())
-            {
-                if (t.IsAbstract || t.IsInterface) continue;
-                if (!typeof(IScriptedEffect).IsAssignableFrom(t)) continue;
-                try
-                {
-                    var inst = (IScriptedEffect)Activator.CreateInstance(t)!;
-                    _byNumber[inst.CardNumber] = inst;
-                }
-                catch { /* 跳过构造失败的 */ }
-            }
-            Console.WriteLine($"[Effects] 已注册 {_byNumber.Count} 张手写卡效果");
-            _scanned = true;
+            types = assembly.GetTypes();
         }
+        catch (ReflectionTypeLoadException ex)
+        {
+            types = ex.Types.Where(type => type is not null).Cast<Type>().ToArray();
+        }
+
+        foreach (var type in types)
+        {
+            if (type.IsAbstract || type.IsInterface || !typeof(IScriptedEffect).IsAssignableFrom(type)) continue;
+            try
+            {
+                var instance = (IScriptedEffect)Activator.CreateInstance(type)!;
+                if (rejectDuplicates && effects.ContainsKey(instance.CardNumber))
+                    throw new InvalidOperationException($"程序集 {assembly.GetName().Name} 重复注册卡效 {instance.CardNumber}");
+                // 内置程序集沿用旧注册器的兼容行为：同一卡号后扫描到的实现覆盖前者。
+                effects[instance.CardNumber] = instance;
+            }
+            catch (MissingMethodException)
+            {
+                // 没有无参构造函数的类型不是可加载的卡效插件。
+            }
+        }
+        return effects;
     }
 }

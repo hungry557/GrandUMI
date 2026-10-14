@@ -37,8 +37,8 @@ public class ST25_003_CrocodileMihawk : IScriptedEffect
         var card = me.Hand.FirstOrDefault(c => c.Id.ToString() == chosen[0]);
         if (card is null) return;
         AtomicOps.DiscardHand(me, card);
-        if (nonKoLeave) ctx.State.MarkPreventLeave(victim.Id);
-        else ctx.State.MarkPreventKO(victim.Id);
+        ctx.State.MarkPreventEffectLeaveBatch(ctx.OwnerIndex, victim.Id,
+            card => card.Info.HasKeyword("十字公会"), isKoReplacement: !nonKoLeave);
         me.TurnOnceUsed.Add(key);
     }
 }
@@ -66,11 +66,35 @@ public class ST30_009_LittleOarsJr : IScriptedEffect
         if (victim.Id == self.Id) return; // 替身须为他卡
         if (!await ctx.Prompts.ConfirmOptional(ctx.OwnerIndex, "小奥兹Jr.：将自身置入废弃区并抽1张，使该力量6000角色不离场？")) return;
         BattleEngine.KOCard(ctx.State, ctx.OwnerIndex, self);
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
         if (ctx.Trigger == EffectTrigger.OnAllyWillLeaveField)
-            ctx.State.MarkPreventLeave(victim.Id);
+        {
+            var simultaneousVictims = ctx.State.SimultaneousLeaveVictimIds;
+            if (simultaneousVictims is null)
+                ctx.State.MarkPreventLeave(victim.Id);
+            else
+            {
+                // One replacement applies to every matching card removed by this same process.
+                foreach (var candidate in me.Characters)
+                    if (candidate.Id != self.Id && candidate.Info.Power == 6000 && simultaneousVictims.Contains(candidate.Id))
+                        ctx.State.MarkPreventLeave(candidate.Id);
+            }
+        }
         else
-            ctx.State.MarkPreventKO(victim.Id);
+        {
+            var simultaneousVictims = ctx.State.SimultaneousKOVictimIds;
+            if (simultaneousVictims is null)
+            {
+                ctx.State.MarkPreventKO(victim.Id);
+                return;
+            }
+
+            // The substitute itself is KO'd as the single cost, so it must mark
+            // every matching victim before it leaves the field.
+            foreach (var candidate in me.Characters)
+                if (candidate.Id != self.Id && candidate.Info.Power == 6000 && simultaneousVictims.Contains(candidate.Id))
+                    ctx.State.MarkPreventKO(candidate.Id);
+        }
     }
 }
 
@@ -97,9 +121,20 @@ public class ST30_011_Buggy : IScriptedEffect
         if (victim.Id == self.Id) return;
         if (self.IsTapped) return; // 已休息无法支付
         if (!await ctx.Prompts.ConfirmOptional(ctx.OwnerIndex, "巴奇：将自身转为休息状态，使该力量6000角色不离场？")) return;
-        AtomicOps.RestCard(self);
+        if (!AtomicOps.RestCard(self)) return;
         if (ctx.Trigger == EffectTrigger.OnAllyWillLeaveField)
-            ctx.State.MarkPreventLeave(victim.Id);
+        {
+            var simultaneousVictims = ctx.State.SimultaneousLeaveVictimIds;
+            if (simultaneousVictims is null)
+                ctx.State.MarkPreventLeave(victim.Id);
+            else
+            {
+                // One replacement applies to every matching card removed by this same process.
+                foreach (var candidate in me.Characters)
+                    if (candidate.Id != self.Id && candidate.Info.Power == 6000 && simultaneousVictims.Contains(candidate.Id))
+                        ctx.State.MarkPreventLeave(candidate.Id);
+            }
+        }
         else
         {
             var simultaneousVictims = ctx.State.SimultaneousKOVictimIds;

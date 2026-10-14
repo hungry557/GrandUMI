@@ -9,6 +9,11 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { usePathname } from "next/navigation";
+import {
+  ContainerResponsiveProvider,
+  LayoutQuarterTurnProvider,
+} from "@/components/ui/ResponsiveScope";
 import SettingsModal from "./SettingsModal";
 import {
   useLayoutPreviewMode,
@@ -19,8 +24,9 @@ interface LayoutSettingsContextValue {
   mode: SelectableLayoutPreviewMode;
   setMode: (mode: SelectableLayoutPreviewMode) => void;
   openSettings: () => void;
+  suppressSettingsTrigger: () => () => void;
   gameOverlayHost: HTMLDivElement | null;
-  setGameOverlayHost: (host: HTMLDivElement | null) => void;
+  setGameOverlayHost: (host: HTMLDivElement | null, rotateQuarterTurn?: boolean) => void;
 }
 
 const LayoutSettingsContext = createContext<LayoutSettingsContextValue | null>(null);
@@ -34,31 +40,55 @@ export function useLayoutSettings(): LayoutSettingsContextValue {
 }
 
 export default function LayoutSettingsProvider({ children }: { children: ReactNode }) {
+  const pathname = usePathname();
   const [mode, setMode] = useLayoutPreviewMode();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTriggerSuppressionCount, setSettingsTriggerSuppressionCount] = useState(0);
   const [gameOverlayHost, setGameOverlayHostState] = useState<HTMLDivElement | null>(null);
+  const [gameOverlayQuarterTurn, setGameOverlayQuarterTurn] = useState(false);
   const openSettings = useCallback(() => setSettingsOpen(true), []);
-  const setGameOverlayHost = useCallback((host: HTMLDivElement | null) => {
+  const suppressSettingsTrigger = useCallback(() => {
+    let active = true;
+    setSettingsTriggerSuppressionCount((count) => count + 1);
+    return () => {
+      if (!active) return;
+      active = false;
+      setSettingsTriggerSuppressionCount((count) => Math.max(0, count - 1));
+    };
+  }, []);
+  const setGameOverlayHost = useCallback((
+    host: HTMLDivElement | null,
+    rotateQuarterTurn = false,
+  ) => {
     setGameOverlayHostState(host);
+    setGameOverlayQuarterTurn(host ? rotateQuarterTurn : false);
   }, []);
   const contextValue = useMemo(
-    () => ({ mode, setMode, openSettings, gameOverlayHost, setGameOverlayHost }),
-    [gameOverlayHost, mode, openSettings, setGameOverlayHost, setMode],
+    () => ({
+      mode,
+      setMode,
+      openSettings,
+      suppressSettingsTrigger,
+      gameOverlayHost,
+      setGameOverlayHost,
+    }),
+    [gameOverlayHost, mode, openSettings, setGameOverlayHost, setMode, suppressSettingsTrigger],
   );
 
   const settingsUi = (
     <>
-      {!settingsOpen && (
+      {!settingsOpen && pathname !== "/game" && settingsTriggerSuppressionCount === 0 && (
         <button
           type="button"
           onClick={openSettings}
           aria-label="打开设置"
           title="设置"
+          data-layout-settings-trigger
           style={{
             right: "calc(0.625rem + var(--layout-safe-right, env(safe-area-inset-right)))",
             top: "calc(0.625rem + var(--layout-safe-top, env(safe-area-inset-top)))",
           }}
-          className="pointer-events-auto fixed z-[10000] flex h-11 w-11 items-center justify-center rounded-xl border border-gray-700/80 bg-gray-900/90 text-gray-300 shadow-lg backdrop-blur-md transition-colors hover:border-orange-500 hover:bg-gray-800 hover:text-white active:bg-gray-700 focus-visible:outline-2 focus-visible:outline-orange-400"
+          className="pointer-events-auto fixed z-[10000] flex h-12 w-12 items-center justify-center rounded-xl border border-gray-700/80 bg-gray-900/90 text-gray-300 shadow-lg backdrop-blur-md transition-colors hover:border-orange-500 hover:bg-gray-800 hover:text-white active:bg-gray-700 focus-visible:outline-2 focus-visible:outline-orange-400"
         >
           <svg
             viewBox="0 0 24 24"
@@ -89,7 +119,14 @@ export default function LayoutSettingsProvider({ children }: { children: ReactNo
   return (
     <LayoutSettingsContext.Provider value={contextValue}>
       {children}
-      {gameOverlayHost ? createPortal(settingsUi, gameOverlayHost) : settingsUi}
+      {gameOverlayHost
+        ? createPortal(
+            <LayoutQuarterTurnProvider rotateQuarterTurn={gameOverlayQuarterTurn}>
+              <ContainerResponsiveProvider>{settingsUi}</ContainerResponsiveProvider>
+            </LayoutQuarterTurnProvider>,
+            gameOverlayHost,
+          )
+        : settingsUi}
     </LayoutSettingsContext.Provider>
   );
 }

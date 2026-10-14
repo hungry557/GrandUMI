@@ -1,11 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CardData } from "@/types/card";
 import { getAllCachedCards, loadAllCards } from "@/data/CardLoader";
 import { useVirtualList } from "@/hooks/useVirtualList";
 import { CARD_BACK_SRC, nextCardImageSrc, thumbSrc } from "@/lib/sprite";
 import CardInfoPanel from "@/components/game/CardInfoPanel";
+import { useSlowImageFallback } from "@/hooks/useSlowImageFallback";
 import {
   CARD_COSTS,
   CARD_PROPERTIES,
@@ -27,6 +28,8 @@ const COLOR_OPTIONS = ["红", "绿", "蓝", "紫", "黑", "黄"];
 const CARD_WIDTH = 118;
 const CARD_HEIGHT = 198;
 const CARD_GAP = 12;
+const CARD_IMAGE_TIMEOUT_MS = 15_000;
+const CARD_IMAGE_MAX_RETRIES = 2;
 
 type LoadState = "loading" | "done" | "error";
 
@@ -478,17 +481,51 @@ function FilterSelect({
   );
 }
 
+function leaderLife(card: CardData) {
+  return card.cost > 0 ? card.cost : 5;
+}
+
 function CatalogCard({ card, onClick }: { card: CardData; onClick: () => void }) {
   const rawSprite = card.sprites[card.sprites.length - 1] ?? card.sprite ?? card.image ?? CARD_BACK_SRC;
   const [imageSrc, setImageSrc] = useState(thumbSrc(rawSprite));
+  const [imageUnavailable, setImageUnavailable] = useState(false);
+  const imageRef = useRef<HTMLImageElement>(null);
+  const loadTimeoutRef = useRef<number | null>(null);
+  const retryCountRef = useRef(0);
+  useSlowImageFallback(imageRef, imageSrc, setImageSrc, !imageUnavailable);
+
+  const clearLoadTimeout = useCallback(() => {
+    if (loadTimeoutRef.current !== null) window.clearTimeout(loadTimeoutRef.current);
+    loadTimeoutRef.current = null;
+  }, []);
 
   useEffect(() => {
     setImageSrc(thumbSrc(rawSprite));
+    setImageUnavailable(false);
+    retryCountRef.current = 0;
   }, [rawSprite]);
 
-  const handleImageError = () => {
-    setImageSrc((current) => nextCardImageSrc(current, rawSprite, card.image, "thumb"));
-  };
+  const handleImageFailure = useCallback(() => {
+    clearLoadTimeout();
+    if (retryCountRef.current >= CARD_IMAGE_MAX_RETRIES) {
+      setImageUnavailable(true);
+      return;
+    }
+    retryCountRef.current += 1;
+    const nextSrc = nextCardImageSrc(imageSrc, rawSprite, card.image, "thumb");
+    if (nextSrc === imageSrc) {
+      setImageUnavailable(true);
+      return;
+    }
+    setImageSrc(nextSrc);
+  }, [card.image, clearLoadTimeout, imageSrc, rawSprite]);
+
+  useEffect(() => {
+    clearLoadTimeout();
+    if (imageUnavailable || (imageRef.current?.complete && imageRef.current.naturalWidth > 0)) return;
+    loadTimeoutRef.current = window.setTimeout(handleImageFailure, CARD_IMAGE_TIMEOUT_MS);
+    return clearLoadTimeout;
+  }, [clearLoadTimeout, handleImageFailure, imageSrc, imageUnavailable]);
 
   return (
     <button
@@ -499,22 +536,41 @@ function CatalogCard({ card, onClick }: { card: CardData; onClick: () => void })
     >
       <span className="relative block h-[164px] w-full overflow-hidden rounded-lg border border-gray-700 bg-gray-900 shadow-lg shadow-black/20 transition-all group-hover:-translate-y-0.5 group-hover:border-orange-400 group-hover:shadow-orange-950/40">
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src={imageSrc}
-          alt={card.name}
-          loading="lazy"
-          decoding="async"
-          draggable={false}
-          onError={handleImageError}
-          className="h-full w-full object-cover"
-        />
+        {imageUnavailable ? (
+          <span className="grid h-full place-items-center px-2 text-center text-[10px] text-gray-600">图片暂不可用</span>
+        ) : (
+          <img
+            ref={imageRef}
+            src={imageSrc}
+            alt={card.name}
+            loading="lazy"
+            decoding="async"
+            draggable={false}
+            onLoad={clearLoadTimeout}
+            onError={handleImageFailure}
+            className="h-full w-full object-cover"
+          />
+        )}
+        {card.type === "Leader" && (
+          <span className="absolute left-1 top-1 rounded bg-black/75 px-1.5 py-0.5 text-[9px] font-bold text-white">
+            {leaderLife(card)}
+          </span>
+        )}
+        {card.playability === "pending" && (
+          <span
+            data-card-playability="pending"
+            className="absolute inset-x-1 bottom-1 rounded bg-amber-500/95 px-1 py-0.5 text-center text-[9px] font-black leading-tight text-gray-950"
+          >
+            效果开发中 · 暂不可对战
+          </span>
+        )}
         {card.rarity && (
           <span className="absolute right-1 top-1 rounded bg-black/75 px-1.5 py-0.5 text-[9px] font-bold text-white">
             {card.rarity}
           </span>
         )}
         {card.sprites.length > 1 && (
-          <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1.5 py-0.5 text-[9px] font-bold text-orange-300">
+          <span className={`absolute right-1 rounded bg-black/75 px-1.5 py-0.5 text-[9px] font-bold text-orange-300 ${card.playability === "pending" ? "bottom-7" : "bottom-1"}`}>
             {card.sprites.length} 画
           </span>
         )}

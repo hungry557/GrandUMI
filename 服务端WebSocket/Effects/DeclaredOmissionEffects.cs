@@ -9,6 +9,15 @@ namespace GrandUMI.Effects;
 /// </summary>
 public static class DeclaredOmissionEffects
 {
+    /// <summary>
+    /// 由本补齐层完整接管、且属于 KO 置换排序窗口的触发。
+    /// 该查询供排序入口剔除仅有历史 EffectTags、实际没有处理器的幽灵候选。
+    /// </summary>
+    internal static bool HandlesKOReplacementTrigger(string cardNumber, EffectTrigger trigger)
+        => (cardNumber, trigger) is
+            ("OP04-082", EffectTrigger.PreKO)
+            or ("OP13-109", EffectTrigger.OnAllyWillLeaveField);
+
     public static async Task<bool> BeforeDsl(EffectContext ctx)
     {
         var me = ctx.State.Players[ctx.OwnerIndex];
@@ -189,7 +198,8 @@ public static class DeclaredOmissionEffects
                     SourceCardId = ctx.Source.Id.ToString(),
                     Scope = new ContinuousScope { Side = 1, IncludeLeader = false, IncludeCharacters = true },
                     PowerDelta = -1000,
-                    Predicate = (state, side, _) => side == 1 - ctx.OwnerIndex
+                    Predicate = (state, side, card) => side == 1 - ctx.OwnerIndex
+                        && state.Players[side].Characters.Contains(card)
                         && state.CurrentTurnPlayer != ctx.OwnerIndex
                         && state.Players[ctx.OwnerIndex].Leader.Info.HasKeyword("福克斯海盗团"),
                 });
@@ -238,6 +248,15 @@ public static class DeclaredOmissionEffects
                 });
                 return false;
 
+            case ("OP13-083", EffectTrigger.OnEnterField):
+                Register(ctx, new ContinuousEffect
+                {
+                    SourceCardId = ctx.Source.Id.ToString(), Scope = OwnSourceScope(), LeaveGuard = "effect",
+                    Predicate = (state, side, card) => side == ctx.OwnerIndex && card.Id == ctx.Source.Id
+                        && state.Players[ctx.OwnerIndex].Trash.Count >= 7,
+                });
+                break;
+
             case ("OP13-109", EffectTrigger.OnAllyWillLeaveField):
                 await ResolveOP13_109(ctx);
                 return false;
@@ -283,6 +302,15 @@ public static class DeclaredOmissionEffects
                         && state.Players[ctx.OwnerIndex].TotalDonInCostArea <= 6,
                 });
                 return false;
+
+            case ("OP15-067", EffectTrigger.OnEnterField):
+                Register(ctx, new ContinuousEffect
+                {
+                    SourceCardId = ctx.Source.Id.ToString(), Scope = OwnSourceScope(), GrantKeyword = "速攻",
+                    Predicate = (state, side, card) => side == ctx.OwnerIndex && card.Id == ctx.Source.Id
+                        && state.Players[ctx.OwnerIndex].TotalDonInCostArea <= 6,
+                });
+                break;
 
             case ("OP15-095", EffectTrigger.EventCounter):
                 if (me.Trash.Count < 15) return false;
@@ -330,7 +358,7 @@ public static class DeclaredOmissionEffects
 
             case ("OP05-059", EffectTrigger.EventMain):
                 if (me.Leader.Info.ColorList.Length < 2) return false;
-                AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+                await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
                 await BounceAnyCharacter(ctx, 5);
                 return false;
 
@@ -344,7 +372,7 @@ public static class DeclaredOmissionEffects
                 break;
 
             case ("OP07-107", EffectTrigger.OnLifeRevealTrigger):
-                AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+                await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
                 if (me.LifeArea.Count <= 1 && me.Trash.Contains(ctx.Source))
                     await AtomicOps.PlayFromTrashFree(ctx.State, ctx.OwnerIndex, ctx.Source);
                 return false;
@@ -390,7 +418,7 @@ public static class DeclaredOmissionEffects
                 break;
 
             case ("OP15-103", EffectTrigger.OnLifeRevealTrigger):
-                AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+                await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
                 if (me.LifeArea.Count <= 2 && me.Trash.Contains(ctx.Source))
                     await AtomicOps.PlayFromTrashFree(ctx.State, ctx.OwnerIndex, ctx.Source);
                 return false;
@@ -474,7 +502,7 @@ public static class DeclaredOmissionEffects
         => new() { Side = 0, IncludeLeader = true, IncludeCharacters = true };
 
     private static bool HasProperty(CardInstance card, string property)
-        => card.Info.Property.Split('/', StringSplitOptions.RemoveEmptyEntries).Contains(property);
+        => card.HasProperty(property);
 
     private static CardInstance? BattleOpponent(GameState state, Guid sourceId)
     {
@@ -501,14 +529,16 @@ public static class DeclaredOmissionEffects
         => ctx.Vars.TryGetValue("owner", out var value) && value is int owner ? owner : -1;
 
     private static async Task<CardInstance?> ChooseUpToOne(
-        EffectContext ctx, string kind, string text, IReadOnlyList<CardInstance> candidates)
+        EffectContext ctx, string kind, string text, IReadOnlyList<CardInstance> candidates,
+        IReadOnlyList<CardInstance>? displayedCards = null)
     {
         if (candidates.Count == 0) return null;
         var selected = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, kind, text,
             candidates.Select(card => card.Id.ToString()).ToList(), 0, 1,
             new Dictionary<string, object?>
             {
-                ["choiceCards"] = candidates.Select(card => new { id = card.Id.ToString(), number = card.Info.Number }).ToList(),
+                ["choiceCards"] = (displayedCards ?? candidates)
+                    .Select(card => new { id = card.Id.ToString(), number = card.Info.Number }).ToList(),
             });
         return selected.Count == 0 ? null
             : candidates.FirstOrDefault(card => card.Id.ToString() == selected[0]);
@@ -569,8 +599,7 @@ public static class DeclaredOmissionEffects
             "选择生命区位置", new[] { "最上方", "最下方" });
         var card = edge == 0 ? me.LifeArea[0] : me.LifeArea[^1];
         me.LifeArea.Remove(card);
-        card.IsLifeFaceUp = false;
-        me.Hand.Add(card);
+        LifeRevealManager.AddRevealedLifeToHandOrDeck(me, card);
         return true;
     }
 
@@ -682,7 +711,7 @@ public static class DeclaredOmissionEffects
         var cost = await ChooseUpToOne(ctx, "OwnCharacter", "选择放入废弃区的 1 张角色", me.Characters);
         if (cost is null) return;
         SendOwnCharacterToTrash(me, cost);
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
     }
 
     private static void SendOwnCharacterToTrash(PlayerState owner, CardInstance card)
@@ -700,7 +729,7 @@ public static class DeclaredOmissionEffects
         int opponentIndex = 1 - ctx.OwnerIndex;
         var opponent = ctx.State.Players[opponentIndex];
         var candidates = opponent.Characters.Where(card => ctx.State.CurrentCostOf(opponentIndex, card) == 0).ToList();
-        if (opponent.StageCard is { } stage && ctx.State.CurrentCostOf(opponentIndex, stage) <= 3) candidates.Add(stage);
+        candidates.AddRange(opponent.StageCards.Where(stage => ctx.State.CurrentCostOf(opponentIndex, stage) <= 3));
         var target = await ChooseUpToOne(ctx, "OpponentCharacterOrStage",
             "选择对方最多 1 张费用为 0 的角色或费用不高于 3 的舞台 KO", candidates);
         if (target is not null)
@@ -712,12 +741,12 @@ public static class DeclaredOmissionEffects
         var me = ctx.State.Players[ctx.OwnerIndex];
         var costs = new List<CardInstance>();
         if (!me.Leader.IsTapped) costs.Add(me.Leader);
-        if (me.StageCard is { IsTapped: false } stage && stage.MatchesName("斗牛竞技场")) costs.Add(stage);
+        costs.AddRange(me.StageCards.Where(stage => !stage.IsTapped && stage.MatchesName("斗牛竞技场")));
         if (costs.Count == 0 || !await ctx.Prompts.ConfirmOptional(ctx.OwnerIndex,
                 "居鲁士：将领袖或“斗牛竞技场”转为休息状态，代替此角色被 KO？")) return;
         var selected = await ChooseUpToOne(ctx, "OwnLeaderOrStage", "选择转为休息状态的卡牌", costs);
         if (selected is null) return;
-        AtomicOps.RestCard(selected);
+        if (!AtomicOps.RestCard(selected)) return;
         ctx.State.MarkPreventKO(ctx.Source.Id);
     }
 
@@ -726,7 +755,7 @@ public static class DeclaredOmissionEffects
         var me = ctx.State.Players[ctx.OwnerIndex];
         var fishmen = me.Hand.Where(card => card.Info.HasKeyword("鱼人族")).ToList();
         var noahs = me.Hand.Where(card => card.MatchesName("方舟诺亚")).ToList();
-        if (me.StageCard is { } stage && stage.MatchesName("方舟诺亚")) noahs.Add(stage);
+        noahs.AddRange(me.StageCards.Where(stage => stage.MatchesName("方舟诺亚")));
         if (fishmen.Count == 0 && noahs.Count == 0) return;
         if (!await ctx.Prompts.ConfirmOptional(ctx.OwnerIndex, "范德·戴肯九世：支付 1 张《鱼人族》手牌或“方舟诺亚”以发动？")) return;
         var allCosts = fishmen.Concat(noahs).DistinctBy(card => card.Id).ToList();
@@ -736,9 +765,8 @@ public static class DeclaredOmissionEffects
         try
         {
             if (me.Hand.Contains(cost)) AtomicOps.DiscardHand(me, cost);
-            else if (ReferenceEquals(me.StageCard, cost))
+            else if (me.RemoveStageCard(cost))
             {
-                me.StageCard = null;
                 me.Trash.Add(cost);
             }
         }
@@ -757,25 +785,11 @@ public static class DeclaredOmissionEffects
                 "虏之矢：将我方 1 张费用不低于 2 的角色放回手牌，使我方卡牌本次战斗+4000？")) return;
         var cost = await ChooseUpToOne(ctx, "OwnCharacter", "选择放回手牌的角色", costs);
         if (cost is null) return;
-        ReturnOwnCharacterToHand(me, cost);
+        AtomicOps.BounceToHand(ctx.State, ctx.OwnerIndex, cost);
         var targets = new List<CardInstance> { me.Leader };
         targets.AddRange(me.Characters);
         var target = await ChooseUpToOne(ctx, "OwnLeaderOrCharacter", "选择我方最多 1 张领袖或角色+4000", targets);
         if (target is not null) AtomicOps.AddPowerThisBattle(target, 4000);
-    }
-
-    private static void ReturnOwnCharacterToHand(PlayerState owner, CardInstance card)
-    {
-        foreach (var don in owner.CostArea.Where(don => don.State == DonState.Attached && don.AttachedToCardId == card.Id))
-        {
-            don.State = DonState.Rest;
-            don.AttachedToCardId = null;
-        }
-        if (owner.Characters.Remove(card))
-        {
-            card.IsTapped = false;
-            owner.Hand.Add(card);
-        }
     }
 
     private static async Task ResolveOP07_075(EffectContext ctx)
@@ -813,7 +827,7 @@ public static class DeclaredOmissionEffects
         var target = await ChooseUpToOne(ctx, "OpponentCharacter", "选择对方最多 1 张费用不高于 5 的角色 KO", targets);
         if (target is not null)
             await AtomicOps.KOByEffectAsync(ctx.State, opponent, target, ctx.Prompts, ctx.OwnerIndex);
-        if (me.Hand.Count <= 3) AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+        if (me.Hand.Count <= 3) await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
     }
 
     private static async Task ResolveOP09_028(EffectContext ctx)
@@ -841,7 +855,7 @@ public static class DeclaredOmissionEffects
     private static async Task ResolveOP14_049(EffectContext ctx)
     {
         if (!await RestActiveDon(ctx, 2, "甚平：将 2 张活跃咚转为休息状态以发动登场效果？")) return;
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 2);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 2);
         var candidates = new List<(int Owner, CardInstance Card)>();
         for (int owner = 0; owner < 2; owner++)
             candidates.AddRange(ctx.State.Players[owner].Characters
@@ -862,7 +876,9 @@ public static class DeclaredOmissionEffects
         if (looked.Count == 0) return;
 
         var candidates = looked.Where(predicate).ToList();
-        var picked = await ChooseUpToOne(ctx, "LookTopReveal", prompt, candidates);
+        // 检索时 validChoices 只包含合法目标，但 choiceCards 必须携带确认到的全部牌，
+        // 让玩家先看完整牌面，再从其中选择可检索卡；不合法目标由客户端置灰展示。
+        var picked = await ChooseUpToOne(ctx, "LookTopReveal", prompt, candidates, looked);
         if (picked is not null)
         {
             ctx.Engine?.BroadcastReveal(ctx.OwnerIndex, new[] { picked.Info.Number });
@@ -873,7 +889,7 @@ public static class DeclaredOmissionEffects
 
         if (looked.Count == 0) return;
         var orderedIds = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OrderDeckCards",
-            "按顺序排列剩余卡牌（先选择的卡牌最靠近卡组顶或最先进入卡组底）",
+            "将剩余卡牌自选顺序排列（先选择的卡牌最靠近卡组顶或最先进入卡组底）",
             looked.Select(card => card.Id.ToString()).ToList(), looked.Count, looked.Count,
             new Dictionary<string, object?>
             {
@@ -908,7 +924,7 @@ public static class DeclaredOmissionEffects
             : discardable.FirstOrDefault(card => card.Id.ToString() == chosen[0]);
         if (discard is null) return;
 
-        AtomicOps.RestCard(ctx.Source);
+        if (!AtomicOps.RestCard(ctx.Source)) return;
         EffectRuntime.PayingCost = true;
         try { AtomicOps.DiscardHand(me, discard); }
         finally { EffectRuntime.PayingCost = false; }
@@ -939,7 +955,7 @@ public static class DeclaredOmissionEffects
                 "杓死：将我方 1 张《东海》角色转为休息状态，使最多 1 张“克洛”转为活跃状态？")) return;
         var cost = await ChooseUpToOne(ctx, "OwnCharacter", "选择转为休息状态的《东海》角色", restCosts);
         if (cost is null) return;
-        AtomicOps.RestCard(cost);
+        if (!AtomicOps.RestCard(cost)) return;
         var target = await ChooseUpToOne(ctx, "OwnCharacter", "选择最多 1 张“克洛”转为活跃状态", kuros);
         if (target is not null) AtomicOps.ActivateCard(target);
     }
@@ -982,7 +998,7 @@ public static class DeclaredOmissionEffects
     private static async Task ResolveOP03_122(EffectContext ctx)
     {
         await BounceAnyCharacter(ctx, 6);
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 2);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 2);
         await DiscardOwnChosenMandatory(ctx, 2);
     }
 
@@ -992,7 +1008,7 @@ public static class DeclaredOmissionEffects
         if (me.Leader.IsTapped
             || !await ctx.Prompts.ConfirmOptional(ctx.OwnerIndex,
                 "雷欧：将我方领袖转为休息状态，将对方最多 1 张费用不高于 1 的角色 KO，之后废弃卡组顶 2 张？")) return;
-        AtomicOps.RestCard(me.Leader);
+        if (!AtomicOps.RestCard(me.Leader)) return;
         if (me.Leader.Info.HasKeyword("德莱斯罗兹"))
         {
             int opponent = 1 - ctx.OwnerIndex;
@@ -1059,7 +1075,7 @@ public static class DeclaredOmissionEffects
         var target = await ChooseUpToOne(ctx, "OwnLeaderOrCharacter",
             "选择我方最多 1 张领袖或角色本次战斗力量+4000", targets);
         if (target is not null) AtomicOps.AddPowerThisBattle(target, 4000);
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 2);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 2);
     }
 
     private static async Task ResolveOP09_098(EffectContext ctx)
@@ -1102,13 +1118,19 @@ public static class DeclaredOmissionEffects
     private static async Task ResolveOP15_116(EffectContext ctx)
     {
         var me = ctx.State.Players[ctx.OwnerIndex];
-        if (!me.Leader.Info.HasKeyword("草帽一伙") || me.LifeArea.Count == 0
-            || me.Hand.Count == 0) return;
-        var life = me.LifeArea[0];
-        me.LifeArea.RemoveAt(0);
-        life.IsLifeFaceUp = false;
-        me.Trash.Add(life);
+        if (!me.Leader.Info.HasKeyword("草帽一伙")) return;
+
+        // 各句按卡面顺序独立执行：生命区为空时只跳过“生命顶送废弃”，
+        // 不能把后续“卡组顶加入生命”和“弃 1 手牌”一并取消。
+        if (me.LifeArea.Count > 0)
+        {
+            var life = me.LifeArea[0];
+            me.LifeArea.RemoveAt(0);
+            life.IsLifeFaceUp = false;
+            me.Trash.Add(life);
+        }
         AtomicOps.AddLifeFromDeckTop(me, 1);
+        if (me.Hand.Count == 0) return;
         var discardIds = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OwnHandDiscard", "选择丢弃的 1 张手牌",
             me.Hand.Select(card => card.Id.ToString()).ToList(), 1, 1,
             new Dictionary<string, object?>
@@ -1143,7 +1165,7 @@ public static class DeclaredOmissionEffects
         int edge = await ctx.Prompts.ChooseOption(ctx.OwnerIndex,
             "将生命区 1 张卡牌加入手牌作为成本", new[] { "最上方", "最下方", "放弃" });
         if (edge is < 0 or > 1) return;
-        AtomicOps.RestCard(ctx.Source);
+        if (!AtomicOps.RestCard(ctx.Source)) return;
         int index = edge == 0 ? 0 : me.LifeArea.Count - 1;
         var life = me.LifeArea[index];
         me.LifeArea.RemoveAt(index);

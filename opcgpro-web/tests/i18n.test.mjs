@@ -22,7 +22,7 @@ test("supports Simplified Chinese, Japanese, and English", () => {
 
 test("keeps the two translation catalogs in sync", () => {
   assert.deepEqual(Object.keys(MESSAGES.en).sort(), Object.keys(MESSAGES.ja).sort());
-  assert.ok(Object.keys(MESSAGES.en).length >= 200);
+  assert.ok(Object.keys(MESSAGES.en).length >= 700);
 });
 
 test("translates core lobby and match actions", () => {
@@ -30,6 +30,14 @@ test("translates core lobby and match actions", () => {
   assert.equal(translateText("设置", "ja"), "設定");
   assert.equal(translateText("结束回合", "en"), "End turn");
   assert.equal(translateText("结束回合", "ja"), "ターン終了");
+  assert.equal(
+    translateText("老板来了，等我一会", "en"),
+    "My boss is here. Give me a moment.",
+  );
+  assert.equal(
+    translateText("老板来了，等我一会", "ja"),
+    "上司が来たので、少し待ってください。",
+  );
   assert.equal(translateText("设置", "zh-CN"), "设置");
 });
 
@@ -38,9 +46,71 @@ test("preserves whitespace and translates dynamic labels", () => {
   assert.equal(translateText("第 2 次投掷", "ja"), "2回目");
   assert.equal(translateText("共 50 张", "en"), "50 cards");
   assert.equal(translateText("以 Luffy 继续", "en"), "Continue as Luffy");
+  assert.equal(translateText("确认贴3咚？", "en"), "Attach 3 DON!!?");
+  assert.equal(translateText("确认贴3咚？", "ja"), "ドン!!を3枚付与しますか？");
+  assert.equal(translateText("确认关闭", "en"), "Confirmation off");
+  assert.equal(translateText("屏蔽玩家 Luffy", "ja"), "Luffy をブロック");
 });
 
 test("leaves unknown content unchanged", () => {
   assert.equal(translateText("OP01-001", "en"), "OP01-001");
   assert.equal(translateText("玩家自定义内容", "ja"), "玩家自定义内容");
+});
+
+test("translates recently added account and community features", () => {
+  assert.equal(translateText("设置密码并登录", "en"), "Set password and sign in");
+  assert.equal(translateText("设置密码并登录", "ja"), "パスワードを設定してログイン");
+  assert.equal(translateText("卡组广场", "en"), "Deck plaza");
+  assert.equal(translateText("卡背广场", "ja"), "カード裏面ギャラリー");
+  assert.equal(translateText("▦ 导出一图流", "en"), "▦ Export deck image");
+  assert.equal(translateText("效果发动确认", "ja"), "効果発動の確認");
+  assert.equal(translateText("Leader 胜率榜", "en"), "Leader win-rate ranking");
+});
+
+test("translates new dynamic confirmations, counts, and notifications", () => {
+  assert.equal(
+    translateText("确定删除卡背“海浪”吗？删除后无法恢复。", "en"),
+    "Delete card back “海浪”? This cannot be undone.",
+  );
+  assert.equal(
+    translateText("确定以管理员身份删除已发布卡背“海浪”（作者：路飞）吗？删除后无法恢复。", "en"),
+    "Delete published card back “海浪” by 路飞 as an administrator? This cannot be undone.",
+  );
+  assert.equal(
+    translateText("确定删除卡组投稿“红路飞”吗？本地卡组不会被删除。", "ja"),
+    "デッキ投稿「红路飞」を削除しますか？ローカルデッキは削除されません。",
+  );
+  assert.equal(translateText("已压缩至 128KB", "en"), "Compressed to 128 KB");
+  assert.equal(translateText("好友 · 3 条新申请", "ja"), "フレンド · 新着申請3件");
+  assert.equal(translateText("· 5 条未读", "en"), "· 5 unread");
+});
+
+test("translates the opening and victory phrase catalog and two-position controls", () => {
+  assert.equal(translateText("聊天装饰交易所", "en"), "Chat decoration exchange");
+  assert.equal(translateText("聊天装饰交易所", "ja"), "チャット装飾取引所");
+  assert.equal(translateText("草帽式问候", "en"), "Straw Hat greeting");
+  assert.equal(translateText("开场台词", "en"), "Opening line");
+  assert.equal(translateText("胜利宣言", "ja"), "勝利宣言");
+  assert.equal(
+    translateText("永久拥有后，可分别设为自动开场台词和胜利宣言。", "en"),
+    "Once owned, a phrase can be set separately as your automatic opening line and victory declaration.",
+  );
+  assert.equal(translateText("皇者霸气", "ja"), "皇帝の覇気");
+  assert.equal(
+    translateText("准备好了吗？真正的风暴才刚开始！", "en"),
+    "Ready? The real storm is only beginning!",
+  );
+  assert.equal(
+    translateText("额度来自本赛季标准排位历史最高悬赏金；仅刷新纪录时补发新增差额，购买不影响排位，狂野排位不计入。", "ja"),
+    "枠は今シーズンのスタンダードランク最高懸賞金に基づきます。最高記録を更新した差額だけが追加され、購入はランクに影響せず、ワイルドランクは対象外です。",
+  );
+  assert.equal(translateText("本赛季语录额度", "en"), "Season phrase allowance");
+  assert.equal(translateText("额度不足", "ja"), "枠が不足しています");
+  assert.equal(translateText("海贼王宣言", "en"), "Pirate King declaration");
+  assert.equal(translateText("我是要成为海贼王的男人!", "ja"), "海賊王におれはなる！");
+  assert.equal(translateText("唯有胜者才是正义！", "en"), "Only the victor is justice!");
+  assert.equal(
+    translateText("看来你已经看见了比我更加遥远的未来", "ja"),
+    "お前はもう、おれより遥かな未来を見ているようだ。",
+  );
 });

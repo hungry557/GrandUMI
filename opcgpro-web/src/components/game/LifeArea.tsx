@@ -96,7 +96,7 @@ export default function LifeArea({ side }: Props) {
                     liftOnSelect={false}
                   />
                 ) : (
-                  <CardBack cardBackId={player?.cardBackId} className="shadow-xl shadow-black/35" />
+                  <CardBack cardBackId={player?.cardBackId} side={side} className="shadow-xl shadow-black/35" />
                 )}
               </div>
             );
@@ -120,7 +120,7 @@ export default function LifeArea({ side }: Props) {
         <AnimatePresence>
           {open && (
             <motion.div
-              className="pointer-events-auto fixed inset-0 z-[110] flex flex-col items-center justify-center gap-4 bg-black/80 p-4 sm:p-8"
+              className="pointer-events-auto fixed inset-0 z-[110] flex flex-col items-center justify-center gap-4 overflow-y-auto bg-black/80 px-[calc(1rem+var(--layout-safe-left,0px))] py-[calc(1rem+var(--layout-safe-top,0px))] [padding-bottom:calc(1rem+var(--layout-safe-bottom,0px))] [padding-right:calc(1rem+var(--layout-safe-right,0px))] @[640px]:gap-6"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
@@ -133,14 +133,14 @@ export default function LifeArea({ side }: Props) {
                   <button
                     type="button"
                     onClick={() => setOpen(false)}
-                    className="rounded-lg bg-gray-600 px-4 py-2 text-sm font-bold text-white hover:bg-gray-500"
+                    className="min-h-12 rounded-lg bg-gray-600 px-4 py-2 text-sm font-bold text-white hover:bg-gray-500"
                   >
                     关闭
                   </button>
                 </div>
 
                 <div
-                  className="flex max-h-[75dvh] max-w-5xl flex-wrap justify-center gap-3 overflow-y-auto p-2"
+                  className="flex max-h-[75cqh] max-w-[calc(100cqw-2rem)] flex-wrap justify-center gap-3 overflow-y-auto p-2"
                   onClick={(event) => event.stopPropagation()}
                 >
                   {Array.from({ length: count }).map((_, index) => {
@@ -154,6 +154,7 @@ export default function LifeArea({ side }: Props) {
                           card={isFaceUp ? getGameCard(info!.number!, player?.spriteMap) ?? null : null}
                           faceDown={!isFaceUp}
                           cardBackId={player?.cardBackId}
+                          cardBackSide={side}
                           size="md"
                           hideCounter
                           hidePower

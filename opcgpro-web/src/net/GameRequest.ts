@@ -3,15 +3,38 @@
  *
  * 所有动作均通过 MsgGameAction 发到服务器；服务器结算后通过 MsgGameState 推回。
  * 对贴咚、攻击横置和出牌仅做可回滚的即时视觉反馈；规则结算仍完全以服务端为准。
+ * 贴咚一经确认就立即发往服务端；撤回资格与操作顺序也完全来自服务端权威快照。
  */
 
 import { NetManager } from "./NetManager";
 import type { MsgBase, MsgFriendChat, MsgGameAction, MsgLeaveGameChat, MsgPromptResponse, MsgRequestState, GameActionType } from "@/types/net";
 import { useGameStore } from "@/store/gameStore";
+import { useSettingsStore } from "@/store/settingsStore";
 
 type PendingLatency = { requestId: string; action: string; startedAt: number };
 const pendingLatencies = new Map<string, PendingLatency>();
 let requestSequence = 0;
+
+export type PendingAttachDonConfirmation = {
+  targetId: string | "leader";
+  count: number;
+};
+
+let pendingAttachDonConfirmation: PendingAttachDonConfirmation | null = null;
+const pendingAttachDonConfirmationListeners = new Set<() => void>();
+
+function notifyPendingAttachDonConfirmation() {
+  pendingAttachDonConfirmationListeners.forEach((listener) => listener());
+}
+
+export function getPendingAttachDonConfirmation(): PendingAttachDonConfirmation | null {
+  return pendingAttachDonConfirmation;
+}
+
+export function subscribePendingAttachDonConfirmation(listener: () => void) {
+  pendingAttachDonConfirmationListeners.add(listener);
+  return () => pendingAttachDonConfirmationListeners.delete(listener);
+}
 
 function createRequestId(): string {
   return `${Date.now().toString(36)}-${(++requestSequence).toString(36)}`;
@@ -24,6 +47,22 @@ function markActionSent(requestId: string, action: string) {
   for (const [id, pending] of pendingLatencies) {
     if (startedAt - pending.startedAt > 60_000) pendingLatencies.delete(id);
   }
+}
+
+/**
+ * 棋钟控制消息不改变卡牌状态，也不占用全屏 pending 遮罩。
+ * requestId 仍交给服务端去重，双击加时或网络重发都不会重复增加时间。
+ */
+function sendClockControl(
+  action: "PlayerActivity" | "RequestTurnExtension",
+  data: Record<string, unknown> = {},
+) {
+  return NetManager.send({
+    proto: "MsgGameAction",
+    action,
+    data,
+    requestId: createRequestId(),
+  } as MsgGameAction);
 }
 
 /** 收到对应权威快照时结束本次客户端→服务端→客户端计时。 */
@@ -51,7 +90,7 @@ function completeLatency(requestId: string | null | undefined, suffix: string) {
   }
 }
 
-function send(
+function sendNow(
   action: GameActionType,
   data: Record<string, unknown> = {},
   optimistic?: () => void,
@@ -75,24 +114,96 @@ function send(
   return sent;
 }
 
+function send(
+  action: GameActionType,
+  data: Record<string, unknown> = {},
+  optimistic?: () => void,
+) {
+  return sendNow(action, data, optimistic);
+}
+
+function submitAttachDon(targetId: string | "leader", count: number) {
+  const safeCount = Math.max(1, Math.floor(count));
+  return sendNow(
+    "AttachDon",
+    { targetId, count: safeCount },
+    () => useGameStore.getState().optimisticAttachDon(targetId, safeCount),
+  );
+}
+
+function requestAttachDonConfirmation(targetId: string | "leader", count: number) {
+  const safeCount = Math.max(1, Math.floor(count));
+  pendingAttachDonConfirmation = {
+    targetId,
+    count: safeCount,
+  };
+  notifyPendingAttachDonConfirmation();
+  return true;
+}
+
+export function confirmPendingAttachDon() {
+  const pending = pendingAttachDonConfirmation;
+  if (!pending) return false;
+  pendingAttachDonConfirmation = null;
+  notifyPendingAttachDonConfirmation();
+  return submitAttachDon(pending.targetId, pending.count);
+}
+
+export function cancelPendingAttachDonConfirmation() {
+  if (!pendingAttachDonConfirmation) return false;
+  pendingAttachDonConfirmation = null;
+  notifyPendingAttachDonConfirmation();
+  return true;
+}
+
+/** 离开对局或重连时关闭尚未确认、因而尚未发送的贴咚弹窗。 */
+export function clearPendingAttachDonState() {
+  const hadConfirmation = pendingAttachDonConfirmation !== null;
+  pendingAttachDonConfirmation = null;
+  if (hadConfirmation) notifyPendingAttachDonConfirmation();
+  return hadConfirmation;
+}
+
 export const GameRequest = {
+  /** 准备确认只更新传输状态，不属于卡牌动作，也不改变操作棋钟。 */
+  prepared: (roomId: string) => NetManager.send({ proto: "MsgGamePrepared", roomId } as MsgBase),
   /** 开局骰点胜者选择自己先手或后手。 */
   chooseFirstPlayer: (goFirst: boolean) => send("ChooseFirstPlayer", { goFirst }),
 
   /** 重抽决策（双方初始 5 张后） */
   mulligan: (redraw: boolean) => send("Mulligan", { redraw }),
 
+  /** 海克斯私密选秀：只提交当前轮次与自己的候选 ID，最终授予由服务端权威结算。 */
+  chooseHex: (roundId: string, hexId: number) => send("ChooseHex", { roundId, hexId }),
+
+  /** 每个候选槽位各一次刷新；携带旧 ID 防止乱序或跨槽请求刷新错误候选。 */
+  refreshHex: (roundId: string, candidateIndex: number, expectedHexId: number) =>
+    send("RefreshHex", { roundId, candidateIndex, expectedHexId }),
+
   /** 出牌：handIndex = 当前手牌列表下标 */
-  playCard: (handIndex: number, overflowTrashCardId?: string) =>
+  playCard: (handIndex: number, overflowTrashCardId?: string, overflowTrashStageId?: string) =>
     send("PlayCard", {
       handIndex,
       ...(overflowTrashCardId ? { overflowTrashCardId } : {}),
+      ...(overflowTrashStageId ? { overflowTrashStageId } : {}),
     }, () => useGameStore.getState().optimisticPlayCard(handIndex)),
 
-  /** 赋予咚：将一张活跃咚附给领袖或场上角色 */
-  attachDon: (targetId: string | "leader", count = 1) =>
-    send("AttachDon", { targetId, count }, () =>
-      useGameStore.getState().optimisticAttachDon(targetId, count)),
+  /** 请求赋予咚；可先本地确认，但确认后会立即提交到服务端。 */
+  attachDon: (targetId: string | "leader", count = 1) => {
+    const safeCount = Math.max(1, Math.floor(count));
+    return useSettingsStore.getState().confirmAttachDon
+      ? requestAttachDonConfirmation(targetId, safeCount)
+      : submitAttachDon(targetId, safeCount);
+  },
+
+  /** 离开对局时关闭尚未发送的确认弹窗。 */
+  cancelPendingAttachDon: clearPendingAttachDonState,
+
+  /** 撤回服务端确认的最近一次贴咚；旧令牌由服务端拒绝，不在客户端自行改牌桌。 */
+  undoAttachDon: (operationId: string) => send("UndoAttachDon", { operationId }),
+
+  /** 【屠宰场】移除一个己方角色身上的全部咚；咚的状态由服务端按角色状态结算。 */
+  detachAllDon: (characterId: string) => send("DetachAllDon", { characterId }),
 
   /** 攻击宣言 */
   attack: (attackerId: string, target: { isLeader: true } | { isLeader: false; cardId: string }) =>
@@ -119,6 +230,14 @@ export const GameRequest = {
   endTurn:       () => send("EndTurn"),
   confirmDamage: () => send("ConfirmDamage"),
   surrender:     () => send("Surrender"),
+  requestDraw:   (description: string) => send("RequestDraw", { description }),
+  respondDraw:   (accept: boolean) => send("RespondDraw", { accept }),
+
+  /** 每位玩家每局一次，将当前回合剩余时间增加 2 分钟（最高不超过 8 分钟）。 */
+  requestTurnExtension: () => sendClockControl("RequestTurnExtension"),
+
+  /** 挂机提醒弹窗中的明确在线确认；服务端据此把本段连续无操作计时归零。 */
+  confirmInactivityPresence: () => sendClockControl("PlayerActivity", { kind: "presence" }),
 
   /** GM 调试：按编号加一张牌到自己手牌 */
   debugAddCard: (cardNumber: string) => send("DebugAddCard", { cardNumber }),
@@ -159,8 +278,15 @@ export const GameRequest = {
 
   /** 断线重连后请求完整快照 */
   requestState: () => {
+    clearPendingAttachDonState();
+    useGameStore.getState().rollbackOptimistic();
+    useGameStore.getState().setPending(false);
     NetManager.send({ proto: "MsgRequestState" } as MsgRequestState);
   },
+
+  /** 轻量重取当前权威快照；不干扰正在进行的卡牌动作与乐观状态。 */
+  refreshStateSnapshot: () =>
+    NetManager.send({ proto: "MsgRequestState" } as MsgRequestState),
 
   /** 对手断线宽限期内，主动请求即时结束对局（判对手负），不再干等后端计时器 */
   endByDisconnect: () => {
@@ -184,5 +310,15 @@ export const GameRequest = {
   /** 返回大厅时退出上一场对局的赛后聊天组。 */
   leaveGameChat: () => {
     NetManager.send({ proto: "MsgLeaveGameChat" } as MsgLeaveGameChat);
+  },
+
+  requestSpectatorHand: () => NetManager.send({ proto: "MsgRequestSpectatorHand" } as MsgBase),
+
+  respondSpectatorHand: (requestId: string, accept: boolean) => {
+    NetManager.send({ proto: "MsgRespondSpectatorHand", requestId, accept } as MsgBase);
+  },
+
+  kickSpectator: (spectatorAccount: string) => {
+    NetManager.send({ proto: "MsgKickSpectator", spectatorAccount } as MsgBase);
   },
 };

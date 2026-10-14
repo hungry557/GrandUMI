@@ -1,23 +1,53 @@
 [Unit]
 Description=GrandUMI 测试服后端（WebSocket 8081）
-After=network.target
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=8
 
 [Service]
 Type=simple
+User=grandumi
+Group=grandumi
+EnvironmentFile=-/etc/grandumi/qq-whitelist-sync.env
+EnvironmentFile=-/etc/grandumi/grandumi-test-replay-artifact.env
 WorkingDirectory=/opt/grandumi-test/服务端WebSocket/publish
-ExecStart=/usr/bin/dotnet /opt/grandumi-test/服务端WebSocket/publish/GrandUMIServer.dll 8081
+ExecStart=/opt/dotnet/dotnet /opt/grandumi-test/服务端WebSocket/publish/GrandUMIServer.dll 8081
 Restart=always
-RestartSec=3
+RestartSec=2
+TimeoutStartSec=45
+TimeoutStopSec=25
+KillSignal=SIGINT
 Environment=DOTNET_CLI_TELEMETRY_OPTOUT=1
-Environment=GRANDUMI_PLAYER_DB=/opt/grandumi/服务端WebSocket/PlayerData/grandumi.db
-Environment=GRANDUMI_LEADER_STATS_READ_PATH=/opt/grandumi/服务端WebSocket/Data/leader-stats.db
-Environment=GRANDUMI_NODE_ID=test-01
+Environment=GRANDUMI_REQUIRE_REPLAY_ARTIFACT_ARCHIVE=1
+Environment=GRANDUMI_DATA_DIR=/data/grandumi-test
+Environment=GRANDUMI_TEST_SEASON_HONORS=1
+Environment=GRANDUMI_ACCOUNT_DB=/data/grandumi-shared/accounts.db
+Environment=GRANDUMI_ACCOUNT_DB_ACTIVATION_MARKER=/data/grandumi-shared/active
+Environment=GRANDUMI_ACCOUNT_DB_ALLOW_LOCAL_FALLBACK=1
+Environment=GRANDUMI_ACCOUNT_DB_PREPARED_MARKER=/data/grandumi-shared/prepared
+Environment=GRANDUMI_ONLINE_PLAYER_HISTORY_READ_PATH=/data/grandumi/online-player-history.db
+Environment=GRANDUMI_RECORD_DAILY_ACTIVE=0
+Environment=GRANDUMI_LEADER_STATS_READ_PATH=/data/grandumi/leader-stats.db
+Environment=GRANDUMI_REQUIRE_SINGLE_WRITER=1
+Environment=GRANDUMI_NODE_ID=hk-test-01
 Environment=GRANDUMI_MAX_CONNECTIONS=300
 Environment=GRANDUMI_MAX_ROOMS=100
 Environment=GRANDUMI_PRIVATE_SNAPSHOT_LOG=0
+Environment=GRANDUMI_REPLAY_CHECKPOINT_LOG=1
+Environment=GRANDUMI_TRAINING_DECISION_CONTEXT_LOG=1
 Environment=GRANDUMI_PROTOCOL_LOG=0
+Environment=GRANDUMI_LATENCY_SUMMARY_SECONDS=60
+Environment=GRANDUMI_ADMIN_DEPLOY_DIR=/var/lib/grandumi-admin-deploy
+LimitNOFILE=65536
 CPUQuota=50%
 MemoryMax=768M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/data/grandumi-test /data/grandumi-shared /var/lib/grandumi-admin-deploy/requests /var/lib/grandumi-admin-deploy/drafts
+ReadOnlyPaths=/data/grandumi /var/lib/grandumi-test-replay-artifacts /data/grandumi-test/hex-catalog
 
 [Install]
 WantedBy=multi-user.target

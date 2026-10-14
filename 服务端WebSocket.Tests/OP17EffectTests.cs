@@ -2,6 +2,7 @@ using GrandUMI.Cards;
 using GrandUMI.Effects;
 using GrandUMI.Game;
 using GrandUMI.Game.PhaseFlow;
+using GrandUMI.Game.Snapshot;
 using GrandUMI.Game.Validation;
 using System.Collections.Concurrent;
 using System.Text.Json;
@@ -13,6 +14,135 @@ public class OP17EffectTests
 {
     private static CardInstance Card(string number, int turnPlayed = 0)
         => new() { Info = CardDatabase.Get(number)!, TurnPlayed = turnPlayed };
+
+    [Fact]
+    public async Task OP17_114_OnPlay_RestsTwoDonDrawsAddsLifeAndAffectsUpToTwoCharacters()
+    {
+        var state = TestScene.New("OP13-004")
+            .MyActiveDon(2)
+            .MyDeckTop("OP17-100", "OP17-101")
+            .OppCharacter("OP17-089")
+            .OppCharacter("OP17-093")
+            .Build();
+        var me = state.Players[0];
+        var firstTarget = state.Players[1].Characters[0];
+        var secondTarget = state.Players[1].Characters[1];
+        var drawCard = me.Deck[0];
+        var lifeCard = me.Deck[1];
+        var source = Card("OP17-114");
+        me.Characters.Add(source);
+        var prompts = new MockPromptService()
+            .QueueConfirm(true)
+            .QueueConfirm(true)
+            .QueueChoose(firstTarget.Id.ToString(), secondTarget.Id.ToString());
+
+        await EffectRuntime.Resolve(state, 0, source, EffectTrigger.OnEnterField, prompts);
+
+        Assert.Equal(2, me.CostArea.Count(don => don.State == DonState.Rest));
+        Assert.Contains(drawCard, me.Hand);
+        Assert.Empty(me.Deck);
+        Assert.Same(lifeCard, Assert.Single(me.LifeArea));
+        Assert.Equal(-3000, firstTarget.PowerModThisTurn);
+        Assert.Equal(-3000, secondTarget.PowerModThisTurn);
+        var targetPrompt = Assert.Single(prompts.ChooseHistory);
+        Assert.Equal("OpponentCharacter", targetPrompt.kind);
+        Assert.Equal(2, targetPrompt.max);
+        Assert.Contains("最多2张角色", targetPrompt.text);
+    }
+
+    [Fact]
+    public async Task OP17_114_OnPlay_CanBeCancelledBeforePayingDonCost()
+    {
+        var state = TestScene.New("OP13-004")
+            .MyActiveDon(2)
+            .MyDeckTop("OP17-100")
+            .OppCharacter("OP17-093")
+            .Build();
+        var me = state.Players[0];
+        var target = Assert.Single(state.Players[1].Characters);
+        var source = Card("OP17-114");
+        me.Characters.Add(source);
+        var prompts = new MockPromptService().QueueConfirm(false);
+
+        await EffectRuntime.Resolve(state, 0, source, EffectTrigger.OnEnterField, prompts);
+
+        Assert.Single(me.Deck);
+        Assert.Empty(me.Hand);
+        Assert.Empty(me.LifeArea);
+        Assert.Equal(2, me.ActiveDonCount);
+        Assert.Equal(0, target.PowerModThisTurn);
+        Assert.Single(prompts.ConfirmHistory);
+        Assert.Empty(prompts.ChooseHistory);
+    }
+
+    [Fact]
+    public async Task OP17_095_ReturnsThreeTrashOnceToProtectAllSimultaneousEffectKOs()
+    {
+        var state = TestScene.New().Build();
+        var me = state.Players[0];
+        var guard = Card("OP17-095");
+        var first = Card("ST30-006");
+        var second = Card("ST30-007");
+        var trash = new[] { Card("ST30-002"), Card("ST30-003"), Card("ST30-004") };
+        me.Characters.AddRange([guard, first, second]);
+        me.Trash.AddRange(trash);
+        var prompts = new MockPromptService()
+            .QueueConfirm(true)
+            .QueueChoose(trash.Select(card => card.Id.ToString()).ToArray());
+        state.KOReason = "effect";
+        state.KOActingSide = 1;
+
+        var koCount = await BattleEngine.KOCardsSimultaneouslyAsync(
+            state, 0, [first, second], prompts);
+
+        Assert.Equal(0, koCount);
+        Assert.Contains(first, me.Characters);
+        Assert.Contains(second, me.Characters);
+        Assert.Empty(me.Trash);
+        Assert.Equal(trash, me.Deck);
+        Assert.Single(prompts.ConfirmHistory);
+    }
+
+    [Fact]
+    public async Task OP17_036_EventMain_CannotUseCharactersToCompleteDonCost()
+    {
+        var state = TestScene.New("OP17-001")
+            .MyActiveDon(5)
+            .MyCharacter("OP17-005")
+            .Build();
+        var character = Assert.Single(state.Players[0].Characters);
+        var prompts = new MockPromptService().QueueConfirm(true);
+
+        await EffectRuntime.Resolve(state, 0, Card("OP17-036"),
+            EffectTrigger.EventMain, prompts);
+
+        Assert.Equal(5, state.Players[0].ActiveDonCount);
+        Assert.False(character.IsTapped);
+        Assert.Empty(prompts.ConfirmHistory);
+        Assert.Empty(prompts.ChooseHistory);
+    }
+
+    [Fact]
+    public async Task OP17_036_EventMain_RestsOnlySixActiveDon()
+    {
+        var state = TestScene.New("OP17-001")
+            .MyActiveDon(6)
+            .MyCharacter("OP17-005")
+            .Build();
+        var me = state.Players[0];
+        var character = Assert.Single(me.Characters);
+        var prompts = new MockPromptService().QueueConfirm(true);
+
+        await EffectRuntime.Resolve(state, 0, Card("OP17-036"),
+            EffectTrigger.EventMain, prompts);
+
+        Assert.Equal(0, me.ActiveDonCount);
+        Assert.All(me.CostArea, don => Assert.Equal(DonState.Rest, don.State));
+        Assert.False(me.Leader.IsTapped);
+        Assert.False(character.IsTapped);
+        Assert.Single(prompts.ConfirmHistory);
+        Assert.Empty(prompts.ChooseHistory);
+    }
 
     [Theory]
     [InlineData("OP08-051", true)]
@@ -209,11 +339,66 @@ public class OP17EffectTests
         var rocksState = TestScene.New("OP17-039").Build();
         var rocks = Card("OP17-118");
         rocksState.Players[0].Hand.Add(rocks);
+
+        Assert.Equal(0, HandStaticCounter.Value(rocksState, 0, rocks));
+
         rocksState.Players[0].Characters.Add(Card("OP17-044"));
         Assert.Equal(2000, HandStaticCounter.Value(rocksState, 0, rocks));
 
         rocksState.Players[0].Characters.Add(Card("OP17-085"));
         Assert.Equal(0, HandStaticCounter.Value(rocksState, 0, rocks));
+    }
+
+    [Fact]
+    public async Task OP17_118_EmptyField_IsHiddenAndRejectedByAuthoritativeCounterPath()
+    {
+        _ = TestScene.New().Build();
+        string deck = "OP15-001\n" + string.Join('\n', Enumerable.Repeat("OP15-003", 10));
+        var engine = new GameEngine(
+            "op17-118-counter-rule",
+            ("s0", "p0", deck),
+            ("s1", "p1", deck),
+            firstPlayer: 1,
+            rngSeed: 118);
+        var state = engine.State;
+        var defender = state.Players[0];
+        var rocks = Card("OP17-118");
+
+        defender.Hand.Clear();
+        defender.Hand.Add(rocks);
+        defender.Characters.Clear();
+        state.CurrentTurnPlayer = 1;
+        state.TurnCount = 3;
+        state.Phase = Phase.Main;
+
+        var emptyFieldSnapshot = JsonSerializer.SerializeToElement(StateSnapshotBuilder.Build(state, 0));
+        Assert.Equal(0, emptyFieldSnapshot.GetProperty("my").GetProperty("handCardCounters")[0].GetInt32());
+
+        BattleEngine.StartAttack(state, state.Players[1].Leader.Id, targetIsLeader: true, targetId: null);
+        await BattleEngine.TriggerAttackDeclareAsync(state, new MockPromptService());
+        BattleEngine.PassBlock(state);
+
+        Assert.False(engine.HandleAction(0, "PlayCounter", JsonSerializer.SerializeToElement(new
+        {
+            handIndex = 0,
+            useCounterIcon = true,
+        })));
+        Assert.Same(rocks, Assert.Single(defender.Hand));
+        Assert.DoesNotContain(rocks, defender.Trash);
+        Assert.Equal(0, defender.Leader.PowerModThisBattle);
+
+        defender.Characters.Add(Card("OP17-044"));
+        var eligibleSnapshot = JsonSerializer.SerializeToElement(StateSnapshotBuilder.Build(state, 0));
+        Assert.Equal(2000, eligibleSnapshot.GetProperty("my").GetProperty("handCardCounters")[0].GetInt32());
+
+        Assert.True(engine.HandleAction(0, "PlayCounter", JsonSerializer.SerializeToElement(new
+        {
+            handIndex = 0,
+            useCounterIcon = true,
+        })));
+        Assert.Empty(defender.Hand);
+        Assert.Contains(rocks, defender.Trash);
+        Assert.Equal(2000, defender.Leader.PowerModThisBattle);
     }
 
     [Fact]
@@ -263,6 +448,60 @@ public class OP17EffectTests
         Assert.False(ActionValidator.CanAttack(state, 1, attacker.Id, true, null).Ok);
         Assert.False(ActionValidator.CanAttack(state, 1, attacker.Id, false, other.Id).Ok);
         Assert.True(ActionValidator.CanAttack(state, 1, attacker.Id, false, john.Id).Ok);
+    }
+
+    [Fact]
+    public async Task OP17_044_CannotPayRestCostWhileCannotBeRested()
+    {
+        var state = TestScene.New("OP17-039")
+            .MyDeckTop("OP17-040")
+            .Build();
+        state.CurrentTurnPlayer = 0;
+        state.Phase = Phase.Main;
+        var john = Card("OP17-044");
+        john.Restrictions.Add(new CardRestriction
+        {
+            Kind = RestrictionKind.CannotBeRested,
+            Duration = KeywordDuration.UntilNextOpponentEndPhase,
+            AppliedBySide = 1,
+        });
+        state.Players[0].Characters.Add(john);
+        var prompts = new MockPromptService().QueueConfirm(true);
+
+        var validation = ActionValidator.CanUseEffect(state, 0, john.Id);
+        await EffectRuntime.Resolve(state, 0, john, EffectTrigger.ActivatedMain, prompts);
+
+        Assert.False(validation.Ok);
+        Assert.Contains("无法转为休息状态", validation.Reason);
+        Assert.False(john.IsTapped);
+        Assert.Empty(state.Players[0].Hand);
+        Assert.Single(state.Players[0].Deck);
+        Assert.Empty(prompts.ConfirmHistory);
+        Assert.Empty(prompts.ChooseHistory);
+    }
+
+    [Fact]
+    public async Task OP17_044_CanStillPayRestCostWithoutRestriction()
+    {
+        var state = TestScene.New("OP17-039")
+            .MyDeckTop("OP17-040")
+            .Build();
+        state.CurrentTurnPlayer = 0;
+        state.Phase = Phase.Main;
+        var john = Card("OP17-044");
+        state.Players[0].Characters.Add(john);
+        var prompts = new MockPromptService()
+            .QueueConfirm(true)
+            .QueueChoose();
+
+        var validation = ActionValidator.CanUseEffect(state, 0, john.Id);
+        await EffectRuntime.Resolve(state, 0, john, EffectTrigger.ActivatedMain, prompts);
+
+        Assert.True(validation.Ok);
+        Assert.True(john.IsTapped);
+        Assert.Single(state.Players[0].Hand);
+        Assert.Empty(state.Players[0].Deck);
+        Assert.Single(prompts.ConfirmHistory);
     }
 
     [Fact]
@@ -432,6 +671,40 @@ public class OP17EffectTests
     }
 
     [Fact]
+    public async Task OP17_032_OnPlay_ShowsLookTopPrompt_WhenNoEligibleCardIsFound()
+    {
+        _ = TestScene.New().Build();
+        var deck = LegalOp17Deck("OP17-039");
+        var engine = new GameEngine("op17-032-empty-search", ("s0", "alice", deck), ("s1", "bob", deck), 0, 17);
+        var player = engine.State.Players[0];
+        var looked = CardDatabase.GetBySet("OP17")
+            .Where(card => card.Kind != CardKind.Leader && !card.HasKeywordContaining("红发海盗团"))
+            .Take(3)
+            .Select(info => new CardInstance { Info = info })
+            .ToList();
+        Assert.Equal(3, looked.Count);
+        player.Deck.Clear();
+        player.Deck.AddRange(looked);
+
+        var resolveTask = EffectRuntime.Resolve(
+            engine.State, 0, Card("OP17-032"), EffectTrigger.OnEnterField, engine.Prompts);
+
+        for (int i = 0; i < 100 && engine.State.PendingPrompt is null; i++)
+            await Task.Delay(10);
+
+        var prompt = Assert.IsType<PendingPrompt>(engine.State.PendingPrompt);
+        Assert.Equal("LookTop", prompt.Kind);
+        Assert.Empty(prompt.ValidChoices);
+        using (var choiceCards = JsonDocument.Parse(JsonSerializer.Serialize(prompt.Extra["choiceCards"])))
+            Assert.Equal(3, choiceCards.RootElement.GetArrayLength());
+
+        engine.Prompts.Resolve(prompt.PromptId, Array.Empty<string>());
+        await resolveTask;
+
+        Assert.Equal(looked, player.Deck);
+    }
+
+    [Fact]
     public void OP17_NewCards_HaveExpectedPrintedValues()
     {
         _ = TestScene.New().Build();
@@ -534,6 +807,28 @@ public class OP17EffectTests
         Assert.DoesNotContain(whiteyBay, defense.Players[0].Characters);
         Assert.Contains(whiteyBay, defense.Players[0].Trash);
         Assert.Equal(1000, defense.Players[0].Leader.PowerModThisBattle);
+    }
+
+    [Fact]
+    public async Task Q318_OP17_014_RealOpponentAttackEvent_TrashesSelfAndBoostsLeader()
+    {
+        var state = TestScene.New().MyCharacter("OP17-014").Build();
+        var defender = state.Players[0];
+        var whiteyBay = defender.Characters.Single();
+        state.CurrentTurnPlayer = 1;
+        state.TurnCount = 3;
+
+        BattleEngine.StartAttack(
+            state,
+            state.Players[1].Leader.Id,
+            targetIsLeader: true,
+            targetId: null);
+        await BattleEngine.TriggerAttackDeclareAsync(state, new MockPromptService());
+
+        Assert.DoesNotContain(whiteyBay, defender.Characters);
+        Assert.Contains(whiteyBay, defender.Trash);
+        Assert.Equal(1000, defender.Leader.PowerModThisBattle);
+        Assert.Equal(Phase.BattleBlock, state.Phase);
     }
 
     [Fact]

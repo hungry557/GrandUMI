@@ -11,6 +11,13 @@ namespace GrandUMI.Game;
 public class ContinuousEffect
 {
     public required string SourceCardId { get; init; }    // 来源卡 GUID（来源 KO/离场后失效）
+    public string? SourceCardNumber { get; init; }        // 限时事件等来源已离场时，供后续反应式效果识别来源
+    /// <summary>已结算的限时效果独立于来源卡继续有效，来源离场或之后被无效不会撤销它。</summary>
+    public bool PersistsAfterSourceLeaves { get; init; }
+    /// <summary>超过此回合编号即到期，适用于“直到下个我方回合开始”的已结算效果。</summary>
+    public int? ExpiresAfterTurnCount { get; init; }
+    /// <summary>指定后，在该玩家的下一个结束阶段结束时移除此限时持续效果。</summary>
+    public int? ExpiresAtEndOfTurnForSide { get; init; }
     public required ContinuousScope Scope { get; init; }
     public int PowerDelta { get; init; }
 
@@ -33,6 +40,10 @@ public class ContinuousEffect
     /// <summary>持续"不会被KO"保护；非空时 Predicate 成立期间 scope 内卡牌不会被 KO。
     /// "battle"=仅战斗中, "effect"=仅因效果, "any"=任何 KO。</summary>
     public string? KoGuard { get; init; }
+
+    /// <summary>可选的弃手牌 KO 置换；非空时 Predicate 成立期间，可丢弃我方 1 张手牌防止对应来源的 KO。
+    /// "battle"=仅战斗中, "effect"=仅因效果, "any"=任何 KO。</summary>
+    public string? DiscardHandKoReplacement { get; init; }
 
     /// <summary>持续"不会离开场上"保护（含KO/退回手牌/放回卡组/置入生命等离场）；非空时 Predicate 成立期间
     /// scope 内卡牌不会因相应来源离场。"effect"=仅因效果离场, "any"=任何离场。比 KoGuard 范围更广。</summary>
@@ -65,5 +76,7 @@ public class ContinuousScope
     public int Side { get; init; }
     public bool IncludeLeader { get; init; } = true;
     public bool IncludeCharacters { get; init; } = true;
+    /// <summary>是否允许持续费用效果作用于手牌。默认关闭，避免场上角色光环泄漏到手牌。</summary>
+    public bool IncludeHand { get; init; }
     public Func<CardInstance, bool>? Filter { get; init; }
 }

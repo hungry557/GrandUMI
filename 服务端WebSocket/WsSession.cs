@@ -21,13 +21,32 @@ public class WsSession
     public WebSocket Socket     { get; init; } = null!;
 
     public string?   Account    { get; set; }
+    /// <summary>
+    /// 白名单从未导入时，经账号密码认证且在首次迁移快照中的管理员账号。
+    /// 此字段不代表完整登录，不计在线，也不能访问白名单状态/导入之外的业务协议。
+    /// </summary>
+    public string?   QqBootstrapAccount { get; set; }
+    public string?   ClientInstanceId { get; set; }
     public string?   PlayerName { get; set; }
     public string    CardBackId { get; set; } = Persistence.PlayerDataStore.DefaultCardBackId;
 
     public string?   Deck       { get; set; }
     public string?   DeckName   { get; set; }
     public bool      IsMatching       { get; set; }
+    /// <summary>公开匹配队列类型；旧客户端未传时默认兼容狂野休闲，但仍执行官网禁卡表。</summary>
+    public string    MatchQueueKind   { get; set; } = "casual";
+    /// <summary>按入队时已校验的领航与主卡组计算；标准排位含 EB05／OP18 时进入新卡池。</summary>
+    internal bool    MatchUsesPreviewCards { get; set; }
+    public DateTime  MatchEnqueuedAtUtc { get; set; }
+    public double    MatchRating      { get; set; } = 1500;
+    public int       MatchPlacementGames { get; set; }
+    public int       MatchRankPoints  { get; set; }
     public string?   CurrentRoomCode  { get; set; }
+
+    /// <summary>本连接的默认观战权限；建局时固化到对局。</summary>
+    public string    SpectateMode { get; set; } = Game.SpectatingRules.Open;
+    public bool      SpectatorHandsPublic { get; set; }
+    public string?   SpectateCode { get; set; }
 
     /// <summary>玩家设置：是否对所有生命牌都弹"是否发动触发"窗口（反信息泄露）</summary>
     public bool      AlwaysPromptOnLifeReveal { get; set; }
@@ -46,14 +65,27 @@ public class WsSession
     private int _maxOutboundDepth;
     private readonly object _rateLimitGate = new();
     private readonly Dictionary<string, RateBucket> _rateBuckets = new(StringComparer.Ordinal);
+    private int _superseded;
+    private int _supersededCleanupStarted;
+    private int _qqAccessRevoked;
+    private int _qqRevokedCloseMonitorStarted;
 
     /// <summary>由握手能力协商决定；旧客户端保持完整快照。</summary>
     public bool SupportsDeltaSnapshots { get; set; }
+    /// <summary>新客户端在资料和开场动画就绪后确认；旧客户端无需这个协议。</summary>
+    public bool SupportsOpeningPreparation { get; set; }
     internal JsonElement? SnapshotBaseline { get; private set; }
     internal int SnapshotBaselineTick { get; private set; } = -1;
     internal int SnapshotDeltasSinceFull { get; private set; }
 
     public bool IsLoggedIn => Account is not null;
+    /// <summary>
+    /// 当前连接已被同账号的新连接替代。该状态不可逆；一旦失去账号权威，旧连接不得再收发业务消息，
+    /// 但仍保留 Account 供乱序断开时完成房间、邀请等会话级清理。
+    /// </summary>
+    public bool IsSuperseded => Volatile.Read(ref _superseded) != 0;
+    /// <summary>管理员解绑或白名单变化后，仅允许当前已注册对局继续；离开对局即终止会话。</summary>
+    public bool IsQqAccessRevoked => Volatile.Read(ref _qqAccessRevoked) != 0;
     public long MergedStateCount => Interlocked.Read(ref _mergedStateCount);
     public long DroppedOutboundCount => Interlocked.Read(ref _droppedOutboundCount);
     public int OutboundDepth { get { lock (_outboundGate) return _outbound.Count; } }
@@ -66,13 +98,20 @@ public class WsSession
     public bool IsRecentlyActive(TimeSpan maxIdle)
         => DateTime.UtcNow - LastSeenUtc <= maxIdle;
 
+    public void MarkQqAccessRevoked() => Volatile.Write(ref _qqAccessRevoked, 1);
+    public void ClearQqAccessRevoked() => Volatile.Write(ref _qqAccessRevoked, 0);
+    public bool TryStartQqRevokedCloseMonitor()
+        => Interlocked.CompareExchange(ref _qqRevokedCloseMonitorStarted, 1, 0) == 0;
+
     public sealed record OutboundMessage(
         object Data,
         long EnqueuedAt,
         int QueueDepth,
         bool IsStateSnapshot,
         string? CoalesceKey = null,
-        OutboundPriority Priority = OutboundPriority.Normal);
+        OutboundPriority Priority = OutboundPriority.Normal,
+        TaskCompletionSource<bool>? Completion = null,
+        bool StopsSender = false);
 
     /// <summary>每个连接只启动一个发送循环，从根源上保证 WebSocket SendAsync 不并发且顺序稳定。</summary>
     public void StartSender(Func<OutboundMessage, Task> sender)
@@ -101,7 +140,7 @@ public class WsSession
     {
         lock (_outboundGate)
         {
-            if (_senderStopping || _sender is null) return false;
+            if (_senderStopping || _sender is null || IsSuperseded) return false;
             var enqueuedAt = LatencyDiagnostics.Start();
 
             if (coalesceKey is not null && _coalesced.TryGetValue(coalesceKey, out var replaceable))
@@ -135,15 +174,59 @@ public class WsSession
 
     public async Task StopSenderAsync()
     {
+        Task senderLoop;
         lock (_outboundGate)
         {
-            if (_senderStopping) return;
+            if (!_senderStopping)
+            {
+                _senderStopping = true;
+                _coalesced.Clear();
+                _outboundSignal.Release();
+            }
+            senderLoop = _senderLoop;
+        }
+        await senderLoop;
+    }
+
+    /// <summary>清空待发数据，只发送最后一条终止通知，并在通知写出后停止发送循环。</summary>
+    public Task<bool> EnqueueTerminalAsync(object data)
+    {
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_outboundGate)
+        {
+            if (_senderStopping || _sender is null) return Task.FromResult(false);
             _senderStopping = true;
+            _outbound.Clear();
             _coalesced.Clear();
+            var enqueuedAt = LatencyDiagnostics.Start();
+            _outbound.AddLast(new OutboundMessage(
+                data,
+                enqueuedAt,
+                1,
+                IsStateSnapshot: false,
+                Priority: OutboundPriority.Critical,
+                Completion: completion,
+                StopsSender: true));
             _outboundSignal.Release();
         }
-        await _senderLoop;
+        return completion.Task;
     }
+
+    /// <summary>原子标记为已被替代，并丢弃尚未发送的普通消息；终止通知由专用入口随后入队。</summary>
+    internal bool TryMarkSuperseded()
+    {
+        if (Interlocked.CompareExchange(ref _superseded, 1, 0) != 0) return false;
+        lock (_outboundGate)
+        {
+            _outbound.Clear();
+            _coalesced.Clear();
+        }
+        return true;
+    }
+
+    /// <summary>保证同一旧会话只启动一个终止与强制回收流程。</summary>
+    internal bool TryBeginSupersededCleanup()
+        => Interlocked.CompareExchange(ref _supersededCleanupStarted, 1, 0) == 0;
 
     private async Task SenderLoopAsync()
     {
@@ -170,6 +253,7 @@ public class WsSession
             }
 
             if (message is null) continue;
+            var sent = true;
             try
             {
                 LatencyDiagnostics.Observe("WebSocket 发送队列", message.EnqueuedAt,
@@ -179,8 +263,14 @@ public class WsSession
             }
             catch (Exception ex)
             {
+                sent = false;
                 Console.Error.WriteLine($"[WebSocket] 会话 {SessionId[..8]} 发送循环异常: {ex.Message}");
             }
+            finally
+            {
+                message.Completion?.TrySetResult(sent);
+            }
+            if (message.StopsSender) return;
         }
     }
 

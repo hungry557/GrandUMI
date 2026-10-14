@@ -7,9 +7,13 @@ namespace GrandUMI.Effects;
 /// </summary>
 public class EffectContext
 {
+    internal bool ExplicitActivationObserved { get; private set; }
+
     public required GameState State { get; init; }
     public required int OwnerIndex   { get; init; }   // 效果所属玩家
     public required CardInstance Source { get; init; } // 效果源卡（即"自身"）
+    /// <summary>本次效果尝试的稳定执行标识；恢复重放按相同调用顺序重建。</summary>
+    public required string ExecutionId { get; init; }
     public EffectTrigger Trigger    { get; init; }
     public Dictionary<string, object?> Vars { get; init; } = new(); // DSL 变量绑定 / 手写卡自由用
     public List<GameEvent> Events   { get; init; } = new();
@@ -17,6 +21,22 @@ public class EffectContext
 
     /// <summary>引擎引用，DSL 中某些 op（如 OpponentDiscard）需要发起对手 Prompt</summary>
     public GameEngine? Engine { get; init; }
+
+    /// <summary>按卡面“公开”语义，向双方短暂展示指定卡牌。</summary>
+    public void BroadcastReveal(CardInstance card)
+    {
+        ExplicitActivationObserved = true;
+        Engine?.BroadcastReveal(OwnerIndex, new[] { card.Info.Number });
+    }
+
+    /// <summary>按卡面“公开”语义，向双方短暂展示指定卡牌。</summary>
+    public void BroadcastReveal(IEnumerable<CardInstance> cards)
+    {
+        var numbers = cards.Select(card => card.Info.Number).ToList();
+        if (numbers.Count == 0) return;
+        ExplicitActivationObserved = true;
+        Engine?.BroadcastReveal(OwnerIndex, numbers);
+    }
 }
 
 public class GameEvent

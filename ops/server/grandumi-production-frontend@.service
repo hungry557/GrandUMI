@@ -1,0 +1,31 @@
+[Unit]
+Description=GrandUMI 正式服前端槽位 %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=8
+
+[Service]
+Type=simple
+User=grandumi
+Group=grandumi
+EnvironmentFile=/etc/grandumi/frontend-%i.env
+WorkingDirectory=/opt/grandumi/slots/%i/frontend
+ExecStart=/opt/node/bin/node /opt/grandumi/slots/%i/frontend/node_modules/next/dist/bin/next start -H 127.0.0.1 -p ${GRANDUMI_FRONTEND_PORT}
+SuccessExitStatus=143
+Restart=always
+RestartSec=2
+TimeoutStartSec=45
+Environment=NODE_ENV=production
+LimitNOFILE=65536
+CPUQuota=150%
+MemoryMax=1536M
+Slice=grandumi-production.slice
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/grandumi/slots/%i/frontend/.next
+
+[Install]
+WantedBy=multi-user.target

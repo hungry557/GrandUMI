@@ -9,7 +9,7 @@ namespace GrandUMI.Effects.Scripted;
 ///   我方场上存在费用为 8 或更高的角色的场合，改为可选择费用不高于 6 的角色。
 /// 【触发】抽取 1 张卡牌，将我方卡组最上方的 1 张卡牌放置到废弃区。
 ///
-/// 费用阈值用 c.Info.Cost（基础费用）判定，与 DSL filter 一致。
+/// 费用阈值按场上角色当前费用判定。
 /// </summary>
 public class OP12_096_BearPaw : IScriptedEffect
 {
@@ -24,7 +24,7 @@ public class OP12_096_BearPaw : IScriptedEffect
         {
             // 【触发】抽 1 张 + 卡组顶 1 张入废弃区
             var meTrig = ctx.State.Players[ctx.OwnerIndex];
-            AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+            await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
             AtomicOps.MillTop(meTrig, 1);
             return;
         }
@@ -34,9 +34,9 @@ public class OP12_096_BearPaw : IScriptedEffect
         var opp = ctx.State.Players[1 - ctx.OwnerIndex];
 
         // 我方场上存在费用 ≥ 8 的角色 → 阈值提升到 6，否则 4
-        int threshold = me.Characters.Any(c => c.Info.Cost >= 8) ? 6 : 4;
+        int threshold = me.Characters.Any(c => ctx.State.CurrentCostOf(c) >= 8) ? 6 : 4;
 
-        var candidates = opp.Characters.Where(c => c.Info.Cost <= threshold).ToList();
+        var candidates = opp.Characters.Where(c => ctx.State.CurrentCostOf(c) <= threshold).ToList();
         if (candidates.Count == 0) return;
 
         var chosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OpponentCharacter",

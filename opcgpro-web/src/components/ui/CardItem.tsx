@@ -11,8 +11,11 @@ import CardZoomOverlay from "@/components/ui/CardZoomOverlay";
 import CardKeywordEffects, { resolveVisibleKeywords } from "@/components/ui/CardKeywordEffects";
 import CardBack from "@/components/ui/CardBack";
 import GameOverlayPortal from "@/components/ui/GameOverlayPortal";
+import { createCardLongPressGesture } from "@/lib/cardLongPressGesture";
+import { shouldShowDesktopCardHoverPreview } from "@/lib/cardHoverPlacement";
 import { getLeaderBreathingEffect } from "@/lib/leaderBreathingEffects";
 import { CARD_BACK_SRC, nextCardImageSrc, thumbSrc } from "@/lib/sprite";
+import { useSlowImageFallback } from "@/hooks/useSlowImageFallback";
 
 interface Props {
   card: CardData | null;
@@ -25,6 +28,8 @@ interface Props {
   faceDown?: boolean;
   /** 暗置时使用的公开卡背外观；旧快照或无效值自动回退经典款。 */
   cardBackId?: string;
+  /** 暗置牌所在的主视角区域；用于仅屏蔽 opponent 卡背。 */
+  cardBackSide?: "my" | "opponent";
   /** 隐藏反击值徽标（卡牌在场上时反击值无意义，仅手牌防御时显示） */
   hideCounter?: boolean;
   /** 当前有效反击值（含场上静态效果）；未提供时使用卡牌印刷值 */
@@ -45,6 +50,8 @@ interface Props {
   gainedKeywords?: string[];
   /** 攻击状态标识：can=可攻击 sick=本回合登场不可攻击 blocked=受到禁攻状态 none=不显示 */
   attackState?: "can" | "sick" | "blocked" | "none";
+  /** 卡牌至少一项【每回合1次】效果本回合仍可发动 */
+  oncePerTurnEffectAvailable?: boolean;
   /** 战斗中的身份高亮；选框挂在卡牌旋转节点上，可自动适配活跃/横置形状 */
   battleHighlight?: "attacker" | "target" | "blocker";
   onClick?: () => void;
@@ -68,6 +75,7 @@ export default function CardItem({
   attachedDonCount = 0,
   faceDown = false,
   cardBackId,
+  cardBackSide,
   hideCounter = false,
   counterValue,
   hidePower = false,
@@ -76,6 +84,7 @@ export default function CardItem({
   showKeywordFx = false,
   gainedKeywords,
   attackState = "none",
+  oncePerTurnEffectAvailable = false,
   battleHighlight,
   onClick,
   size = "md",
@@ -92,6 +101,9 @@ export default function CardItem({
   const displayCounter = counterValue ?? card?.counter ?? 0;
   const rawSprite = card?.sprite ?? CARD_BACK_SRC;
   const [imgSrc, setImgSrc] = useState(thumbSrc(rawSprite));
+  const [imageFailed, setImageFailed] = useState(false);
+  const imageRef = useRef<HTMLImageElement>(null);
+  useSlowImageFallback(imageRef, imgSrc, setImgSrc, !showFaceDown && !imageFailed);
   const leaderBreathingEffect =
     !showFaceDown && card?.type === "Leader"
       ? getLeaderBreathingEffect(card.number, rawSprite)
@@ -117,49 +129,133 @@ export default function CardItem({
   // 卡背后、即使图恢复也一直卡在卡背的问题）
   useEffect(() => {
     setImgSrc(thumbSrc(rawSprite));
+    setImageFailed(false);
   }, [card?.sprite]);
 
   // 悬停详情预览（仅正面且有卡牌数据时显示，避免泄露对手暗置手牌）
   const [hoverInfo, setHoverInfo] = useState<HoverInfo | null>(null);
   const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // 右键大图详情（同样仅正面有卡牌时可开，避免泄露对手暗置牌）
-  const [zoomOpen, setZoomOpen] = useState(false);
+  // 右键或触屏长按大图详情；保存打开时的卡牌身份，避免卡牌切换瞬间展示新牌信息。
+  const [zoomCardIdentity, setZoomCardIdentity] = useState<string | null>(null);
+  const cardIdentity = showFaceDown || !card ? null : `${card.number}\u0000${rawSprite}`;
+  const currentCardRef = useRef({ card, cardIdentity, showFaceDown });
+  currentCardRef.current = { card, cardIdentity, showFaceDown };
+
+  const clearHoverPreview = () => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current);
+    hoverTimer.current = null;
+    setHoverInfo(null);
+  };
+
+  const [longPressGesture] = useState(() => createCardLongPressGesture({
+    onLongPress: (pressedIdentity) => {
+      const current = currentCardRef.current;
+      if (current.showFaceDown || !current.card || current.cardIdentity !== pressedIdentity) return;
+      clearHoverPreview();
+      setZoomCardIdentity(pressedIdentity);
+    },
+  }));
 
   useEffect(() => {
+    const handleWindowPointerMove = (event: PointerEvent) => {
+      longPressGesture.move(event);
+    };
+    const handleWindowPointerUp = (event: PointerEvent) => {
+      const result = longPressGesture.finish(event);
+      if (result === "ignored") return;
+      clearHoverPreview();
+      if (result === "long-press") event.preventDefault();
+    };
+    const handleWindowPointerCancel = (event: PointerEvent) => {
+      const result = longPressGesture.cancelPointer(event);
+      if (result !== "ignored") clearHoverPreview();
+    };
+    const handleWindowClick = (event: MouseEvent) => {
+      if (!longPressGesture.consumeSuppressedClick(event)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+
+    // HandArea 会把触控指针捕获到外层；窗口捕获阶段仍能稳定看到移动和释放。
+    window.addEventListener("pointermove", handleWindowPointerMove, true);
+    window.addEventListener("pointerup", handleWindowPointerUp, true);
+    window.addEventListener("pointercancel", handleWindowPointerCancel, true);
+    window.addEventListener("click", handleWindowClick, true);
     return () => {
+      window.removeEventListener("pointermove", handleWindowPointerMove, true);
+      window.removeEventListener("pointerup", handleWindowPointerUp, true);
+      window.removeEventListener("pointercancel", handleWindowPointerCancel, true);
+      window.removeEventListener("click", handleWindowClick, true);
+      longPressGesture.dispose();
       if (hoverTimer.current) clearTimeout(hoverTimer.current);
     };
-  }, []);
+  }, [longPressGesture]);
 
-  const handleMouseEnter = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (showFaceDown || !card) return;
+  useEffect(() => {
+    longPressGesture.cancelActive();
+    clearHoverPreview();
+    setZoomCardIdentity(null);
+  }, [cardIdentity, longPressGesture]);
+
+  const handlePointerEnter = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!shouldShowDesktopCardHoverPreview(e.pointerType) || showFaceDown || !card || !cardIdentity) return;
     const rect = e.currentTarget.getBoundingClientRect();
     if (hoverTimer.current) clearTimeout(hoverTimer.current);
+    const hoveredIdentity = cardIdentity;
     hoverTimer.current = setTimeout(
-      () => setHoverInfo({ card, rect, currentSprite: rawSprite }),
+      () => {
+        hoverTimer.current = null;
+        if (currentCardRef.current.cardIdentity !== hoveredIdentity) return;
+        setHoverInfo({ card, rect, currentSprite: rawSprite });
+      },
       HOVER_DELAY,
     );
   };
 
-  const handleMouseLeave = () => {
-    if (hoverTimer.current) clearTimeout(hoverTimer.current);
-    setHoverInfo(null);
+  const handlePointerLeave = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === "mouse") clearHoverPreview();
+  };
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === "mouse") {
+      longPressGesture.noteMousePointerDown(e, e.button);
+      return;
+    }
+    if (!e.isPrimary || showFaceDown || !cardIdentity) return;
+    clearHoverPreview();
+    // 不在按下时 preventDefault，保留普通短按和非 HandArea 场景的页面滚动。
+    longPressGesture.start(e, cardIdentity);
+  };
+
+  const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    // 即使没有业务 onClick，也保留节点级兜底，避免合成 click 冒泡到牌区祖先。
+    if (longPressGesture.consumeSuppressedClick(e)) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.nativeEvent.stopImmediatePropagation();
+      return;
+    }
+    onClick?.();
   };
 
   // 右键 → 居中大图详情；屏蔽浏览器原生菜单，背面/无卡数据不弹（防泄露暗置牌）
   const handleContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
-    if (showFaceDown || !card) return;
-    if (hoverTimer.current) clearTimeout(hoverTimer.current);
-    setHoverInfo(null);
-    setZoomOpen(true);
+    // 部分浏览器把触摸长按产生的 contextmenu 标成 mouse，故按近期触控坐标判定。
+    if (longPressGesture.shouldSuppressContextMenu(e)) {
+      e.stopPropagation();
+      return;
+    }
+    if (showFaceDown || !card || !cardIdentity) return;
+    clearHoverPreview();
+    setZoomCardIdentity(cardIdentity);
   };
 
   return (
     <motion.div
       className={clsx(
         sizes[size],
-        "relative shrink-0 cursor-pointer overflow-hidden rounded-md border-2 shadow-xl",
+        "relative shrink-0 cursor-pointer select-none overflow-hidden rounded-md border-2 shadow-xl",
         "transform-gpu backface-hidden transition-colors",
         isSelected
           ? "z-30 border-yellow-300"
@@ -180,30 +276,52 @@ export default function CardItem({
         scale: isSelected ? (liftOnSelect ? 1.05 : 1.03) : 1,
       }}
       transition={{ type: "spring", stiffness: 300, damping: 25 }}
-      onClick={onClick}
-      onContextMenu={handleContextMenu}
-      onMouseEnter={handleMouseEnter}
-      onMouseLeave={handleMouseLeave}
+      style={{ WebkitTouchCallout: "none" }}
+      data-game-board-interactive={onClick ? "true" : undefined}
+      draggable={false}
+      onClick={handleClick}
+      // 捕获阶段先于目标/图片默认行为拦截 HarmonyOS WebView 的原生保存/分享菜单。
+      onContextMenuCapture={handleContextMenu}
+      onDragStart={(event) => { event.preventDefault(); }}
+      onPointerDown={handlePointerDown}
+      onPointerEnter={handlePointerEnter}
+      onPointerLeave={handlePointerLeave}
       whileHover={!isSelected ? { scale: 1.03 } : {}}
     >
       {showFaceDown ? (
-        <CardBack cardBackId={cardBackId} />
+        <CardBack cardBackId={cardBackId} side={cardBackSide} />
       ) : (
         <>
-          <NextImage
-            src={imgSrc}
-            alt={card!.name}
-            fill
-            sizes="180px"
-            className={clsx(
-              "object-cover transition-[filter] duration-300",
+          {!imageFailed ? (
+            <NextImage
+              ref={imageRef}
+              src={imgSrc}
+              alt={card!.name}
+              fill
+              sizes="180px"
+              className={clsx(
+                "object-cover transition-[filter] duration-300",
+                isTapped && "grayscale brightness-[0.6]",
+              )}
+              draggable={false}
+              onError={() => setImgSrc((cur) => {
+                const next = nextCardImageSrc(cur, rawSprite, card?.image, "thumb");
+                if (next === cur || next.includes(CARD_BACK_SRC)) setImageFailed(true);
+                return next;
+              })}
+            />
+          ) : (
+            <div className={clsx(
+              "absolute inset-0 flex flex-col bg-gradient-to-b from-slate-800 to-slate-950 p-1 text-slate-100",
               isTapped && "grayscale brightness-[0.6]",
-            )}
-            draggable={false}
-            onError={() =>
-              setImgSrc((cur) => nextCardImageSrc(cur, rawSprite, card?.image, "thumb"))
-            }
-          />
+            )}>
+              <p className="line-clamp-2 text-[9px] font-black leading-tight">{card!.name}</p>
+              <p className="mt-0.5 text-[7px] text-slate-400">{card!.number}</p>
+              <p className="mt-1 line-clamp-6 overflow-hidden whitespace-pre-wrap text-[7px] leading-tight text-slate-200">
+                {card!.effectEvent || card!.trigger || card!.abilities.join(" / ") || "卡图暂不可用"}
+              </p>
+            </div>
+          )}
           {leaderBreathingEffect && (
             <div
               className={clsx("leader-breath-fx", isTapped && "leader-breath-fx--tapped")}
@@ -287,6 +405,21 @@ export default function CardItem({
 
           <CardKeywordEffects keywords={visibleKeywords} />
 
+          {oncePerTurnEffectAvailable && (
+            <span
+              data-once-per-turn-ready="true"
+              className="pointer-events-none absolute right-0 top-1/2 z-30 flex -translate-y-1/2 items-center gap-0.5 rounded-l bg-gradient-to-l from-cyan-400 to-blue-600 px-1 py-0.5 shadow-[0_0_7px_rgba(34,211,238,0.95)] ring-1 ring-cyan-100/80"
+              title="每回合1次效果可发动"
+              aria-label="每回合1次效果可发动"
+            >
+              <svg viewBox="0 0 24 24" className="h-3 w-3 text-white" fill="none" aria-hidden>
+                <path d="M19 7v5h-5M5 17v-5h5" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M18.2 11a7 7 0 0 0-12-3M5.8 13a7 7 0 0 0 12 3" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" />
+              </svg>
+              <span className="text-[8px] font-black leading-none text-white">1</span>
+            </span>
+          )}
+
           {/* 攻击状态标识 → 左侧边中部（避开所有现有徽标），仅我方回合显示 */}
           {attackState === "can" && (
             <span
@@ -333,12 +466,12 @@ export default function CardItem({
         )}
       <GameOverlayPortal>
         <AnimatePresence>
-          {zoomOpen && card && (
+          {zoomCardIdentity !== null && zoomCardIdentity === cardIdentity && card && !showFaceDown && (
             <CardZoomOverlay
               card={card}
               sprite={rawSprite}
               counterValue={displayCounter}
-              onClose={() => setZoomOpen(false)}
+              onClose={() => setZoomCardIdentity(null)}
             />
           )}
         </AnimatePresence>

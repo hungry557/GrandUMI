@@ -40,7 +40,7 @@ public class OP03_008_Buggy : IScriptedEffect
                 var attacker = attackerSide.Leader.Id == battle.AttackerCardId
                     ? attackerSide.Leader
                     : attackerSide.Characters.FirstOrDefault(c => c.Id == battle.AttackerCardId);
-                return attacker is not null && attacker.Info.Property.Split('/').Contains("斩");
+                return attacker is not null && attacker.HasProperty("斩");
             },
         });
 
@@ -64,6 +64,7 @@ public class OP03_008_Buggy : IScriptedEffect
                 var p = cand.First(c => c.Id.ToString() == ch[0]);
                 me.Deck.Remove(p);
                 me.Hand.Add(p);
+                ctx.BroadcastReveal(p);
             }
         }
 

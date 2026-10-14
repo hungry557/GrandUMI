@@ -38,9 +38,25 @@ public class ST17_003_Buggy : IScriptedEffect
         var me = ctx.State.Players[ctx.OwnerIndex];
         var top = me.Deck.Take(3).ToList();
         if (top.Count == 0) return;
-        // 仅放回最上方（自选顺序简化为原相对顺序）
-        AtomicOps.ReorderTopK(me, top.Select(c => c.Id).ToList(), toBottom: false);
-        return;
+
+        var extra = new Dictionary<string, object?>
+        {
+            ["choiceCards"] = top.Select(c => new { id = c.Id.ToString(), number = c.Info.Number }).ToList(),
+        };
+        var chosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "ST17BuggyReorder",
+            $"确认卡组顶 {top.Count} 张，自选顺序排列后放回卡组最上方",
+            top.Select(c => c.Id.ToString()).ToList(), top.Count, top.Count, extra);
+
+        // 仅接受本次确认到的卡牌并去重；异常或不完整回传按原相对顺序补齐，避免丢牌。
+        var order = chosen
+            .Select(id => top.FirstOrDefault(c => c.Id.ToString() == id))
+            .Where(c => c is not null)
+            .Select(c => c!.Id)
+            .Distinct()
+            .ToList();
+        order.AddRange(top.Where(c => !order.Contains(c.Id)).Select(c => c.Id));
+
+        AtomicOps.ReorderTopK(me, order, toBottom: false);
     }
 }
 
@@ -61,7 +77,7 @@ public class ST12_003_Mihawk : IScriptedEffect
             c.Info.Kind == CardKind.Character &&
             c.Info.Cost <= 4 &&
             !c.Info.NameIs("杰拉基尔·米霍克") &&
-            (c.Info.HasKeyword("阴森王国") || c.Info.Property.Split('/').Contains("斩"))).ToList();
+            (c.Info.HasKeyword("阴森王国") || c.HasProperty("斩"))).ToList();
         if (cands.Count == 0) return;
         var extra = new Dictionary<string, object?>
         {
@@ -92,7 +108,7 @@ public class ST12_007_Rika : IScriptedEffect
         var opp = ctx.State.Players[1 - ctx.OwnerIndex];
         if (opp.LifeCount < 3) return;
         if (me.ActiveDonCount < 2) return;
-        var cands = me.Characters.Where(c => c.Info.Cost <= 4 && c.Info.Property.Split('/').Contains("斩")).ToList();
+        var cands = me.Characters.Where(c => ctx.State.CurrentCostOf(c) <= 4 && c.HasProperty("斩")).ToList();
         if (cands.Count == 0) return;
         var ch = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OwnCharacter",
             "将我方最多1张费用≤4属性(斩)角色转为活跃状态", cands.Select(c => c.Id.ToString()).ToList(), 0, 1);

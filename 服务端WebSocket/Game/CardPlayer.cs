@@ -36,22 +36,36 @@ public static class CardPlayer
                     p.Trash.Add(sacrifice);
                 }
                 card.TurnPlayed = s.TurnCount;
+                card.IsTapped = s.ShouldCharacterEnterRested(playerIdx, card);
                 p.Characters.Add(card);
-                return new PlayResult(PlayKind.Character, card);
+                Hex.HexRules.OnCharacterEntered(s, playerIdx, card, from: "hand", byEffect: false);
+                return new PlayResult(PlayKind.Character, card, cost);
 
             case CardKind.Stage:
+                if (Hex.HexRules.HasLegacyDockSlots(s, playerIdx))
+                {
+                    if (p.StageCard is null) p.StageCard = card;
+                    else if (p.ExtraStageCard is null) p.ExtraStageCard = card;
+                    else
+                    {
+                        // 正常入口会先提示选择；内部直接调用时保留确定性兜底。
+                        p.Trash.Add(p.StageCard);
+                        p.StageCard = card;
+                    }
+                    return new PlayResult(PlayKind.Stage, card, cost);
+                }
                 if (p.StageCard is not null)
                 {
                     p.Trash.Add(p.StageCard);
                     p.StageCard = null;
                 }
                 p.StageCard = card;
-                return new PlayResult(PlayKind.Stage, card);
+                return new PlayResult(PlayKind.Stage, card, cost);
 
             case CardKind.Event:
                 // 事件：发动效果（M3 接入），先直接进废弃区
                 p.Trash.Add(card);
-                return new PlayResult(PlayKind.Event, card);
+                return new PlayResult(PlayKind.Event, card, cost);
 
             default:
                 throw new InvalidOperationException($"无法打出 {info.Kind}");
@@ -85,4 +99,4 @@ public static class CardPlayer
 }
 
 public enum PlayKind { Character, Stage, Event }
-public record PlayResult(PlayKind Kind, CardInstance Card);
+public record PlayResult(PlayKind Kind, CardInstance Card, int PaidCost);

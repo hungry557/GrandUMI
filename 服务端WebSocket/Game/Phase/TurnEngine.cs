@@ -1,3 +1,6 @@
+using GrandUMI.Effects;
+using GrandUMI.Cards;
+
 namespace GrandUMI.Game.PhaseFlow;
 
 /// <summary>
@@ -12,6 +15,7 @@ public static class TurnEngine
     /// <summary>开局后双方都完成 Mulligan 时，进入第一回合的 Reset 阶段</summary>
     public static void StartFirstTurn(GameState state)
     {
+        DeckOutRules.Arm(state);
         state.TurnCount = 1;
         state.CurrentTurnPlayer = state.FirstPlayer;
         state.Phase = Phase.Reset;
@@ -26,6 +30,24 @@ public static class TurnEngine
         state.Phase = Phase.Reset;
         var p = state.Turn;
 
+        state.ContinuousEffects.RemoveAll(effect =>
+            effect.ExpiresAfterTurnCount is int expiresAfter && state.TurnCount > expiresAfter);
+
+        // “直到下个我方回合开始”在准备阶段入口到期，早于转活跃、抽牌及 OnTurnStart。
+        // 扫描双方场上卡而不是只扫当前方，使期限始终以记录的 OwnerSide 为权威；
+        // AppliedTurnCount 则防止同一回合的重复准备阶段入口提前清除刚施加的修正。
+        foreach (var side in state.Players)
+        {
+            ClearUntilNextOwnTurnStart(side.Leader, state);
+            foreach (var card in side.Characters) ClearUntilNextOwnTurnStart(card, state);
+            if (side.StageCard is not null) ClearUntilNextOwnTurnStart(side.StageCard, state);
+            if (side.ExtraStageCard is not null) ClearUntilNextOwnTurnStart(side.ExtraStageCard, state);
+        }
+
+        // 新的自己回合开始：仍在场的卡重新获得【每回合1次】可用标识。
+        // 对方回合内使用过的防御型效果也会在其控制者下次回合开始恢复。
+        p.OncePerTurnEffectUsedCardIds.Clear();
+
         // 1. 赋予中的咚 → 休息状态放回费用区
         foreach (var d in p.CostArea)
         {
@@ -37,7 +59,10 @@ public static class TurnEngine
         }
 
         // 2. 领袖/角色/舞台/费用区中的休息卡牌 → 活跃
-        if (p.Leader.IsTapped) p.Leader.IsTapped = false;
+        if (p.Leader.CannotActivateNextReset)
+            p.Leader.CannotActivateNextReset = false;
+        else if (!state.IsResetPrevented(p.Leader) && p.Leader.IsTapped)
+            p.Leader.IsTapped = false;
         foreach (var c in p.Characters)
         {
             if (c.CannotActivateNextReset)
@@ -49,7 +74,16 @@ public static class TurnEngine
             if (c.IsTapped) c.IsTapped = false;
         }
         // 舞台卡通常不会休息，但留个处理点
-        if (p.StageCard is { IsTapped: true } && !state.IsResetPrevented(p.StageCard)) p.StageCard.IsTapped = false;
+        if (p.StageCard is { } stage)
+        {
+            if (stage.CannotActivateNextReset) stage.CannotActivateNextReset = false;
+            else if (stage.IsTapped && !state.IsResetPrevented(stage)) stage.IsTapped = false;
+        }
+        if (p.ExtraStageCard is { } extraStage)
+        {
+            if (extraStage.CannotActivateNextReset) extraStage.CannotActivateNextReset = false;
+            else if (extraStage.IsTapped && !state.IsResetPrevented(extraStage)) extraStage.IsTapped = false;
+        }
         foreach (var d in p.CostArea)
             if (d.State == DonState.Rest)
             {
@@ -57,8 +91,6 @@ public static class TurnEngine
                 d.State = DonState.Active;
             }
 
-        // 清除本回合"每回合 1 次"使用记录（在 EnterResetPhase 阶段，回合玩家自己的清掉，
-        // 实际官方规则是在结束阶段清除，统一在 EnterEndPhase 做）
     }
 
     public static void EnterDrawPhase(GameState state)
@@ -70,16 +102,31 @@ public static class TurnEngine
             DrawCard(state, state.CurrentTurnPlayer, 1);
     }
 
+    public static async Task EnterDrawPhaseAsync(GameState state, IPromptService prompts)
+    {
+        state.Phase = Phase.Draw;
+        bool firstTurnFirstPlayer = state.TurnCount == 1 && state.CurrentTurnPlayer == state.FirstPlayer;
+        if (!firstTurnFirstPlayer)
+            await DrawCardAsync(state, state.CurrentTurnPlayer, 1, prompts);
+    }
+
     public static void EnterDonPhase(GameState state)
     {
         state.Phase = Phase.Don;
         bool firstTurnFirstPlayer = state.TurnCount == 1 && state.CurrentTurnPlayer == state.FirstPlayer;
         int add = firstTurnFirstPlayer ? 1 : 2;
-        AddDonFromDeck(state, state.CurrentTurnPlayer, add);
-
-        // OP13-003 高路·D·罗杰：我方场上存在咚时，将1张将要放置的咚改赋予我方领袖
         var tp = state.Players[state.CurrentTurnPlayer];
-        if (tp.Leader.Info.Number == "OP13-003")
+        int donBefore = tp.TotalDonInCostArea;
+        int added = AddDonFromDeck(state, state.CurrentTurnPlayer, add);
+
+        // OP13-003 高路·D·罗杰：进入咚阶段前场上已存在咚，且本次确实会放置咚时，
+        // 才把其中 1 张改为赋予领袖。0 咚的首回合与已经 10 咚时都不会发动。
+        if (tp.Leader.Info.Number == "OP13-003"
+            && !tp.Leader.IsEffectsNullified
+            && !state.IsContinuouslyNullified(tp.Leader)
+            && donBefore > 0
+            && donBefore < state.MaxDonInCostAreaFor(state.CurrentTurnPlayer)
+            && added > 0)
         {
             var don = tp.CostArea.FirstOrDefault(d => d.State == DonState.Active);
             if (don is not null) { don.State = DonState.Attached; don.AttachedToCardId = tp.Leader.Id; }
@@ -101,6 +148,7 @@ public static class TurnEngine
             ClearUntilNextOpponentEndPhase(p.Leader, state.CurrentTurnPlayer);
             // 手牌卡的本回合费用修正（如 OP16-087 给"光月桃之助"+20）也需回合末清，否则会跨回合残留
             foreach (var c in p.Hand) c.CostModThisTurn = 0;
+            // 规则层的【每回合1次】在每个回合结束后恢复；界面标识的恢复时点独立为控制者自己回合开始。
             p.TurnOnceUsed.Clear();
             p.HandDiscardedByEffectThisTurn = false;
             p.HasActivatedBaseCost3PlusEventThisTurn = false;
@@ -118,10 +166,12 @@ public static class TurnEngine
             }
             else if (task.Kind == "RefreshOwnDon")
             {
-                // EB02-015：回合结束时将我方最多 1 张休息咚转为活跃状态
+                // 回合结束时将指定数量的我方休息咚转为活跃状态（默认1张；OP14-031为5张）
                 var owner = state.Players[task.Owner];
-                var don = owner.CostArea.FirstOrDefault(d => d.State == DonState.Rest && d.AttachedToCardId is null);
-                if (don is not null) don.State = DonState.Active;
+                foreach (var don in owner.CostArea
+                             .Where(d => d.State == DonState.Rest && d.AttachedToCardId is null)
+                             .Take(task.Count))
+                    don.State = DonState.Active;
             }
             else if (task.Kind == "ReturnSelfToHand")
             {
@@ -144,18 +194,156 @@ public static class TurnEngine
                 foreach (var card in state.Players[task.Owner].Characters.Where(c => c.Info.HasKeyword("FILM")))
                     card.IsTapped = false;
             }
+            else if (task.Kind == "ReturnCharacterToDeckBottom")
+            {
+                var owner = state.Players[task.Owner];
+                var card = owner.Characters.FirstOrDefault(c => c.Id.ToString() == task.SourceCardId);
+                if (card is not null)
+                    AtomicOps.ReturnFieldToDeckBottom(state, task.Owner, card);
+            }
         }
         state.EndOfTurnTasks.Clear();
         // 清除回合级玩家状态
         state.NoPlayCharacterThisTurn.Clear();
+        state.NoPlayCharacterOriginalCostGteThisTurn.Clear();
         state.NoEffectLifeToHandThisTurn.Clear();
         state.NoActivateDonByCharacterEffectThisTurn.Clear();
         state.LifeLeftThisTurn.Clear();
         state.OneShotPlayDiscounts.Clear();   // OP02-025：一次性减费仅"本回合下次"
         state.AttackTaxDiscard[state.CurrentTurnPlayer] = 0; // 本回合方被课的攻击税到期
 
-        // 清除来源已不在场上的 ContinuousEffect（防止僵尸效果）
-        state.ContinuousEffects.RemoveAll(eff => !IsSourceCardOnField(state, eff.SourceCardId));
+        // 清除到期或来源已不在场上的 ContinuousEffect（防止僵尸效果）。
+        state.ContinuousEffects.RemoveAll(eff =>
+            eff.ExpiresAtEndOfTurnForSide == state.CurrentTurnPlayer
+            || (eff.ExpiresAfterTurnCount is int expiresAfter && state.TurnCount > expiresAfter)
+            || (!eff.PersistsAfterSourceLeaves && !IsSourceCardOnField(state, eff.SourceCardId)));
+    }
+
+    /// <summary>
+    /// 在同步结束阶段清理前，先处理需要玩家确认的延迟离场任务。
+    /// 这类任务不能直接调用同步移动方法，否则“将要离场时”的置换效果没有机会弹出并支付成本。
+    /// </summary>
+    public static async Task ResolvePromptedEndPhaseTasksAsync(GameState state, IPromptService prompts)
+    {
+        var tasks = state.EndOfTurnTasks
+            .Where(task => task.Kind is "ReturnCharacterToDeckBottom"
+                or "PreventOpponentDonCharacterReset"
+                or "ReturnExcessDonToOpponentCount"
+                or "ChooseRefreshOwnDonUpTo"
+                or "DiscardOwnHandToLimit")
+            .ToList();
+        foreach (var task in tasks)
+        {
+            state.EndOfTurnTasks.Remove(task);
+
+            if (task.Kind == "DiscardOwnHandToLimit")
+            {
+                var player = state.Players[task.Owner];
+                var cards = player.Hand.ToList();
+                int discardCount = Math.Max(0, cards.Count - task.Count);
+                if (discardCount == 0) continue;
+                var chosen = await prompts.ChooseCards(task.Owner, "DiscardOwnChosen",
+                    $"路飞【本回合结束时】：丢弃{discardCount}张手牌，使手牌变为{task.Count}张",
+                    cards.Select(card => card.Id.ToString()).ToList(), discardCount, discardCount,
+                    new Dictionary<string, object?>
+                    {
+                        ["choiceCards"] = cards.Select(card => new { id = card.Id.ToString(), number = card.Info.Number }).ToList(),
+                    });
+                var selected = chosen.Distinct()
+                    .Select(id => player.Hand.FirstOrDefault(card => card.Id.ToString() == id))
+                    .OfType<CardInstance>().Take(discardCount).ToList();
+                // 强制弃牌不能被取消、重复ID或失效响应绕过；缺少的选择由当前手牌补足。
+                selected.AddRange(player.Hand.Where(card => !selected.Contains(card)).Take(discardCount - selected.Count));
+                foreach (var discardedCard in selected)
+                {
+                    AtomicOps.DiscardHand(player, discardedCard);
+                    EffectRuntime.NotifyHandDiscarded(state, task.Owner, discardedCard,
+                        player.Leader.Info.Number, task.Owner, isCost: false);
+                }
+                await EffectRuntime.DrainPendingEnterFields(state, prompts);
+                continue;
+            }
+
+            if (task.Kind == "ChooseRefreshOwnDonUpTo")
+            {
+                await AtomicOps.PromptChooseAndApplyDonCount(
+                    state,
+                    prompts,
+                    task.Owner,
+                    task.Count,
+                    $"奈美【回合结束时】：选择要转为活跃状态的休息咚!!张数（最多 {task.Count} 张）",
+                    don => don.State == DonState.Rest && don.AttachedToCardId is null,
+                    don => don.State = DonState.Active);
+                continue;
+            }
+
+            if (task.Kind == "ReturnExcessDonToOpponentCount")
+            {
+                var returnOwner = state.Players[task.Owner];
+                var source = returnOwner.Characters
+                    .Concat(returnOwner.Hand)
+                    .Concat(returnOwner.Trash)
+                    .Concat(returnOwner.Deck)
+                    .Concat(returnOwner.LifeArea)
+                    .Append(returnOwner.StageCard)
+                    .Append(returnOwner.ExtraStageCard)
+                    .FirstOrDefault(card => card?.Id.ToString() == task.SourceCardId);
+                if (source is null) continue;
+
+                await EffectRuntime.Resolve(
+                    state,
+                    task.Owner,
+                    source,
+                    EffectTrigger.OnMyTurnEnd,
+                    prompts,
+                    new Dictionary<string, object?>
+                {
+                    ["scheduled"] = true,
+                });
+                continue;
+            }
+
+            if (task.Kind == "PreventOpponentDonCharacterReset")
+            {
+                var opponent = state.Players[1 - task.Owner];
+                var lockable = opponent.Characters
+                    .Where(card => card.IsTapped && opponent.AttachedDonCount(card.Id) >= 3)
+                    .ToList();
+                if (lockable.Count == 0) continue;
+
+                var extra = new Dictionary<string, object?>
+                {
+                    ["choiceCards"] = lockable
+                        .Select(card => new { id = card.Id.ToString(), number = card.Info.Number })
+                        .ToList(),
+                };
+                var picked = await prompts.ChooseCards(
+                    task.Owner,
+                    "OpponentCharacter",
+                    "选择对方最多一张被赋予三张或更多咚且处于休息状态的角色，使其在下个重置阶段不转为活跃",
+                    lockable.Select(card => card.Id.ToString()).ToList(),
+                    0,
+                    1,
+                    extra);
+                if (picked.Count > 0)
+                {
+                    var locked = lockable.First(card => card.Id.ToString() == picked[0]);
+                    AtomicOps.PreventActivateNextReset(locked);
+                }
+                continue;
+            }
+
+            var owner = state.Players[task.Owner];
+            var card = owner.Characters.FirstOrDefault(c => c.Id.ToString() == task.SourceCardId);
+            if (card is null) continue;
+            await AtomicOps.ProcessEffectLeavesAsync(
+                state,
+                task.Owner,
+                new[] { card },
+                prompts,
+                "deckBottom",
+                AtomicOps.ReturnFieldToDeckBottom);
+        }
     }
 
     private static void ClearTurnScopedState(CardInstance c)
@@ -166,7 +354,8 @@ public static class TurnEngine
         c.OriginalPowerOverride = null;
         c.IsEffectsNullified = false;
         c.NoAttackCostLeThisTurn = 0;
-        c.ReactivateAfterBattleThisTurn = false;
+        c.BattledOpponentCharacterThisTurn = false;
+        c.GainedPropertiesThisTurn.Clear();
         // 注意：UntilNextOpponentEndPhase 不在此清除——它须保留到"对方"的结束阶段，
         // 否则会在施加者自己的结束阶段就失效（#146/#147）。改由 ClearUntilNextOpponentEndPhase 处理。
         c.GainedKeywords.RemoveAll(k =>
@@ -177,6 +366,11 @@ public static class TurnEngine
             r.Duration == KeywordDuration.ThisBattle);
         c.OncePerTurnUsedKeys.Clear();
     }
+
+    private static void ClearUntilNextOwnTurnStart(CardInstance card, GameState state)
+        => card.PowerModsUntilNextOwnTurnStart.RemoveAll(modifier =>
+            modifier.OwnerSide == state.CurrentTurnPlayer
+            && modifier.AppliedTurnCount < state.TurnCount);
 
     /// <summary>
     /// 清除"直到下个对方的结束阶段结束时为止"(UntilNextOpponentEndPhase) 的关键词 / 限制。
@@ -215,15 +409,37 @@ public static class TurnEngine
             if (m.EndPhasesSeen == 0) { m.EndPhasesSeen = 1; return false; }
             return true;
         });
+        c.CostModsUntilOppEnd.RemoveAll(m =>
+        {
+            bool expired;
+            if (m.AppliedBySide >= 0)
+            {
+                expired = currentTurnPlayer == 1 - m.AppliedBySide;
+            }
+            else if (m.EndPhasesSeen == 0)
+            {
+                m.EndPhasesSeen = 1;
+                expired = false;
+            }
+            else
+            {
+                expired = true;
+            }
+
+            if (expired) c.CostModPersistent -= m.Delta;
+            return expired;
+        });
     }
 
     private static bool IsSourceCardOnField(GameState s, string sourceId)
     {
-        if (!Guid.TryParse(sourceId, out var gid)) return false;
+        // 限时效果可在来源 GUID 后附加用途后缀，仍应按前 36 位定位来源卡。
+        if (sourceId.Length < 36 || !Guid.TryParse(sourceId[..36], out var gid)) return false;
         foreach (var p in s.Players)
         {
             if (p.Leader.Id == gid) return true;
             if (p.StageCard?.Id == gid) return true;
+            if (p.ExtraStageCard?.Id == gid) return true;
             foreach (var c in p.Characters) if (c.Id == gid) return true;
         }
         return false;
@@ -243,6 +459,12 @@ public static class TurnEngine
     public static void AdvanceTurnToReset(GameState state)
     {
         EnterEndPhase(state);
+        StartNextTurnAtReset(state);
+    }
+
+    /// <summary>当前结束阶段已完成清理后，原子切换回合方并执行新回合准备阶段。</summary>
+    public static void StartNextTurnAtReset(GameState state)
+    {
         // 切换回合玩家（"追加获得我方回合"时跳过切换，同一玩家再来一回合）
         if (state.ExtraTurnPending) state.ExtraTurnPending = false;
         else state.CurrentTurnPlayer = 1 - state.CurrentTurnPlayer;
@@ -258,32 +480,107 @@ public static class TurnEngine
         state.Phase = Phase.Main;
     }
 
+    public static async Task AdvanceTurnToMainAsync(GameState state, IPromptService prompts)
+    {
+        await EnterDrawPhaseAsync(state, prompts);
+        if (state.IsGameOver) return;
+        EnterDonPhase(state);
+        state.Phase = Phase.Main;
+    }
+
     /// <summary>从卡组抽 n 张</summary>
     public static int DrawCard(GameState state, int playerIdx, int n)
     {
         var p = state.Players[playerIdx];
-        int actual = 0;
-        for (int i = 0; i < n; i++)
+        int kept = 0;
+        while (kept < n)
         {
             if (p.Deck.Count == 0)
             {
-                // 卡组抽空 → 规则处理时点判负；OP03-040 奈美：登记了"卡组0张改判胜利"则反判此玩家胜利
-                if (!state.IsGameOver)
-                {
-                    bool deckOutWin = state.DeckOutVictoryPlayers.Contains(playerIdx);
-                    state.WinnerIndex = deckOutWin ? playerIdx : 1 - playerIdx;
-                    state.GameOverReason = deckOutWin
-                        ? $"{p.AccountName} 卡组耗尽（规则替换：胜利）"
-                        : $"{p.AccountName} 卡组耗尽";
-                }
+                state.EvaluateDeckOut();
                 break;
             }
             var top = p.Deck[0];
             p.Deck.RemoveAt(0);
-            p.Hand.Add(top);
-            actual++;
+            var runtime = state.HexState.Runtime[playerIdx];
+            bool useLegacyHexConversion = state.HexState.RulesRevision < Hex.HexRules.SevenHexReworkRulesRevision;
+            bool convertEvent = useLegacyHexConversion
+                && top.Info.Kind == CardKind.Event
+                && Hex.HexRules.Has(state, playerIdx, 38)
+                && !runtime.EventDrawConvertedThisTurn;
+            bool convertCharacter = useLegacyHexConversion
+                && top.Info.Kind == CardKind.Character
+                && Hex.HexRules.Has(state, playerIdx, 39)
+                && !runtime.CharacterDrawConvertedThisTurn;
+            if (convertEvent || convertCharacter)
+            {
+                if (convertEvent) runtime.EventDrawConvertedThisTurn = true;
+                if (convertCharacter) runtime.CharacterDrawConvertedThisTurn = true;
+                p.Trash.Add(top);
+            }
+            else
+            {
+                p.Hand.Add(top);
+                kept++;
+            }
+            // 正式对局已启用规则时，抽走最后一张后立即判定；测试布场在未启用规则前不会被误判。
+            state.EvaluateDeckOut();
+            if (state.IsGameOver) break;
         }
-        return actual;
+        return kept;
+    }
+
+    /// <summary>
+    /// 可交互的权威抽牌入口。每次卡组实际变为0张时先结算“无尽虚空”，
+    /// 再继续同一次多抽，避免把剩余抽牌丢到外层效果之后或提前宣告败北。
+    /// </summary>
+    public static async Task<int> DrawCardAsync(
+        GameState state,
+        int playerIdx,
+        int n,
+        IPromptService prompts)
+    {
+        var player = state.Players[playerIdx];
+        int kept = 0;
+        while (kept < n && !state.IsGameOver)
+        {
+            if (player.Deck.Count == 0
+                && !await Hex.HexRules.ResolveEmptyDeckAsync(state, playerIdx, prompts))
+            {
+                state.EvaluateDeckOut();
+                break;
+            }
+            if (state.IsGameOver || player.Deck.Count == 0) break;
+
+            var top = player.Deck[0];
+            player.Deck.RemoveAt(0);
+            var runtime = state.HexState.Runtime[playerIdx];
+            bool useLegacyHexConversion = state.HexState.RulesRevision < Hex.HexRules.SevenHexReworkRulesRevision;
+            bool convertEvent = useLegacyHexConversion
+                && top.Info.Kind == CardKind.Event
+                && Hex.HexRules.Has(state, playerIdx, 38)
+                && !runtime.EventDrawConvertedThisTurn;
+            bool convertCharacter = useLegacyHexConversion
+                && top.Info.Kind == CardKind.Character
+                && Hex.HexRules.Has(state, playerIdx, 39)
+                && !runtime.CharacterDrawConvertedThisTurn;
+            if (convertEvent || convertCharacter)
+            {
+                if (convertEvent) runtime.EventDrawConvertedThisTurn = true;
+                if (convertCharacter) runtime.CharacterDrawConvertedThisTurn = true;
+                player.Trash.Add(top);
+            }
+            else
+            {
+                player.Hand.Add(top);
+                kept++;
+            }
+
+            if (player.Deck.Count == 0)
+                await Hex.HexRules.ResolveEmptyDeckAsync(state, playerIdx, prompts);
+            state.EvaluateDeckOut();
+        }
+        return kept;
     }
 
     /// <summary>从咚卡组取 n 张到费用区（活跃状态）</summary>
@@ -291,7 +588,7 @@ public static class TurnEngine
     {
         var p = state.Players[playerIdx];
         int actual = 0;
-        int budget = MaxDonInCostArea - p.CostArea.Count;
+        int budget = state.MaxDonInCostAreaFor(playerIdx) - p.CostArea.Count;
         n = Math.Min(n, budget);
         for (int i = 0; i < n; i++)
         {

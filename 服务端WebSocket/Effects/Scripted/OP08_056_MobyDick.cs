@@ -54,7 +54,7 @@ public class OP08_056_MobyDick : IScriptedEffect
         me.TurnOnceUsed.Add(key);
 
         // 抽取 1 张卡牌
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
 
         // 之后：将我方 1 张手牌放回卡组最上方或最下方
         if (me.Hand.Count == 0) return;
@@ -81,7 +81,8 @@ public class OP08_056_MobyDick : IScriptedEffect
         foreach (var c in p.LifeArea) if (c.Id.ToString() == id) return c;
         // 离场卡可能被同一效果链后续操作再次登场回场上，须搜场上角色区/舞台
         foreach (var c in p.Characters) if (c.Id.ToString() == id) return c;
-        if (p.StageCard is not null && p.StageCard.Id.ToString() == id) return p.StageCard;
+        var stage = p.StageCards.FirstOrDefault(card => card.Id.ToString() == id);
+        if (stage is not null) return stage;
         return null;
     }
 }

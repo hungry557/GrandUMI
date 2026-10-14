@@ -1,11 +1,11 @@
 {
   "OP01-003": {
     "_name": "蒙奇·D·路飞",
-    "_matcher": "启动主要每回合1次,咚-4,将1张费用≤5且含超新星/草帽一伙的角色转活跃并本回合+1000",
+    "_matcher": "启动主要每回合1次，休息4咚，将最多1张当前费用≤5且含超新星/草帽一伙的角色转活跃并本回合+1000",
     "_src": "wf-dsl",
     "activated": {
       "cost": {
-        "donReturn": 4
+        "restActiveDon": 4
       },
       "oncePerTurn": true,
       "then": [
@@ -23,7 +23,7 @@
                 "keyword": "草帽一伙"
               }
             ],
-            "originalCostLte": 5
+            "currentCostLte": 5
           },
           "text": "选择1张费用≤5且拥有《超新星》或《草帽一伙》的角色"
         },
@@ -77,7 +77,7 @@
             "max": 1,
             "as": "$tgt",
             "filter": {
-              "originalPowerLte": 4000
+              "currentPowerLte": 4000
             },
             "text": "选择对方最多1张力量≤4000的角色"
           },
@@ -209,7 +209,7 @@
             "max": 1,
             "as": "$tgt",
             "filter": {
-              "originalPowerLte": 3000
+              "currentPowerLte": 3000
             }
           },
           {
@@ -322,7 +322,7 @@
         "min": 0,
         "as": "$ko",
         "filter": {
-          "originalPowerLte": 4000
+          "currentPowerLte": 4000
         }
       },
       {
@@ -498,7 +498,8 @@
         "then": [
           {
             "op": "ActiveOwnDon",
-            "n": 1
+            "n": 1,
+            "chooseCount": true
           }
         ]
       }
@@ -577,6 +578,7 @@
       {
         "on": "OnBlockDeclare",
         "if": {
+          "donAttachedGte": 1,
           "ownCharCountGte": 3
         },
         "then": [
@@ -705,7 +707,8 @@
         "then": [
           {
             "op": "ActiveOwnDon",
-            "n": 2
+            "n": 2,
+            "chooseCount": true
           }
         ]
       }
@@ -782,11 +785,12 @@
   },
   "OP01-052": {
     "_name": "雷藏",
-    "_matcher": "攻击时若我方休息角色≥2则抽1张（每回合1次语义由触发本身承载）。",
+    "_matcher": "攻击时若我方休息角色≥2则抽1张（每回合1次）。",
     "_src": "wf-dsl",
     "triggers": [
       {
         "on": "OnAttackDeclare",
+        "oncePerTurn": true,
         "if": {
           "ownRestedCharCountGte": 2
         },
@@ -831,7 +835,7 @@
     "_src": "wf-dsl",
     "main": {
       "cost": {
-        "restCards": {
+        "restCharacters": {
           "n": 2,
           "optional": true
         }

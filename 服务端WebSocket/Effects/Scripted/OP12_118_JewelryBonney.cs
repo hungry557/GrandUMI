@@ -28,14 +28,14 @@ public class OP12_118_JewelryBonney : IScriptedEffect
         // 休息领袖 + 休息角色 + 休息舞台 + 休息咚!! + 被赋予中的咚!!（附着咚按官方规则以横置状态置于卡下，计入休息卡）
         int restedLeader = me.Leader.IsTapped ? 1 : 0;
         int restedChars = me.Characters.Count(c => c.IsTapped);
-        int restedStage = (me.StageCard is not null && me.StageCard.IsTapped) ? 1 : 0;
+        int restedStage = me.StageCards.Count(stage => stage.IsTapped);
         int restedDon = me.CostArea.Count(d => d.State == DonState.Rest || d.State == DonState.Attached);
         int restedTotal = restedLeader + restedChars + restedStage + restedDon;
 
         if (restedTotal < 8) return;
 
         // 抽取 2 张卡牌
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 2);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 2);
 
         // 丢弃我方 1 张手牌（强制；手牌为空则跳过）
         if (me.Hand.Count > 0)

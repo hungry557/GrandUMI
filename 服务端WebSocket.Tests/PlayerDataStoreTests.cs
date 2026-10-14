@@ -1,11 +1,27 @@
 using GrandUMI.Persistence;
+using System.Text.Json;
 using Xunit;
 
 namespace GrandUMI.Tests;
 
 public sealed class PlayerDataStoreTests : IDisposable
 {
-    private readonly string _tempDir = Path.Combine(Path.GetTempPath(), "grandumi-player-data-tests", Guid.NewGuid().ToString("N"));
+    [Fact]
+    public void 公开昵称解析只匹配完整昵称且不创建未知账号()
+    {
+        var store = CreateStore();
+        store.Login("account-a");
+        store.UpdateProfile("account-a", "公开昵称", "");
+        var before = store.GetPlayerDirectoryEntries().Count;
+        var resolved = store.ResolvePublicPlayerAccounts(new[] { "公开昵称", "公开", "account-a", "' OR 1=1 --" });
+        Assert.Equal("account-a", Assert.Single(resolved).Value);
+        Assert.Equal(before, store.GetPlayerDirectoryEntries().Count);
+        Assert.Throws<PlayerDataValidationException>(() => store.ResolvePublicPlayerAccounts(Enumerable.Repeat("公开昵称", 41).ToArray()));
+    }
+    private readonly string _tempDir = Path.Combine(
+        Environment.GetEnvironmentVariable("GRANDUMI_TEST_TEMP_DIR") ?? Path.GetTempPath(),
+        "grandumi-player-data-tests",
+        Guid.NewGuid().ToString("N"));
     private readonly string _databasePath;
 
     public PlayerDataStoreTests()
@@ -32,6 +48,38 @@ public sealed class PlayerDataStoreTests : IDisposable
     }
 
     [Fact]
+    public void 管理员可搜索并改名且保留玩家自己的改名机会和审计记录()
+    {
+        var store = CreateStore();
+        store.Login("TargetAccount");
+        var auth = new AccountAuthenticationStore(store);
+        auth.Initialize();
+        auth.Authenticate("TargetAccount", "target-password", null);
+
+        var accountDirectory = new QqAccessStore(store);
+        accountDirectory.Initialize();
+        var result = Assert.Single(accountDirectory.SearchAccountsForAdmin("target", "player"));
+        Assert.Equal("TargetAccount", result.Account);
+        Assert.True(result.HasPassword);
+
+        var renamed = store.AdminRenamePlayer("释迦", "targetaccount", "新昵称");
+
+        Assert.Equal("新昵称", renamed.DisplayName);
+        Assert.True(renamed.CanChangeDisplayName);
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={_databasePath};Pooling=False");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT admin_account, target_account, action, detail_json FROM admin_player_audit;";
+        using var reader = command.ExecuteReader();
+        Assert.True(reader.Read());
+        Assert.Equal("释迦", reader.GetString(0));
+        Assert.Equal("TargetAccount", reader.GetString(1));
+        Assert.Equal("rename", reader.GetString(2));
+        using var detail = JsonDocument.Parse(reader.GetString(3));
+        Assert.Equal("新昵称", detail.RootElement.GetProperty("newDisplayName").GetString());
+    }
+
+    [Fact]
     public void DeckCrud_IsIsolatedByAccount_AndDeleteClearsSelection()
     {
         var store = CreateStore();
@@ -50,6 +98,62 @@ public sealed class PlayerDataStoreTests : IDisposable
         var deleted = store.DeleteDeck("玩家甲", "红色卡组");
         Assert.Empty(deleted.Decks);
         Assert.Null(deleted.SelectedDeckName);
+    }
+
+    [Fact]
+    public void 最强称号装备偏好会持久化且重复装备保持幂等()
+    {
+        var store = CreateStore();
+        var initial = store.Login("Alice");
+        Assert.Null(initial.EquippedChampionLeaderNumber);
+
+        var selected = store.UpdateEquippedChampionTitle("alice", " op16-001 ");
+        var repeated = store.UpdateEquippedChampionTitle("ALICE", "OP16-001");
+        var reloaded = CreateStore().Login("Alice");
+
+        Assert.Equal("OP16-001", selected.EquippedChampionLeaderNumber);
+        Assert.Equal("OP16-001", repeated.EquippedChampionLeaderNumber);
+        Assert.Equal("OP16-001", reloaded.EquippedChampionLeaderNumber);
+        Assert.Throws<PlayerDataValidationException>(() =>
+            store.UpdateEquippedChampionTitle("Alice", "../OP16-001"));
+    }
+
+    [Fact]
+    public void 旧版玩家库初始化时会无损补齐最强称号装备字段()
+    {
+        Directory.CreateDirectory(_tempDir);
+        using (var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={_databasePath};Pooling=False"))
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                CREATE TABLE players (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_key TEXT NOT NULL UNIQUE,
+                    account TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    display_name_change_used INTEGER NOT NULL DEFAULT 0,
+                    display_name_revision INTEGER NOT NULL DEFAULT 0,
+                    avatar TEXT NOT NULL DEFAULT '',
+                    card_back_id TEXT NOT NULL DEFAULT 'classic',
+                    selected_deck_name TEXT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    last_login_at INTEGER NOT NULL
+                );
+                INSERT INTO players(account_key, account, display_name, created_at, updated_at, last_login_at)
+                VALUES('ALICE', 'Alice', 'Alice', 1, 1, 1);
+                """;
+            command.ExecuteNonQuery();
+        }
+
+        var store = new PlayerDataStore(_databasePath);
+        store.Initialize();
+        var migrated = store.Login("alice");
+
+        Assert.Equal("Alice", migrated.DisplayName);
+        Assert.Null(migrated.EquippedChampionLeaderNumber);
+        Assert.Equal("OP01-001", store.UpdateEquippedChampionTitle("Alice", "OP01-001").EquippedChampionLeaderNumber);
     }
 
     [Fact]
@@ -91,8 +195,47 @@ public sealed class PlayerDataStoreTests : IDisposable
         var reloaded = store.Login("ALICE");
 
         Assert.Equal("航海士", updated.DisplayName);
+        Assert.False(updated.CanChangeDisplayName);
         Assert.Equal("航海士", reloaded.DisplayName);
         Assert.Equal("/sprites-thumb/OP15/OP15-001.webp", reloaded.Avatar);
+    }
+
+    [Fact]
+    public void UpdateProfile_AllowsOneDisplayNameChange_WithoutBlockingAvatarUpdates()
+    {
+        var store = CreateStore();
+        var initial = store.Login("Alice");
+
+        Assert.True(initial.CanChangeDisplayName);
+
+        var avatarOnly = store.UpdateProfile("Alice", "Alice", "/sprites-thumb/OP15/OP15-001.webp");
+        Assert.True(avatarOnly.CanChangeDisplayName);
+
+        var renamed = store.UpdateProfile("Alice", "航海士", "/sprites-thumb/OP15/OP15-002.webp");
+        Assert.False(renamed.CanChangeDisplayName);
+
+        var updatedAvatar = store.UpdateProfile("Alice", "航海士", "/sprites-thumb/OP15/OP15-003.webp");
+        Assert.Equal("/sprites-thumb/OP15/OP15-003.webp", updatedAvatar.Avatar);
+        Assert.Throws<PlayerDataValidationException>(() =>
+            store.UpdateProfile("Alice", "第二个昵称", updatedAvatar.Avatar));
+    }
+
+    [Fact]
+    public void DisplayName_MustBeUnique_ForRenamesAndNewAccounts()
+    {
+        var store = CreateStore();
+        store.Login("Alice");
+        var bob = store.Login("Bob");
+        store.UpdateProfile("Alice", "Navigator", "");
+
+        var renameError = Assert.Throws<PlayerDataValidationException>(() =>
+            store.UpdateProfile("Bob", "navigator", ""));
+        Assert.Contains("昵称已被其他玩家使用", renameError.Message);
+        Assert.True(store.GetPlayerData("Bob").CanChangeDisplayName);
+
+        var accountError = Assert.Throws<PlayerDataValidationException>(() => store.Login("Navigator"));
+        Assert.Contains("昵称已被其他玩家使用", accountError.Message);
+        Assert.Equal("Bob", bob.DisplayName);
     }
 
     [Fact]
@@ -116,8 +259,14 @@ public sealed class PlayerDataStoreTests : IDisposable
         store.Login("Alice");
         store.Login("Bob");
 
-        store.UploadCardBack("Alice", "海上日出", "image/png", TinyPngBase64());
-        store.UploadCardBack("Bob", "月下航路", "image/png", TinyPngBase64());
+        var alicePending = Assert.Single(store.UploadCardBack("Alice", "海上日出", "image/png", TinyPngBase64()));
+        var bobPending = Assert.Single(store.UploadCardBack("Bob", "月下航路", "image/png", TinyPngBase64()));
+        Assert.Equal(PlayerDataStore.CardBackReviewPending, alicePending.ReviewStatus);
+        var bobBeforeReview = store.GetCardBackGallery("Bob");
+        Assert.DoesNotContain(bobBeforeReview, item => item.ReviewStatus == PlayerDataStore.CardBackReviewApproved);
+        Assert.Single(bobBeforeReview, item => item.Id == bobPending.Id && item.Owned);
+        store.ReviewCardBack("释迦", alicePending.Id, approved: true, rejectionReason: null);
+        store.ReviewCardBack("释迦", bobPending.Id, approved: true, rejectionReason: null);
         var before = store.GetCardBackGallery("Alice");
         var aliceBack = Assert.Single(before, item => item.Name == "海上日出");
         var bobBack = Assert.Single(before, item => item.Name == "月下航路");
@@ -126,11 +275,15 @@ public sealed class PlayerDataStoreTests : IDisposable
 
         var selected = store.UpdateCardBack("Alice", bobBack.Id);
         Assert.Equal(bobBack.Id, selected.Snapshot.CardBackId);
-        var selectedItem = Assert.Single(selected.Gallery, item => item.Id == bobBack.Id);
+        var selectedItem = Assert.IsType<CardBackGalleryItem>(selected.GalleryItem);
+        Assert.Equal(bobBack.Id, selectedItem.Id);
         Assert.True(selectedItem.Liked);
         Assert.Equal(1, selectedItem.Likes);
 
-        store.ToggleCardBackLike("Bob", bobBack.Id);
+        var likedByBob = store.ToggleCardBackLike("Bob", bobBack.Id);
+        Assert.Equal(bobBack.Id, likedByBob.Id);
+        Assert.True(likedByBob.Liked);
+        Assert.Equal(2, likedByBob.Likes);
         var ranked = store.GetCardBackGallery("Alice");
         Assert.Equal(bobBack.Id, ranked[0].Id);
         Assert.Equal(2, ranked[0].Likes);
@@ -163,7 +316,8 @@ public sealed class PlayerDataStoreTests : IDisposable
         var store = CreateStore();
         store.Login("Alice");
         store.Login("Bob");
-        store.UploadCardBack("Alice", "待删除卡背", "image/png", TinyPngBase64());
+        var pending = Assert.Single(store.UploadCardBack("Alice", "待删除卡背", "image/png", TinyPngBase64()));
+        store.ReviewCardBack("释迦", pending.Id, approved: true, rejectionReason: null);
         var cardBack = Assert.Single(store.GetCardBackGallery("Alice"));
         store.UpdateCardBack("Alice", cardBack.Id);
         store.UpdateCardBack("Bob", cardBack.Id);
@@ -177,6 +331,137 @@ public sealed class PlayerDataStoreTests : IDisposable
         Assert.Equal(PlayerDataStore.DefaultCardBackId, store.GetPlayerData("Bob").CardBackId);
         Assert.Null(store.GetCardBackImage(long.Parse(cardBack.Id["custom-".Length..])));
         Assert.Throws<PlayerDataValidationException>(() => store.DeleteCardBack("Alice", cardBack.Id));
+    }
+
+    [Fact]
+    public void CardBackGallery_管理员可删除他人已发布卡背但不可删除未发布投稿()
+    {
+        var store = CreateStore();
+        store.Login("释迦");
+        store.Login("Alice");
+        store.Login("Bob");
+        var pendingItems = store.UploadCardBack("Alice", "待审核卡背", "image/png", TinyPngBase64());
+        var pending = Assert.Single(pendingItems);
+
+        Assert.Throws<PlayerDataValidationException>(() =>
+            store.DeleteCardBack("释迦", pending.Id, canManagePublishedCardBacks: true));
+
+        store.ReviewCardBack("释迦", pending.Id, approved: true, rejectionReason: null);
+        store.UpdateCardBack("Bob", pending.Id);
+        var deleted = store.DeleteCardBack("释迦", pending.Id, canManagePublishedCardBacks: true);
+
+        Assert.Equal(pending.Id, deleted.DeletedCardBackId);
+        Assert.Empty(store.GetCardBackGallery("Alice"));
+        Assert.Equal(PlayerDataStore.DefaultCardBackId, store.GetPlayerData("Bob").CardBackId);
+    }
+
+    [Fact]
+    public void CardBackReview_待审核不可公开选用且未通过理由仅向投稿者展示()
+    {
+        var store = CreateStore();
+        store.Login("Alice");
+        store.Login("Bob");
+
+        var pending = Assert.Single(store.UploadCardBack("Alice", "人物照片", "image/png", TinyPngBase64()));
+        Assert.Equal(PlayerDataStore.CardBackReviewPending, pending.ReviewStatus);
+        Assert.Empty(store.GetCardBackGallery("Bob"));
+        Assert.Single(store.GetPendingCardBackReviews());
+        Assert.Throws<PlayerDataValidationException>(() => store.UpdateCardBack("Alice", pending.Id));
+        Assert.Throws<PlayerDataValidationException>(() => store.ToggleCardBackLike("Bob", pending.Id));
+
+        store.ReviewCardBack("栗子", pending.Id, approved: false, rejectionReason: null);
+
+        Assert.Empty(store.GetPendingCardBackReviews());
+        Assert.Empty(store.GetCardBackGallery("Bob"));
+        var rejected = Assert.Single(store.GetCardBackGallery("Alice"));
+        Assert.Equal(PlayerDataStore.CardBackReviewRejected, rejected.ReviewStatus);
+        Assert.Equal(PlayerDataStore.DefaultCardBackRejectionReason, rejected.ReviewReason);
+        Assert.Throws<PlayerDataValidationException>(() =>
+            store.ReviewCardBack("释迦", pending.Id, approved: true, rejectionReason: null));
+    }
+
+    [Fact]
+    public void CardBackGallery_双向游标分页均可按欢迎度读取全部公开卡背并单独返回本人投稿()
+    {
+        var store = CreateStore();
+        store.Login("Viewer");
+        var publishedIds = new List<string>();
+        for (var ownerIndex = 0; ownerIndex < 16; ownerIndex++)
+        {
+            var account = $"Owner{ownerIndex:D2}";
+            store.Login(account);
+            for (var itemIndex = 0; itemIndex < 20; itemIndex++)
+            {
+                var name = $"Card{itemIndex:D2}";
+                var uploaded = store.UploadCardBack(
+                    account,
+                    name,
+                    "image/png",
+                    TinyPngBase64());
+                var pending = Assert.Single(uploaded, item =>
+                    item.Owned && item.Name == name && item.ReviewStatus == PlayerDataStore.CardBackReviewPending);
+                store.ReviewCardBack("释迦", pending.Id, approved: true, rejectionReason: null);
+                publishedIds.Add(pending.Id);
+            }
+        }
+
+        store.Login("LikerOne");
+        store.Login("LikerTwo");
+        for (var index = 0; index < publishedIds.Count; index += 37)
+            store.ToggleCardBackLike("LikerOne", publishedIds[index]);
+        for (var index = 0; index < publishedIds.Count; index += 83)
+            store.ToggleCardBackLike("LikerTwo", publishedIds[index]);
+
+        List<CardBackGalleryItem> ReadAll(string sortOrder)
+        {
+            var allItems = new List<CardBackGalleryItem>();
+            string? cursor = null;
+            do
+            {
+                var page = store.GetCardBackGalleryPage("Viewer", cursor, pageSize: 50, sortOrder: sortOrder);
+                Assert.Equal(sortOrder, page.SortOrder);
+                Assert.Equal(320, page.Total);
+                Assert.InRange(page.Items.Count, 1, 50);
+                allItems.AddRange(page.Items);
+                cursor = page.NextCursor;
+                if (!page.HasMore) Assert.Null(cursor);
+            } while (cursor is not null);
+            return allItems;
+        }
+
+        var descendingItems = ReadAll(PlayerDataStore.CardBackGallerySortDescending);
+        var ascendingItems = ReadAll(PlayerDataStore.CardBackGallerySortAscending);
+
+        Assert.Equal(320, descendingItems.Count);
+        Assert.Equal(320, descendingItems.Select(item => item.Id).Distinct().Count());
+        Assert.Equal(320, ascendingItems.Count);
+        Assert.Equal(320, ascendingItems.Select(item => item.Id).Distinct().Count());
+        Assert.Equal(
+            descendingItems.Select(item => item.Id).OrderBy(id => id),
+            ascendingItems.Select(item => item.Id).OrderBy(id => id));
+        AssertCardBackGalleryOrdered(descendingItems, PlayerDataStore.CardBackGallerySortDescending);
+        AssertCardBackGalleryOrdered(ascendingItems, PlayerDataStore.CardBackGallerySortAscending);
+        Assert.True(descendingItems[0].Likes > descendingItems[^1].Likes);
+        Assert.True(ascendingItems[0].Likes < ascendingItems[^1].Likes);
+
+        var defaultPage = store.GetCardBackGalleryPage("Viewer", pageSize: 50);
+        Assert.Equal(PlayerDataStore.CardBackGallerySortDescending, defaultPage.SortOrder);
+        Assert.Equal(descendingItems.Take(50).Select(item => item.Id), defaultPage.Items.Select(item => item.Id));
+        Assert.NotNull(defaultPage.NextCursor);
+        Assert.Throws<PlayerDataValidationException>(() => store.GetCardBackGalleryPage(
+            "Viewer",
+            defaultPage.NextCursor,
+            pageSize: 50,
+            sortOrder: PlayerDataStore.CardBackGallerySortAscending));
+
+        var ownerView = store.GetCardBackGalleryPage("Owner00");
+        Assert.Equal(PlayerDataStore.DefaultCardBackGalleryPageSize, ownerView.Items.Count);
+        Assert.Equal(20, ownerView.OwnedItems.Count);
+        Assert.All(ownerView.OwnedItems, item => Assert.True(item.Owned));
+        Assert.Throws<PlayerDataValidationException>(() =>
+            store.GetCardBackGalleryPage("Viewer", "不是有效游标"));
+        Assert.Throws<PlayerDataValidationException>(() =>
+            store.GetCardBackGalleryPage("Viewer", sortOrder: "likesSideways"));
     }
 
     [Fact]
@@ -340,6 +625,64 @@ public sealed class PlayerDataStoreTests : IDisposable
     }
 
     [Fact]
+    public void FriendMessageQueue_离线消息持久化并按发送顺序一次性取出()
+    {
+        var store = CreateStore();
+        store.Login("Alice");
+        store.Login("Bob");
+        store.UpdateProfile("Alice", "艾丽丝", "");
+        store.UpdateProfile("Bob", "鲍勃", "");
+        store.SendFriendRequest("Alice", "Bob");
+        store.SendFriendRequest("Bob", "Alice");
+
+        store.QueueFriendMessage("Alice", "bob", "message-2", "第二条", 2_000);
+        store.QueueFriendMessage("Alice", "BOB", "message-1", "第一条", 1_000);
+
+        var afterRestart = CreateStore();
+        var messages = afterRestart.TakeQueuedFriendMessages("Bob");
+        Assert.Collection(
+            messages,
+            first =>
+            {
+                Assert.Equal("message-1", first.Id);
+                Assert.Equal("第一条", first.Text);
+                Assert.Equal("Alice", first.FromAccount);
+                Assert.Equal("艾丽丝", first.FromName);
+                Assert.Equal("Bob", first.ToAccount);
+                Assert.Equal("鲍勃", first.ToName);
+            },
+            second => Assert.Equal("message-2", second.Id));
+        Assert.Empty(afterRestart.TakeQueuedFriendMessages("Bob"));
+    }
+
+    [Fact]
+    public void FriendMessageQueue_拒绝非好友并限制每位收件人的待收数量()
+    {
+        var store = CreateStore();
+        store.Login("Alice");
+        store.Login("Bob");
+        Assert.Throws<PlayerDataValidationException>(() =>
+            store.QueueFriendMessage("Alice", "Bob", "not-friend", "你好", 1));
+
+        store.SendFriendRequest("Alice", "Bob");
+        store.SendFriendRequest("Bob", "Alice");
+        for (var index = 0; index <= PlayerDataStore.MaxQueuedFriendMessagesPerPlayer; index++)
+        {
+            store.QueueFriendMessage(
+                "Alice",
+                "Bob",
+                $"message-{index}",
+                $"消息 {index}",
+                index + 1);
+        }
+
+        var messages = store.TakeQueuedFriendMessages("Bob");
+        Assert.Equal(PlayerDataStore.MaxQueuedFriendMessagesPerPlayer, messages.Count);
+        Assert.Equal("message-1", messages[0].Id);
+        Assert.Equal($"message-{PlayerDataStore.MaxQueuedFriendMessagesPerPlayer}", messages[^1].Id);
+    }
+
+    [Fact]
     public void SearchPlayers_返回账号昵称匹配及当前好友关系()
     {
         var store = CreateStore();
@@ -378,6 +721,31 @@ public sealed class PlayerDataStoreTests : IDisposable
             SpriteMap = new Dictionary<string, string>(),
             UpdatedAt = 1_700_000_000_000,
         };
+
+    private static void AssertCardBackGalleryOrdered(
+        IReadOnlyList<CardBackGalleryItem> items,
+        string sortOrder)
+    {
+        for (var index = 1; index < items.Count; index++)
+        {
+            var previous = items[index - 1];
+            var current = items[index];
+            if (previous.Likes != current.Likes)
+            {
+                if (sortOrder == PlayerDataStore.CardBackGallerySortDescending)
+                    Assert.True(previous.Likes > current.Likes);
+                else
+                    Assert.True(previous.Likes < current.Likes);
+                continue;
+            }
+
+            var previousId = long.Parse(previous.Id["custom-".Length..]);
+            var currentId = long.Parse(current.Id["custom-".Length..]);
+            Assert.True(
+                previous.CreatedAt > current.CreatedAt
+                || (previous.CreatedAt == current.CreatedAt && previousId > currentId));
+        }
+    }
 
     public void Dispose()
     {

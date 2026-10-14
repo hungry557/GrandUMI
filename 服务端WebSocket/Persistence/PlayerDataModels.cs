@@ -42,7 +42,9 @@ public sealed record PlayerDataSnapshot(
     string DisplayName,
     string Avatar,
     string CardBackId,
+    bool CanChangeDisplayName,
     string? SelectedDeckName,
+    string? EquippedChampionLeaderNumber,
     IReadOnlyList<StoredDeck> Decks);
 
 /// <summary>卡背广场中的玩家投稿（图片本体通过只读 HTTP 地址按需获取）。</summary>
@@ -54,13 +56,34 @@ public sealed record CardBackGalleryItem(
     int Likes,
     bool Liked,
     bool Owned,
+    bool PubliclyListed,
+    long CreatedAt,
+    string ReviewStatus,
+    string ReviewReason);
+
+/// <summary>卡背广场游标分页；本人投稿单独返回，避免与热门列表分页互相干扰。</summary>
+public sealed record CardBackGalleryPage(
+    IReadOnlyList<CardBackGalleryItem> Items,
+    IReadOnlyList<CardBackGalleryItem> OwnedItems,
+    int PageSize,
+    int Total,
+    bool HasMore,
+    string? NextCursor,
+    string SortOrder);
+
+/// <summary>管理员卡背审核队列中的待处理投稿。</summary>
+public sealed record CardBackReviewItem(
+    string Id,
+    string Name,
+    string AuthorName,
+    string ImageUrl,
     long CreatedAt);
 
 public sealed record CardBackImage(string MimeType, byte[] Data);
 
 public sealed record CardBackSelectionResult(
     PlayerDataSnapshot Snapshot,
-    IReadOnlyList<CardBackGalleryItem> Gallery);
+    CardBackGalleryItem? GalleryItem);
 
 public sealed record CardBackDeletionResult(
     string DeletedCardBackId,
@@ -128,10 +151,32 @@ public sealed record FriendSearchPlayer(
     string Avatar,
     string Relationship);
 
+public sealed record AdminPlayerSummary(
+    string Account,
+    string DisplayName,
+    long CreatedAt,
+    long LastLoginAt,
+    bool HasPassword);
+
 /// <summary>好友关系写操作结果。</summary>
 public sealed record FriendMutationResult(
     FriendDataSnapshot Snapshot,
     string OtherAccount,
     bool AutoAccepted = false);
+
+/// <summary>等待投递或刚刚投递的好友消息。</summary>
+public sealed record QueuedFriendMessage(
+    string Id,
+    string Text,
+    string FromAccount,
+    string FromName,
+    string ToAccount,
+    string ToName,
+    long SentAt);
+
+public sealed record BlockedPlayerSnapshot(
+    string Account,
+    string DisplayName,
+    long BlockedAt);
 
 public sealed class PlayerDataValidationException(string message) : Exception(message);

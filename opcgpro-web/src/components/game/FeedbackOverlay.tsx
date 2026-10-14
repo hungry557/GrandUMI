@@ -3,22 +3,28 @@
 /**
  * FeedbackOverlay — 大厅与游戏内共用的反馈窗口
  *
- * 按 F 弹出/关闭。大厅只附带基础环境信息，游戏内额外附带
- * gameStore 镜像，发送给服务端落盘。
+ * 按 F 弹出/关闭。只附带白名单化的客户端网络与视口诊断；
+ * 对局规则状态由服务端在房间串行队列中权威采集。
  */
 
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
+import GameOverlayPortal from "@/components/ui/GameOverlayPortal";
 import { NetManager } from "@/net/NetManager";
 import { eventBus } from "@/net/eventBus";
-import { useGameStore } from "@/store/gameStore";
 import { useNetStore } from "@/store/netStore";
+import { buildClientFeedbackEvidence } from "@/lib/feedbackEvidence";
+import { installFeedbackShortcut } from "@/lib/feedbackShortcut.mjs";
 import type { FeedbackCategory, MsgBase, MsgBugReport } from "@/types/net";
 
 interface Props {
   context: "lobby" | "game";
   /** 外部入口每次递增该值即可打开反馈窗口；F 键仍可独立切换。 */
   openRequest?: number;
+  /** 对局页可将入口统一收进“更多”；大厅保持默认入口行为。 */
+  showTrigger?: boolean;
+  /** 从云回放进入时，由服务端再次校验参与者身份后关联反馈。 */
+  replayId?: string | null;
 }
 
 type SubmitState =
@@ -34,7 +40,7 @@ const CATEGORY_CONFIG: Record<
   bug: {
     tab: "提交 Bug",
     label: "问题描述",
-    placeholder: "描述触发 Bug 的操作、实际现象和期望结果……提交时会自动附带当前对局信息。",
+    placeholder: "描述触发 Bug 的操作、实际现象和期望结果；提及卡牌时请勿使用俗称，必须使用卡牌编号（如 OP01-006）……提交时会自动附带当前对局信息。",
   },
   suggestion: {
     tab: "优化建议",
@@ -43,7 +49,7 @@ const CATEGORY_CONFIG: Record<
   },
 };
 
-export default function FeedbackOverlay({ context, openRequest }: Props) {
+export default function FeedbackOverlay({ context, openRequest, showTrigger = true, replayId }: Props) {
   const [open, setOpen] = useState(false);
   const [category, setCategory] = useState<FeedbackCategory>("bug");
   const [drafts, setDrafts] = useState<Record<FeedbackCategory, string>>({
@@ -56,42 +62,17 @@ export default function FeedbackOverlay({ context, openRequest }: Props) {
   const lastOpenRequestRef = useRef(openRequest);
   const description = drafts[category];
   const config = CATEGORY_CONFIG[category];
+  const title = context === "lobby" ? "问题反馈" : "游戏反馈（F）";
   const placeholder =
     category === "bug" && context === "lobby"
-      ? "描述大厅中触发 Bug 的操作、实际现象和期望结果……提交时会自动附带当前页面信息。"
+      ? "描述大厅中触发 Bug 的操作、实际现象和期望结果；提及卡牌时请勿使用俗称，必须使用卡牌编号（如 OP01-006）……提交时会自动附带当前页面信息。"
       : config.placeholder;
 
-  // F 切换显隐；在输入区域打字时不抢占按键。
-  useEffect(() => {
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") {
-        setOpen(false);
-        return;
-      }
-
-      const target = e.target as HTMLElement | null;
-      const isEditing =
-        target?.tagName === "INPUT" ||
-        target?.tagName === "TEXTAREA" ||
-        target?.isContentEditable;
-      if (
-        e.code !== "KeyF" ||
-        e.repeat ||
-        e.ctrlKey ||
-        e.altKey ||
-        e.metaKey ||
-        isEditing
-      ) {
-        return;
-      }
-
-      e.preventDefault();
-      setOpen((visible) => !visible);
-    }
-
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  // 捕获阶段接管 F，避免牌桌控件截断冒泡；输入区域内打字仍不触发。
+  useEffect(() => installFeedbackShortcut(window, {
+    onToggle: () => setOpen((visible) => !visible),
+    onClose: () => setOpen(false),
+  }), []);
 
   // 左侧栏等外部入口仅负责请求打开；首次挂载不自动弹窗。
   useEffect(() => {
@@ -136,31 +117,11 @@ export default function FeedbackOverlay({ context, openRequest }: Props) {
     if (!trimmedDescription || submit.kind === "sending") return;
 
     const netState = useNetStore.getState();
-    const gameState = context === "game" ? useGameStore.getState() : null;
-    const clientInfo = JSON.stringify({
-      meta: {
-        ts: new Date().toISOString(),
-        url: typeof window !== "undefined" ? window.location.href : "",
-        userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
-        context,
-        account: netState.account,
-        playerName: netState.playerName,
-        connectionState: netState.connState,
-        networkDiagnostics: NetManager.getDiagnostics(),
-        ...(gameState
-          ? {
-              mode: gameState.mode,
-              phase: gameState.phase,
-              turnCount: gameState.turnCount,
-              currentTurn: gameState.currentTurn,
-              myName: gameState.myName,
-              opponentName: gameState.opponentName,
-            }
-          : {}),
-      },
-      // 大厅不附带上一局可能残留的对局数据。
-      ...(gameState ? { gameStore: gameState } : {}),
-    });
+    const clientEvidence = buildClientFeedbackEvidence(
+      context,
+      netState.connState,
+      NetManager.getDiagnostics(),
+    );
 
     setSubmit({ kind: "sending" });
     pendingCategoryRef.current = category;
@@ -168,7 +129,11 @@ export default function FeedbackOverlay({ context, openRequest }: Props) {
       proto: "MsgBugReport",
       category,
       description: trimmedDescription,
-      clientInfo,
+      clientEvidence,
+      requestId: typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `feedback-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+      ...(replayId ? { replayId } : {}),
     } as MsgBugReport);
 
     if (!sent) {
@@ -185,17 +150,38 @@ export default function FeedbackOverlay({ context, openRequest }: Props) {
   }
 
   return (
-    <AnimatePresence>
-      {open && (
-        <motion.div
-          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          onClick={() => setOpen(false)}
-        >
-          <motion.div
-            className={`w-full max-w-md rounded-lg border bg-slate-950/95 p-5 shadow-2xl shadow-black/60 ${
+    <>
+      {context === "game" && showTrigger && !open && (
+        <GameOverlayPortal>
+          <button
+            type="button"
+            onClick={() => setOpen(true)}
+            className="pointer-events-auto fixed z-[90] flex h-12 min-w-12 items-center justify-center rounded-lg border border-amber-300/50 bg-slate-950/95 px-3 text-xs font-black text-amber-100 shadow-xl shadow-black/50 md:hidden"
+            style={{
+              right: "calc(6.75rem + var(--layout-safe-right, env(safe-area-inset-right)))",
+              bottom: "calc(0.75rem + var(--layout-safe-bottom, env(safe-area-inset-bottom)))",
+            }}
+            aria-label="打开 Bug 和建议反馈（快捷键 F）"
+          >
+            F · 反馈
+          </button>
+        </GameOverlayPortal>
+      )}
+      <GameOverlayPortal>
+        <AnimatePresence>
+          {open && (
+            <motion.div
+              className="pointer-events-auto fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-black/50 px-[calc(1rem+var(--layout-safe-left,env(safe-area-inset-left)))] py-[calc(1rem+var(--layout-safe-top,env(safe-area-inset-top)))] [padding-bottom:calc(1rem+var(--layout-safe-bottom,env(safe-area-inset-bottom)))] [padding-right:calc(1rem+var(--layout-safe-right,env(safe-area-inset-right)))]"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setOpen(false)}
+            >
+              <motion.div
+            role="dialog"
+            aria-modal="true"
+            aria-label={title}
+            className={`max-h-full w-full max-w-md overflow-y-auto rounded-lg border bg-slate-950/95 p-4 shadow-2xl shadow-black/60 sm:p-5 ${
               category === "bug" ? "border-rose-400/40" : "border-sky-400/40"
             }`}
             initial={{ scale: 0.92, y: 16 }}
@@ -204,11 +190,12 @@ export default function FeedbackOverlay({ context, openRequest }: Props) {
             onClick={(event) => event.stopPropagation()}
           >
             <div className="mb-3 flex items-center justify-between">
-              <h2 className="text-sm font-black text-white">游戏反馈（F）</h2>
+              <h2 className="text-sm font-black text-white">{title}</h2>
               <button
                 type="button"
                 onClick={() => setOpen(false)}
-                className="rounded px-2 py-0.5 text-xs text-slate-400 transition-colors hover:text-white"
+                aria-label="关闭弹窗"
+                className="flex min-h-[52px] min-w-[52px] items-center justify-center rounded px-2 text-xs text-slate-400 transition-colors hover:bg-slate-800 hover:text-white"
               >
                 关闭
               </button>
@@ -225,7 +212,7 @@ export default function FeedbackOverlay({ context, openRequest }: Props) {
                     aria-selected={selected}
                     disabled={submit.kind === "sending"}
                     onClick={() => selectCategory(item)}
-                    className={`rounded px-3 py-1.5 text-xs font-bold transition-colors disabled:cursor-wait ${
+                    className={`min-h-[52px] rounded px-3 py-1.5 text-xs font-bold transition-colors disabled:cursor-wait ${
                       selected
                         ? item === "bug"
                           ? "bg-rose-500 text-white"
@@ -274,7 +261,7 @@ export default function FeedbackOverlay({ context, openRequest }: Props) {
                 type="button"
                 onClick={handleSubmit}
                 disabled={!description.trim() || submit.kind === "sending"}
-                className={`shrink-0 rounded px-4 py-1.5 text-sm font-bold text-white transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                className={`min-h-[52px] shrink-0 rounded px-4 py-1.5 text-sm font-bold text-white transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                   category === "bug"
                     ? "bg-rose-500 hover:bg-rose-400"
                     : "bg-sky-500 hover:bg-sky-400"
@@ -283,9 +270,11 @@ export default function FeedbackOverlay({ context, openRequest }: Props) {
                 发送
               </button>
             </div>
-          </motion.div>
-        </motion.div>
-      )}
-    </AnimatePresence>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </GameOverlayPortal>
+    </>
   );
 }

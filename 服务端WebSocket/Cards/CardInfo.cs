@@ -6,6 +6,7 @@ namespace GrandUMI.Cards;
 /// </summary>
 public class CardInfo
 {
+    private static readonly char[] RuleColors = ['红', '绿', '蓝', '紫', '黑', '黄'];
     public required string Number    { get; init; }   // "OP15-001"
     public required string Name      { get; init; }
     public required string Color     { get; init; }   // "红" / "红/蓝" 等
@@ -21,6 +22,10 @@ public class CardInfo
     public string[] Abilities        { get; init; } = Array.Empty<string>();
     public string Trigger            { get; init; } = "";
     public string Rarity             { get; init; } = "";
+    /// <summary>官方环境角标；1 表示该印次通常不在当前标准环境，白名单重印卡除外。</summary>
+    public int Subscript             { get; init; }
+    /// <summary>是否允许进入新对局。Pending 卡仍可用于图鉴与组卡资料展示。</summary>
+    public CardPlayability Playability { get; init; } = CardPlayability.Playable;
 
     /// <summary>规则上"卡牌名称也视为"的其它名称（如 EB04-038 也视为"特拉法尔加·罗"/"堂吉诃德·罗西南德"）。
     /// 静态恒成立(手牌/卡组/场上全区)，故卡名匹配(NameContains/NameIs)同时匹配主名与这些别名。</summary>
@@ -35,8 +40,19 @@ public class CardInfo
     /// <summary>所属卡集，例如 "OP15" / "ST01"</summary>
     public string SetCode => Number.Split('-')[0];
 
-    /// <summary>颜色集合（多色卡按 / 拆分）</summary>
-    public string[] ColorList => Color.Split('/', StringSplitOptions.RemoveEmptyEntries);
+    /// <summary>颜色集合；兼容历史导入中的不同分隔符，只认可六种规则色并保持原顺序。</summary>
+    public string[] ColorList => ParseColors(Color);
+
+    internal static string[] ParseColors(string? color)
+    {
+        if (string.IsNullOrWhiteSpace(color)) return Array.Empty<string>();
+        var normalized = color.Normalize(System.Text.NormalizationForm.FormKC);
+        return normalized
+            .Where(c => RuleColors.Contains(c))
+            .Distinct()
+            .Select(c => c.ToString())
+            .ToArray();
+    }
 
     /// <summary>判断与另一张卡（通常是领航）是否有颜色交集</summary>
     public bool SharesColorWith(CardInfo other)
@@ -87,8 +103,8 @@ public class CardInfo
     {
         Number = Number, Name = Name, Color = Color, Kind = Kind, Property = Property,
         Power = Power, Cost = Cost, Keywords = Keywords, Counter = Counter,
-        EffectTags = EffectTags, Abilities = Abilities, Trigger = Trigger, Rarity = Rarity,
-        AlsoNames = AlsoNames,
+        EffectTags = EffectTags, Abilities = Abilities, Trigger = Trigger, Rarity = Rarity, Subscript = Subscript,
+        AlsoNames = AlsoNames, Playability = Playability,
         AllKeywordsWildcard = true,
         NameWildcard = true,
     };
@@ -101,4 +117,10 @@ public enum CardKind
     Event,
     Stage,
     Don,
+}
+
+public enum CardPlayability
+{
+    Playable,
+    Pending,
 }

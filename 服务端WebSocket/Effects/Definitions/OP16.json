@@ -60,7 +60,7 @@
             "max": 1,
             "as": "$tgt",
             "filter": {
-              "originalPowerLte": 4000
+              "currentPowerLte": 4000
             }
           },
           {
@@ -123,7 +123,7 @@
             "max": 1,
             "as": "$tgt",
             "filter": {
-              "originalPowerLte": 8000
+              "currentPowerLte": 8000
             }
           },
           {
@@ -201,6 +201,7 @@
             "max": 2,
             "min": 0,
             "as": "$tgt",
+            "valueBasis": "original",
             "filter": {
               "originalPowerLte": 2000
             }
@@ -505,10 +506,13 @@
   },
   "OP16-051": {
     "_name": "毛奇&卡巴奇",
-    "_matcher": "登场时抽 N",
+    "_matcher": "登场时我方手牌不多于5张的场合抽2",
     "triggers": [
       {
         "on": "OnEnterField",
+        "if": {
+          "selfHandCountLte": 5
+        },
         "then": [
           {
             "op": "Draw",
@@ -720,6 +724,10 @@
     "triggers": [
       {
         "on": "OnEnterField",
+        "cost": {
+          "donReturn": 1
+        },
+        "costPrompt": "萨卡斯基【登场时】：咚!!-1，使对方最多1张角色力量-6000？",
         "then": [
           {
             "op": "Choose",
@@ -941,7 +949,7 @@
         },
         "then": [
           {
-            "op": "ReturnDonToDeck",
+            "op": "OpponentReturnDonToDeck",
             "n": 1
           }
         ]
@@ -950,7 +958,7 @@
         "on": "OnKO",
         "then": [
           {
-            "op": "ReturnDonToDeck",
+            "op": "OpponentReturnDonToDeck",
             "n": 4
           }
         ]
@@ -1179,13 +1187,17 @@
   },
   "OP16-089": {
     "_name": "杰拉基尔·米霍克",
-    "_matcher": "登场时抽 N",
+    "_matcher": "登场时抽2张，之后丢弃2张手牌",
     "triggers": [
       {
         "on": "OnEnterField",
         "then": [
           {
             "op": "Draw",
+            "n": 2
+          },
+          {
+            "op": "DiscardOwnChosen",
             "n": 2
           }
         ]
@@ -1194,7 +1206,7 @@
   },
   "OP16-090": {
     "_name": "托尼托尼·乔巴",
-    "_matcher": "登场时抽 N",
+    "_matcher": "登场时抽2张、弃2张手牌，之后KO对方最多1张当前费用≤1的角色。",
     "triggers": [
       {
         "on": "OnEnterField",
@@ -1202,6 +1214,20 @@
           {
             "op": "Draw",
             "n": 2
+          },
+          {
+            "op": "DiscardOwnChosen",
+            "n": 2
+          },
+          {
+            "op": "Choose",
+            "prompt": "OpponentCharacterCostLe1",
+            "max": 1,
+            "as": "$ko"
+          },
+          {
+            "op": "KO",
+            "target": "$ko"
           }
         ]
       }
@@ -1310,7 +1336,7 @@
           {
             "op": "GiveKeyword",
             "target": "$tgt",
-            "keyword": "Unblockable",
+            "keyword": "不可阻挡",
             "duration": "ThisTurn"
           }
         ]
@@ -1473,7 +1499,8 @@
   },
   "OP16-102": {
     "_name": "阿瓦罗·匹萨罗",
-    "_matcher": "KO时抽 N",
+    "_matcher": "【KO时】抽1张，之后将手牌或废弃区中最多1张名为“哈奇诺斯”的卡牌登场；合并候选和来源区移动由专用脚本实现。",
+    "_src": "scripted",
     "triggers": [
       {
         "on": "OnKO",
@@ -1841,6 +1868,13 @@
       { "op": "TrashToHand", "target": "$card" }
     ],
     "main": {
+      "cost": {
+        "handDiscard": {
+          "n": 1,
+          "hasTrigger": true,
+          "text": "选择丢弃1张拥有【触发】的手牌作为成本（可放弃）"
+        }
+      },
       "then": [
         {
           "op": "Choose",

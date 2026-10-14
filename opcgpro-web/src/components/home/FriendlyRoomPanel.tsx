@@ -1,5 +1,7 @@
 "use client";
 
+import PlayerName from "@/components/ui/PlayerName";
+
 import { useEffect, useState } from "react";
 import { useNetStore } from "@/store/netStore";
 import { HomeRequest } from "@/net/HomeProtocol";
@@ -65,6 +67,18 @@ export default function FriendlyRoomPanel() {
       <h1 className="text-center text-xl font-bold text-white @[640px]:text-2xl">
         {room.origin === "roomCode" ? "房间码友谊战" : "友谊战房间"}
       </h1>
+
+      <div
+        data-friendly-room-gameplay={room.hexMode ? "hex" : "normal"}
+        className={`flex min-h-11 w-full max-w-md items-center justify-between gap-3 rounded-xl border px-4 py-2.5 ${
+          room.hexMode
+            ? "border-cyan-700/70 bg-cyan-950/30 text-cyan-200"
+            : "border-gray-700 bg-gray-900 text-gray-300"
+        }`}
+      >
+        <span className="text-sm font-black">{room.hexMode ? "海克斯模式" : "普通模式"}</span>
+        <span className="text-xs opacity-75">房主已锁定</span>
+      </div>
 
       {room.roomCode && (
         <div className="flex w-full max-w-md items-center justify-between gap-3 rounded-2xl border border-blue-800 bg-blue-950/30 px-4 py-3">
@@ -185,7 +199,7 @@ function PlayerCard({ title, name, deckName, ready, connected, mine, waiting }: 
       mine ? "border-orange-500/60 bg-orange-500/5" : "border-gray-700 bg-gray-900"
     }`}>
       <span className="text-sm text-gray-500">{title}</span>
-      <p className="text-white font-bold text-sm truncate w-full text-center">{waiting ? "等待加入…" : (name ?? "?")}</p>
+      <p className="text-white font-bold text-sm truncate w-full text-center">{waiting ? "等待加入…" : <PlayerName name={name ?? "?"} align="center" />}</p>
       <p className="text-gray-400 text-xs truncate w-full text-center">{waiting ? "房间码已开放" : (deckName ?? "未选卡组")}</p>
       <span className={`text-sm font-bold ${ready ? "text-green-400" : "text-gray-600"}`}>
         {waiting ? "等待中" : connected === false ? "重连中" : ready ? "已准备" : "未准备"}

@@ -48,9 +48,9 @@ public class OP09_060_KaraiBari : IScriptedEffect
         }
 
         // 成本：将此舞台转为休息状态
-        AtomicOps.RestCard(self);
+        if (!AtomicOps.RestCard(self)) return;
 
         // 收益：抽取 2 张卡牌
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 2);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 2);
     }
 }

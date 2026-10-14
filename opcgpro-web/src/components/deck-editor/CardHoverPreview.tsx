@@ -1,16 +1,21 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
 import NextImage from "next/image";
 import type { CardData } from "@/types/card";
 import { toDisplayColor, primaryDisplayColor, COLOR_STYLES } from "@/lib/colorMap";
 import { CARD_BACK_SRC, displaySrc, nextCardImageSrc, thumbSrc } from "@/lib/sprite";
-import { calculateCardHoverPlacement } from "@/lib/cardHoverPlacement";
+import {
+  calculateCardHoverPlacement,
+  DESKTOP_CARD_HOVER_PREVIEW_HEIGHT_APPROX,
+  DESKTOP_CARD_HOVER_PREVIEW_WIDTH,
+} from "@/lib/cardHoverPlacement";
 import { useLayoutQuarterTurn } from "@/components/ui/ResponsiveScope";
+import { useSlowImageFallback } from "@/hooks/useSlowImageFallback";
 
-export const PREVIEW_W = 240;
-const PREVIEW_H_APPROX = 480;
+export const PREVIEW_W = DESKTOP_CARD_HOVER_PREVIEW_WIDTH;
+const PREVIEW_H_APPROX = DESKTOP_CARD_HOVER_PREVIEW_HEIGHT_APPROX;
 
 export interface HoverInfo {
   card: CardData;
@@ -47,6 +52,8 @@ export default function CardHoverPreview({
   // 先显示 128px 小图，再由高质量 WebP 平滑覆盖；派生图缺失时才回退原图。
   const [imgSrc, setImgSrc] = useState(displaySrc(rawSprite));
   const [loadedImageSrc, setLoadedImageSrc] = useState<string | null>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
+  useSlowImageFallback(imageRef, imgSrc, setImgSrc);
 
   useEffect(() => {
     setImgSrc(displaySrc(rawSprite));
@@ -108,6 +115,7 @@ export default function CardHoverPreview({
         />
         <NextImage
           key={imgSrc}
+          ref={imageRef}
           src={imgSrc}
           alt={card.name}
           fill

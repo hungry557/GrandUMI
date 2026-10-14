@@ -15,12 +15,16 @@ namespace GrandUMI.Effects.Scripted;
 ///   - 启动主要：成本为横置自身领袖（RestCard）；对方1张角色 -2000；
 ///     再给我方1张「没有【攻击时】效果」(EffectTags 不含 OnAttackDeclare) 的角色本回合【速攻】。
 /// </summary>
-public class EB03_001_Vivi : IScriptedEffect
+public class EB03_001_Vivi : IScriptedEffect, IActivatedMainAvailability
 {
     public string CardNumber => "EB03-001";
 
     public bool HandlesTrigger(EffectTrigger t) =>
         t == EffectTrigger.OnAllyWillBeKOd || t == EffectTrigger.ActivatedMain;
+
+    public string? GetActivatedMainUnavailableReason(GameState state, int ownerIndex, CardInstance source)
+        => source.IsTapped || !AtomicOps.CanRestCard(state, source)
+            ? "薇薇领袖当前无法转为休息状态，不能支付发动成本" : null;
 
     public async Task Resolve(EffectContext ctx)
     {
@@ -51,11 +55,15 @@ public class EB03_001_Vivi : IScriptedEffect
             var pick = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OwnHand",
                 "丢弃1张手牌作为置换成本",
                 me.Hand.Select(c => c.Id.ToString()).ToList(), 1, 1);
-            if (pick.Count == 0) return;
-            var disc = me.Hand.First(c => c.Id.ToString() == pick[0]);
+            if (pick.Count != 1) return;
+            var disc = me.Hand.FirstOrDefault(c => c.Id.ToString() == pick[0]);
+            if (disc is null || !me.Hand.Contains(disc)) return;
             AtomicOps.DiscardHand(me, disc);
 
-            ctx.State.MarkPreventKO(victim.Id);
+            // 同一个 KO 过程选择了多张符合条件的角色时，规则 8-1-3-4-4 要求这次
+            // 置换和一次支付覆盖该过程中的全部符合目标；不能让逐张守护检查再次扣费。
+            ctx.State.MarkPreventEffectLeaveBatch(ctx.OwnerIndex, victim.Id,
+                card => card.Info.Cost >= 4, isKoReplacement: true);
             me.TurnOnceUsed.Add(key);
             return;
         }
@@ -63,7 +71,9 @@ public class EB03_001_Vivi : IScriptedEffect
         if (ctx.Trigger == EffectTrigger.ActivatedMain)
         {
             // 成本：横置此领袖
-            AtomicOps.RestCard(self);
+            if (ctx.State.CurrentTurnPlayer != ctx.OwnerIndex
+                || GetActivatedMainUnavailableReason(ctx.State, ctx.OwnerIndex, self) is not null
+                || !AtomicOps.RestCard(self)) return;
 
             // 对方最多1张角色力量-2000
             if (opp.Characters.Count > 0)

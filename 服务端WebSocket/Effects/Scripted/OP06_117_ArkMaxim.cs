@@ -29,32 +29,38 @@ public class OP06_117_ArkMaxim : IScriptedEffect
         var key = self.Info.Number + "-act" + ":" + self.Id;
         if (me.TurnOnceUsed.Contains(key)) return;
 
-        // 成本前提：此舞台需为活跃，且存在 1 张活跃的"艾尼路"角色
+        // 成本前提：此舞台需为活跃，且存在 1 张活跃的"艾尼路"领袖或角色
         if (self.IsTapped) return;
-        var enels = me.Characters.Where(c => !c.IsTapped && c.MatchesName("艾尼路")).ToList();
+        var enels = new[] { me.Leader }.Concat(me.Characters)
+            .Where(c => !c.IsTapped && c.MatchesName("艾尼路") && AtomicOps.CanRestCard(ctx.State, c))
+            .ToList();
         if (enels.Count == 0) return;
 
         bool use = await ctx.Prompts.ConfirmOptional(ctx.OwnerIndex,
-            "方舟箴言【启动主要】：将此舞台和我方 1 张活跃的“艾尼路”转为休息，KO 对方所有费用≤2 的角色？");
+            "方舟箴言【启动主要】：将此舞台和我方 1 张活跃的“艾尼路”领袖或角色转为休息，KO 对方所有费用≤2 的角色？");
         if (!use) return;
 
         // 成本：选择 1 张活跃"艾尼路"横置
         var enelPick = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OwnEnel",
-            "选择 1 张活跃的“艾尼路”转为休息状态（成本）",
+            "选择 1 张活跃的“艾尼路”领袖或角色转为休息状态（成本）",
             enels.Select(c => c.Id.ToString()).ToList(), 1, 1);
         if (enelPick.Count < 1) return; // 未支付成本
 
         var enel = enels.First(c => c.Id.ToString() == enelPick[0]);
-        AtomicOps.RestCard(enel);
-        AtomicOps.RestCard(self);
+        if (!AtomicOps.CanRestCard(ctx.State, enel) || !AtomicOps.CanRestCard(ctx.State, self)) return;
+        if (!AtomicOps.RestCard(enel) || !AtomicOps.RestCard(self)) return;
 
         me.TurnOnceUsed.Add(key);
 
-        // 效果：将对方所有费用不高于 2 的角色 KO
-        var targets = opp.Characters.Where(c => c.Info.Cost <= 2).ToList();
-        foreach (var t in targets)
-        {
-            AtomicOps.KO(ctx.State, 1 - ctx.OwnerIndex, t);
-        }
+        // 效果：将对方所有费用不高于 2 的角色同时 KO。
+        // 必须走可交互的效果 KO 流程，让 OP17-095 等离场置换能够观察整批目标，
+        // 并确保一次支付可按卡文保护同一批次内的全部角色。
+        var targets = opp.Characters.Where(c => ctx.State.CurrentCostOf(c) <= 2).ToList();
+        await AtomicOps.KOCardsByEffectAsync(
+            ctx.State,
+            1 - ctx.OwnerIndex,
+            targets,
+            ctx.Prompts,
+            ctx.OwnerIndex);
     }
 }

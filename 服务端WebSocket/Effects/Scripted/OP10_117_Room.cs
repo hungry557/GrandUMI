@@ -28,7 +28,7 @@ public class OP10_117_Room : IScriptedEffect
         // ── 【触发】抽 1 ──
         if (ctx.Trigger == EffectTrigger.OnLifeRevealTrigger)
         {
-            AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+            await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
             return;
         }
 
@@ -50,7 +50,7 @@ public class OP10_117_Room : IScriptedEffect
         }
 
         // 第二步：将我方最多 1 张费用≤5 的角色转为活跃状态
-        var actCands = me.Characters.Where(c => c.Info.Cost <= 5 && c.IsTapped).ToList();
+        var actCands = me.Characters.Where(c => ctx.State.CurrentCostOf(c) <= 5 && c.IsTapped).ToList();
         if (actCands.Count == 0) return;
         var pick = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OwnCharacter",
             "将我方最多 1 张费用≤5 的角色转为活跃状态",

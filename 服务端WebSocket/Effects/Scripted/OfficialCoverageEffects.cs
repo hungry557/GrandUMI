@@ -282,11 +282,11 @@ public sealed class P_060_FleetingLullaby : IScriptedEffect
         var uta = new List<CardInstance>();
         if (!me.Leader.IsTapped && me.Leader.Info.NameIs("乌塔")) uta.Add(me.Leader);
         uta.AddRange(me.Characters.Where(card => !card.IsTapped && card.Info.NameIs("乌塔")));
-        if (me.StageCard is { IsTapped: false } stage && stage.Info.NameIs("乌塔")) uta.Add(stage);
+        uta.AddRange(me.StageCards.Where(stage => !stage.IsTapped && stage.Info.NameIs("乌塔")));
         var cost = await OfficialCoverageHelpers.ChooseUpToOne(ctx, ctx.OwnerIndex, "OwnCardCost",
             "选择要转为休息状态的1张“乌塔”", uta);
         if (cost is null) return;
-        AtomicOps.RestCard(cost);
+        if (!AtomicOps.RestCard(cost)) return;
 
         var opponent = ctx.State.Players[1 - ctx.OwnerIndex];
         var active = opponent.CostArea.Where(don => don.State == DonState.Active).ToList();
@@ -483,7 +483,7 @@ public sealed class P_134_DineAndDash : IScriptedEffect
     {
         var picked = await OfficialCoverageHelpers.LookTopPickAndBottom(ctx, 3,
             card => Names.Any(card.MatchesName), "公开最多1张“萨波”“艾斯”或“路飞”并加入手牌");
-        if (picked is null) AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+        if (picked is null) await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
     }
 }
 

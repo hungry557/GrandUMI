@@ -45,7 +45,7 @@ public class ST10_007_Killer : IScriptedEffect
         var key = $"ST10-007-donreturn:{ctx.Source.Id}";
         if (me.TurnOnceUsed.Contains(key)) return;
         int oppIdx = 1 - ctx.OwnerIndex;
-        var cands = ctx.State.Players[oppIdx].Characters.Where(c => c.IsTapped && c.Info.Cost <= 3).ToList();
+        var cands = ctx.State.Players[oppIdx].Characters.Where(c => c.IsTapped && ctx.State.CurrentCostOf(c) <= 3).ToList();
         if (cands.Count == 0) return;
         var chosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OpponentRestingCharacter",
             "KO 对方最多1张休息且费用≤3 的角色", cands.Select(c => c.Id.ToString()).ToList(), 0, 1);
@@ -71,7 +71,8 @@ public class ST10_011_Heat : IScriptedEffect
         if (ctx.State.CurrentTurnPlayer != ctx.OwnerIndex) return Task.CompletedTask;
         var key = $"ST10-011-donreturn:{ctx.Source.Id}";
         if (me.TurnOnceUsed.Contains(key)) return Task.CompletedTask;
-        AtomicOps.AddPowerPersistent(ctx.Source, 2000);
+        AtomicOps.AddPowerUntilNextOwnTurnStart(
+            ctx.State, ctx.OwnerIndex, ctx.Source, 2000);
         me.TurnOnceUsed.Add(key);
         return Task.CompletedTask;
     }
@@ -92,7 +93,7 @@ public class ST10_014_Wire : IScriptedEffect
         var key = $"ST10-014-donreturn:{ctx.Source.Id}";
         if (me.TurnOnceUsed.Contains(key)) return;
         me.TurnOnceUsed.Add(key);
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
         if (me.Hand.Count == 0) return;
         var chosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OwnHand", "丢弃1张手牌",
             me.Hand.Select(c => c.Id.ToString()).ToList(), 1, 1);

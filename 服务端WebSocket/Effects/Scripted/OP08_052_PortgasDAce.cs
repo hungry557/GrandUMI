@@ -25,6 +25,7 @@ public class OP08_052_PortgasDAce : IScriptedEffect
 
         if (me.Deck.Count == 0) return;
         var top = me.Deck[0];
+        ctx.BroadcastReveal(top);
 
         var revealExtra = new Dictionary<string, object?>
         {
@@ -33,7 +34,7 @@ public class OP08_052_PortgasDAce : IScriptedEffect
 
         bool eligible = top.Info.Kind == CardKind.Character
             && top.Info.Cost <= 4
-            && top.Info.HasKeyword("白胡子海盗团");
+            && top.Info.HasKeywordContaining("白胡子海盗团");
 
         if (eligible)
         {
@@ -42,8 +43,7 @@ public class OP08_052_PortgasDAce : IScriptedEffect
                 new List<string> { top.Id.ToString() }, 0, 1, revealExtra);
             if (pick.Count > 0)
             {
-                me.Deck.Remove(top);
-                await AtomicOps.PlayFromHandFree(ctx.State, ctx.OwnerIndex, top);
+                await AtomicOps.PlayFromDeckFree(ctx.State, ctx.OwnerIndex, top);
                 return; // 已登场，无剩余牌
             }
         }

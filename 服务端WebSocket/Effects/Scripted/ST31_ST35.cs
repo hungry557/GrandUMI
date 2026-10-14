@@ -148,7 +148,7 @@ public abstract class ST31To35EffectBase : IScriptedEffect
             await AtomicOps.KOByEffectAsync(ctx.State, oppIdx, target, ctx.Prompts, ctx.OwnerIndex);
     }
 
-    private static void RegisterSelfKeyword(EffectContext ctx, string keyword,
+    protected static void RegisterSelfKeyword(EffectContext ctx, string keyword,
         Func<GameState, int, CardInstance, bool> condition)
     {
         var id = ctx.Source.Id;
@@ -176,14 +176,15 @@ public abstract class ST31To35EffectBase : IScriptedEffect
     }
 
     private static int AssignedDon(PlayerState player) => player.CostArea.Count(d => d.State == DonState.Attached);
-    private static bool SlashLeader(PlayerState player) => player.Leader.Info.Property == "斩";
+    private static bool SlashLeader(PlayerState player)
+        => player.Leader.HasProperty("斩");
 
     private static async Task ST31_001(EffectContext ctx)
     {
         var me = ctx.State.Players[ctx.OwnerIndex];
         var id = ctx.Source.Id;
         RegisterSelfKeyword(ctx, "速攻", (_, _, card) => card.Id == id && me.AttachedDonCount(id) >= 2);
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
         await PlayFromHand(ctx, c => c.Info.Kind == CardKind.Character && c.Info.Cost <= 5 &&
             c.Info.HasKeyword("草帽一伙") && !c.Info.NameIs("山智"),
             "将最多1张山智以外、费用不高于5的《草帽一伙》角色登场");
@@ -191,7 +192,7 @@ public abstract class ST31To35EffectBase : IScriptedEffect
 
     private static async Task ST31_002(EffectContext ctx)
     {
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
         await PlayFromHand(ctx, c => c.Info.Kind is CardKind.Character or CardKind.Stage &&
             c.Info.Cost == 1 && c.Info.HasKeyword("草帽一伙"),
             "将最多1张费用为1的《草帽一伙》卡牌登场");
@@ -222,7 +223,7 @@ public abstract class ST31To35EffectBase : IScriptedEffect
         RegisterSelfKeyword(ctx, "速攻", (_, _, card) => card.Id == id && AssignedDon(me) >= 3);
         int strawHat = (me.Leader.Info.HasKeyword("草帽一伙") ? 1 : 0)
             + me.Characters.Count(c => c.Info.HasKeyword("草帽一伙"))
-            + (me.StageCard?.Info.HasKeyword("草帽一伙") == true ? 1 : 0);
+            + me.StageCards.Count(stage => stage.Info.HasKeyword("草帽一伙"));
         if (strawHat == 0) return;
         var opp = ctx.State.Players[1 - ctx.OwnerIndex];
         var target = await Choose(ctx, ctx.OwnerIndex, "OpponentCharacter",
@@ -244,7 +245,7 @@ public abstract class ST31To35EffectBase : IScriptedEffect
         if (me.Leader.MatchesName("蒙奇·D·路飞")) targets.Add(me.Leader);
         targets.AddRange(me.Characters.Where(c => c.MatchesName("蒙奇·D·路飞")));
         if (targets.Count == 0) return;
-        AtomicOps.RestCard(ctx.Source);
+        if (!AtomicOps.RestCard(ctx.Source)) return;
         var target = await Choose(ctx, ctx.OwnerIndex, "OwnLeaderOrCharacter", "赋予1张路飞最多1张休息咚!!", targets);
         if (target is not null) AtomicOps.AttachDonFromCost(me, target.Id, 1, DonState.Rest);
     }
@@ -264,20 +265,23 @@ public abstract class ST31To35EffectBase : IScriptedEffect
         var selected = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OwnLeaderOrDon",
             "可以将斩属性领袖或1张咚!!转为休息状态：抽2张，丢弃1张手牌", ids, 0, 1, extra);
         if (selected.Count == 0) return;
-        if (selected[0] == me.Leader.Id.ToString()) me.Leader.IsTapped = true;
+        if (selected[0] == me.Leader.Id.ToString())
+        {
+            if (!AtomicOps.RestCard(me.Leader)) return;
+        }
         else
         {
             var don = me.CostArea.FirstOrDefault(d => d.Id.ToString() == selected[0] && d.State == DonState.Active);
             if (don is null) return;
             don.State = DonState.Rest;
         }
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 2);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 2);
         await ChooseOwnDiscard(ctx, optional: false, asCost: false);
     }
 
     private static async Task ST32_002(EffectContext ctx)
     {
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
         var opp = ctx.State.Players[1 - ctx.OwnerIndex];
         var target = await Choose(ctx, ctx.OwnerIndex, "OpponentCharacter",
             "选择对方最多1张原本费用不高于6的角色，直到下个对方回合结束时无法转为休息状态",
@@ -294,13 +298,13 @@ public abstract class ST31To35EffectBase : IScriptedEffect
         {
             if (ctx.State.CurrentTurnPlayer != ctx.OwnerIndex) return;
             if (!ctx.Vars.TryGetValue("restedCardId", out var value) || value?.ToString() != ctx.Source.Id.ToString()) return;
-            AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+            await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
             await ChooseOwnDiscard(ctx, optional: false, asCost: false);
             return;
         }
         if (!SlashLeader(me)) return;
         await PlayFromHand(ctx, c => c.Info.Kind == CardKind.Character && c.Info.Cost <= 5 &&
-            (c.Info.NameContains("佩罗娜") || c.Info.Property == "斩"),
+            (c.Info.NameContains("佩罗娜") || c.HasProperty("斩")),
             "将最多1张费用不高于5的佩罗娜或斩属性角色登场");
     }
 
@@ -315,8 +319,6 @@ public abstract class ST31To35EffectBase : IScriptedEffect
     private static Task ST32_005(EffectContext ctx)
     {
         var me = ctx.State.Players[ctx.OwnerIndex];
-        var id = ctx.Source.Id;
-        RegisterSelfKeyword(ctx, "登场回合可攻击角色", (_, _, card) => card.Id == id);
         return SlashLeader(me) ? RestUpTo(ctx, 1, 2) : Task.CompletedTask;
     }
 
@@ -333,7 +335,7 @@ public abstract class ST31To35EffectBase : IScriptedEffect
     private static async Task ST33_001(EffectContext ctx)
     {
         if (await ChooseOwnDiscard(ctx, optional: true, asCost: true) is not null)
-            AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+            await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
     }
 
     private static async Task ST33_002(EffectContext ctx)
@@ -356,9 +358,10 @@ public abstract class ST31To35EffectBase : IScriptedEffect
         int oppIdx = 1 - ctx.OwnerIndex;
         var cards = ctx.State.Players[oppIdx].Characters
             .Where(c => ctx.State.CurrentCostOf(oppIdx, c) <= 2).ToList();
-        foreach (var card in await ChooseMany(ctx, ctx.OwnerIndex, "OpponentCharacter",
-                     "将对方最多2张费用不高于2的角色放回卡组最下方", cards, 2))
-            AtomicOps.ReturnFieldToDeckBottom(ctx.State, oppIdx, card);
+        var selected = await ChooseMany(ctx, ctx.OwnerIndex, "OpponentCharacter",
+            "将对方最多2张费用不高于2的角色放回卡组最下方", cards, 2);
+        await AtomicOps.ProcessEffectLeavesAsync(ctx.State, oppIdx, selected, ctx.Prompts, "deck-bottom",
+            AtomicOps.ReturnFieldToDeckBottom);
     }
 
     private static async Task ST33_005(EffectContext ctx)
@@ -492,7 +495,18 @@ public sealed class ST32_001_Effect : ST31To35EffectBase { public override strin
 public sealed class ST32_002_Effect : ST31To35EffectBase { public override string CardNumber => "ST32-002"; }
 public sealed class ST32_003_Effect : ST31To35EffectBase { public override string CardNumber => "ST32-003"; }
 public sealed class ST32_004_Effect : ST31To35EffectBase { public override string CardNumber => "ST32-004"; }
-public sealed class ST32_005_Effect : ST31To35EffectBase { public override string CardNumber => "ST32-005"; }
+public sealed class ST32_005_Effect : ST31To35EffectBase, IFieldStaticEffect
+{
+    public override string CardNumber => "ST32-005";
+
+    public Task RegisterFieldStatic(EffectContext ctx)
+    {
+        var id = ctx.Source.Id;
+        RegisterSelfKeyword(ctx, "登场回合可攻击角色", (_, side, card) =>
+            side == ctx.OwnerIndex && card.Id == id);
+        return Task.CompletedTask;
+    }
+}
 public sealed class ST33_001_Effect : ST31To35EffectBase { public override string CardNumber => "ST33-001"; }
 public sealed class ST33_002_Effect : ST31To35EffectBase { public override string CardNumber => "ST33-002"; }
 public sealed class ST33_003_Effect : ST31To35EffectBase { public override string CardNumber => "ST33-003"; }

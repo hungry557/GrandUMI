@@ -1,9 +1,10 @@
 "use client";
 
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
-import { useCallback, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import CardBack from "@/components/ui/CardBack";
 import CardItem from "@/components/ui/CardItem";
+import { useLayoutQuarterTurn } from "@/components/ui/ResponsiveScope";
 import { getGameCard } from "@/data/CardLoader";
 import {
   detectCardZoneTransitions,
@@ -11,7 +12,9 @@ import {
   type CardZoneSide,
   type CardZoneTransition,
 } from "@/lib/cardZoneTransitions";
+import { viewportRectToLayerBounds } from "@/lib/stageGeometry";
 import { useGameStore, type PlayerView } from "@/store/gameStore";
+import { useSettingsStore } from "@/store/settingsStore";
 
 const CARD_WIDTH = 72;
 const CARD_HEIGHT = 101;
@@ -59,20 +62,20 @@ function specificAnchorKey(
   return genericAnchorKey(side, zone);
 }
 
-function toStageBounds(layer: HTMLElement, element: HTMLElement): Bounds {
-  const layerRect = layer.getBoundingClientRect();
-  const elementRect = element.getBoundingClientRect();
-  const scaleX = layerRect.width / layer.clientWidth || 1;
-  const scaleY = layerRect.height / layer.clientHeight || 1;
-  return {
-    left: (elementRect.left - layerRect.left) / scaleX,
-    top: (elementRect.top - layerRect.top) / scaleY,
-    width: elementRect.width / scaleX,
-    height: elementRect.height / scaleY,
-  };
+function toStageBounds(
+  layer: HTMLElement,
+  element: HTMLElement,
+  rotateQuarterTurn: boolean,
+): Bounds {
+  return viewportRectToLayerBounds({
+    layerRect: layer.getBoundingClientRect(),
+    layerWidth: layer.clientWidth,
+    layerHeight: layer.clientHeight,
+    rotateQuarterTurn,
+  }, element.getBoundingClientRect());
 }
 
-function collectBounds(layer: HTMLElement) {
+function collectBounds(layer: HTMLElement, rotateQuarterTurn: boolean) {
   const stage = layer.parentElement;
   const bounds = new Map<string, Bounds>();
   if (!stage) return bounds;
@@ -81,7 +84,7 @@ function collectBounds(layer: HTMLElement) {
     const side = element.dataset.zoneSide as CardZoneSide | undefined;
     const zone = element.dataset.zone as CardZone | undefined;
     if (!side || !zone) return;
-    const measured = toStageBounds(layer, element);
+    const measured = toStageBounds(layer, element, rotateQuarterTurn);
     const genericKey = genericAnchorKey(side, zone);
     if (!bounds.has(genericKey)) bounds.set(genericKey, measured);
     if (element.dataset.zoneCardId) {
@@ -143,10 +146,12 @@ function bendPoint(start: Flight["start"], end: Flight["end"], order: number) {
 function FlyingCard({
   flight,
   reducedMotion,
+  fast,
   onComplete,
 }: {
   flight: Flight;
   reducedMotion: boolean;
+  fast: boolean;
   onComplete: (id: string) => void;
 }) {
   const card = flight.cardNumber ? getGameCard(flight.cardNumber, flight.spriteMap) ?? null : null;
@@ -159,8 +164,8 @@ function FlyingCard({
   const endY = flight.end.y - CARD_HEIGHT / 2;
   const fromFlip = flight.fromFaceUp ? 0 : 180;
   const toFlip = flight.toFaceUp ? 0 : 180;
-  const duration = reducedMotion ? 0.2 : 0.56;
-  const delay = reducedMotion ? 0 : flight.order * 0.045;
+  const duration = reducedMotion ? 0.2 : fast ? 0.25 : 0.56;
+  const delay = reducedMotion ? 0 : flight.order * (fast ? 0.02 : 0.045);
 
   return (
     <motion.div
@@ -212,7 +217,7 @@ function FlyingCard({
           className="absolute inset-0 overflow-hidden rounded-md"
           style={{ backfaceVisibility: "hidden", transform: "rotateY(180deg)" }}
         >
-          <CardBack cardBackId={flight.cardBackId} decorative />
+          <CardBack cardBackId={flight.cardBackId} side={flight.side} decorative />
         </div>
       </motion.div>
     </motion.div>
@@ -225,11 +230,17 @@ function FlyingCard({
  */
 export default function CardZoneTransitionLayer() {
   const layerRef = useRef<HTMLDivElement>(null);
+  const rotateQuarterTurn = useLayoutQuarterTurn();
   const previousFrameRef = useRef<BoardFrame | null>(null);
   const previousBoundsRef = useRef(new Map<string, Bounds>());
   const sequenceRef = useRef(0);
   const [flights, setFlights] = useState<Flight[]>([]);
   const reducedMotion = useReducedMotion() ?? false;
+  const animationSpeed = useSettingsStore((state) => state.animationSpeed);
+
+  useEffect(() => {
+    if (animationSpeed === "off") setFlights([]);
+  }, [animationSpeed]);
 
   const tick = useGameStore((state) => state.tick);
   const my = useGameStore((state) => state.my);
@@ -243,7 +254,7 @@ export default function CardZoneTransitionLayer() {
   useLayoutEffect(() => {
     const layer = layerRef.current;
     if (!layer) return;
-    const currentBounds = collectBounds(layer);
+    const currentBounds = collectBounds(layer, rotateQuarterTurn);
     const currentFrame: BoardFrame = {
       tick,
       my,
@@ -262,7 +273,7 @@ export default function CardZoneTransitionLayer() {
           const state = useGameStore.getState();
           // 只刷新同一份权威快照；若期间发生乐观更新，必须保留动作前坐标。
           if (state.tick === tick && state.my === my && state.opponent === opponent) {
-            previousBoundsRef.current = collectBounds(layer);
+            previousBoundsRef.current = collectBounds(layer, rotateQuarterTurn);
           }
         });
       });
@@ -289,7 +300,7 @@ export default function CardZoneTransitionLayer() {
       return refreshBoundsAfterLayout();
     }
 
-    if (gameplayReady(previousFrame) && gameplayReady(currentFrame)) {
+    if (animationSpeed !== "off" && gameplayReady(previousFrame) && gameplayReady(currentFrame)) {
       const transitions = detectCardZoneTransitions(
         { my: previousFrame.my, opponent: previousFrame.opponent },
         { my, opponent },
@@ -324,11 +335,13 @@ export default function CardZoneTransitionLayer() {
     return refreshBoundsAfterLayout();
   }, [
     actionPayload,
+    animationSpeed,
     firstPlayerChosen,
     lastAction,
     mulliganBothDone,
     my,
     opponent,
+    rotateQuarterTurn,
     tick,
     turnCount,
   ]);
@@ -345,6 +358,7 @@ export default function CardZoneTransitionLayer() {
             key={flight.id}
             flight={flight}
             reducedMotion={reducedMotion}
+            fast={animationSpeed === "fast"}
             onComplete={finishFlight}
           />
         ))}

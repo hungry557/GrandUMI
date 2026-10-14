@@ -39,13 +39,13 @@ public class OP09_092_MarshallDTeach : IScriptedEffect
         if (!use) return;
 
         // 支付成本：横置自身
-        AtomicOps.RestCard(self);
+        if (!AtomicOps.RestCard(self)) return;
 
         // 条件：我方手牌张数比对方少 3 张或更多
         if (me.Hand.Count > opp.Hand.Count - 3) return;
 
         // 抽 2 张
-        AtomicOps.Draw(s, ctx.OwnerIndex, 2);
+        await AtomicOps.DrawAsync(s, ctx.OwnerIndex, 2);
 
         // 丢弃我方 1 张手牌（强制）
         if (me.Hand.Count == 0) return;

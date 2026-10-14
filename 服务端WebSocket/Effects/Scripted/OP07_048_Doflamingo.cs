@@ -43,6 +43,7 @@ public class OP07_048_Doflamingo : IScriptedEffect
 
         if (me.Deck.Count == 0) return;
         var top = me.Deck[0];
+        ctx.BroadcastReveal(top);
 
         bool eligible = top.Info.Kind == CardKind.Character
             && top.Info.Cost <= 4
@@ -64,8 +65,9 @@ public class OP07_048_Doflamingo : IScriptedEffect
                 if (me.Characters.Count >= 5)
                     await AtomicOps.SqueezeCharacterSlot(ctx.State, ctx.OwnerIndex);
                 top.TurnPlayed = ctx.State.TurnCount;
-                top.IsTapped = true; // 休息状态登场
+                AtomicOps.RestCard(top); // 休息状态登场；霸王色霸气等无法休息规则仍须生效
                 me.Characters.Add(top);
+                ctx.State.EnqueueEnterField(ctx.OwnerIndex, top, "deck");
                 return; // 已登场，无剩余卡需放回
             }
         }

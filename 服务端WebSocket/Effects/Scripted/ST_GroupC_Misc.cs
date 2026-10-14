@@ -22,7 +22,7 @@ public class ST11_003_Reverse : IScriptedEffect
             new List<string> { "将对方最多1张费用≤5角色转为休息状态", "KO对方最多1张休息且费用≤5的角色" });
         if (opt == 0)
         {
-            var cands = opp.Characters.Where(c => c.Info.Cost <= 5).ToList();
+            var cands = opp.Characters.Where(c => ctx.State.CurrentCostOf(c) <= 5).ToList();
             if (cands.Count == 0) return;
             var ch = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OpponentCharacter", "转为休息状态",
                 cands.Select(c => c.Id.ToString()).ToList(), 0, 1);
@@ -30,43 +30,7 @@ public class ST11_003_Reverse : IScriptedEffect
         }
         else if (opt == 1)
         {
-            var cands = opp.Characters.Where(c => c.IsTapped && c.Info.Cost <= 5).ToList();
-            if (cands.Count == 0) return;
-            var ch = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OpponentRestingCharacter", "KO",
-                cands.Select(c => c.Id.ToString()).ToList(), 0, 1);
-            if (ch.Count > 0) AtomicOps.KO(ctx.State, oppIdx, cands.First(c => c.Id.ToString() == ch[0]));
-        }
-    }
-}
-
-/// <summary>
-/// ST12-006 约撒&强尼（角色）
-/// 【咚!!×1】【攻击时】选择1项：①将对方最多1张费用≤2角色转休息；②KO对方最多1张休息且费用≤2角色。
-/// </summary>
-public class ST12_006_YosakuJohnny : IScriptedEffect
-{
-    public string CardNumber => "ST12-006";
-    public bool HandlesTrigger(EffectTrigger t) => t == EffectTrigger.OnAttackDeclare;
-
-    public async Task Resolve(EffectContext ctx)
-    {
-        var me = ctx.State.Players[ctx.OwnerIndex];
-        if (me.AttachedDonCount(ctx.Source.Id) < 1) return;
-        int oppIdx = 1 - ctx.OwnerIndex;
-        var opp = ctx.State.Players[oppIdx];
-        int opt = await ctx.Prompts.ChooseOption(ctx.OwnerIndex, "选择以下1项",
-            new List<string> { "将对方最多1张费用≤2角色转为休息状态", "KO对方最多1张休息且费用≤2的角色" });
-        if (opt == 0)
-        {
-            var cands = opp.Characters.Where(c => c.Info.Cost <= 2).ToList();
-            if (cands.Count == 0) return;
-            var ch = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OpponentCharacter", "转为休息状态",
-                cands.Select(c => c.Id.ToString()).ToList(), 0, 1);
-            if (ch.Count > 0) AtomicOps.RestCard(cands.First(c => c.Id.ToString() == ch[0]));
-        }
-        else if (opt == 1)
-        {
-            var cands = opp.Characters.Where(c => c.IsTapped && c.Info.Cost <= 2).ToList();
+            var cands = opp.Characters.Where(c => c.IsTapped && ctx.State.CurrentCostOf(c) <= 5).ToList();
             if (cands.Count == 0) return;
             var ch = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OpponentRestingCharacter", "KO",
                 cands.Select(c => c.Id.ToString()).ToList(), 0, 1);
@@ -89,7 +53,7 @@ public class ST29_002_Usopp : IScriptedEffect
         int oppIdx = 1 - ctx.OwnerIndex;
         var opp = ctx.State.Players[oppIdx];
         int threshold = opp.LifeCount;
-        var cands = opp.Characters.Where(c => c.Info.Cost <= threshold).ToList();
+        var cands = opp.Characters.Where(c => ctx.State.CurrentCostOf(c) <= threshold).ToList();
         if (cands.Count == 0) return;
         var ch = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OpponentCharacter",
             $"将对方最多1张费用≤{threshold} 角色转为休息状态", cands.Select(c => c.Id.ToString()).ToList(), 0, 1);
@@ -111,7 +75,7 @@ public class ST29_013_RobLucci : IScriptedEffect
         int oppIdx = 1 - ctx.OwnerIndex;
         var opp = ctx.State.Players[oppIdx];
         int threshold = ctx.State.Players[ctx.OwnerIndex].LifeCount + opp.LifeCount;
-        var cands = opp.Characters.Where(c => c.Info.Cost <= threshold).ToList();
+        var cands = opp.Characters.Where(c => ctx.State.CurrentCostOf(c) <= threshold).ToList();
         if (cands.Count == 0) return;
         var ch = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OpponentCharacter",
             $"KO 对方最多1张费用≤{threshold} 的角色", cands.Select(c => c.Id.ToString()).ToList(), 0, 1);

@@ -123,19 +123,24 @@
         }
       ]
     },
-    "counter": [
-      {
-        "op": "Choose",
-        "prompt": "OwnLeaderOrCharacter",
-        "max": 1,
-        "as": "$t"
+    "counter": {
+      "cost": {
+        "lifeToHand": true
       },
-      {
-        "op": "AddPowerThisBattle",
-        "target": "$t",
-        "delta": 3000
-      }
-    ]
+      "then": [
+        {
+          "op": "Choose",
+          "prompt": "OwnLeaderOrCharacter",
+          "max": 1,
+          "as": "$t"
+        },
+        {
+          "op": "AddPowerThisTurn",
+          "target": "$t",
+          "delta": 3000
+        }
+      ]
+    }
   },
   "OP06-019": {
     "_name": "",
@@ -149,7 +154,7 @@
           "max": 1,
           "as": "$tgt",
           "filter": {
-            "originalPowerLte": 5000
+            "currentPowerLte": 5000
           }
         },
         {
@@ -165,7 +170,7 @@
         "max": 1,
         "as": "$tgt",
         "filter": {
-          "originalPowerLte": 4000
+          "currentPowerLte": 4000
         }
       },
       {
@@ -293,7 +298,8 @@
         "then": [
           {
             "op": "ActiveOwnDon",
-            "n": 1
+            "n": 1,
+            "chooseCount": true
           },
           {
             "op": "AddPowerThisTurn",
@@ -566,7 +572,7 @@
   },
   "OP06-050": {
     "_name": "",
-    "_matcher": "登场时确认卡组顶5张、公开1张排除塔希米的海军特征卡加入手牌，其余放回卡组底。",
+    "_matcher": "登场时确认卡组顶5张、公开1张排除达斯琪的海军特征卡加入手牌，其余放回卡组底。",
     "_src": "wf-dsl",
     "triggers": [
       {
@@ -579,7 +585,7 @@
             "restTo": "bottom",
             "match": {
               "keyword": "海军",
-              "excludeName": "塔希米"
+              "excludeName": "达斯琪"
             }
           }
         ]
@@ -678,25 +684,14 @@
         {
           "op": "Choose",
           "prompt": "OpponentCharacterCostLe6",
-          "max": 1,
+          "max": 2,
           "min": 0,
-          "as": "$t1"
+          "as": "$targets",
+          "text": "将对方最多2张费用不高于6的角色自选顺序放回卡组最下方"
         },
         {
           "op": "ReturnToDeckBottom",
-          "target": "$t1",
-          "from": "field"
-        },
-        {
-          "op": "Choose",
-          "prompt": "OpponentCharacterCostLe6",
-          "max": 1,
-          "min": 0,
-          "as": "$t2"
-        },
-        {
-          "op": "ReturnToDeckBottom",
-          "target": "$t2",
+          "target": "$targets",
           "from": "field"
         }
       ]
@@ -1052,13 +1047,15 @@
         "then": [
           {
             "op": "Choose",
-            "prompt": "OwnTrashCharacter",
+            "prompt": "OwnTrash",
             "max": 1,
+            "min": 0,
             "as": "$t",
             "filter": {
               "keyword": "恐怖之船海盗团",
               "excludeName": "豪格巴克医生"
-            }
+            },
+            "text": "将废弃区最多1张豪格巴克医生以外的恐怖之船海盗团卡牌加入手牌"
           },
           {
             "op": "TrashToHand",
@@ -1115,11 +1112,12 @@
   },
   "OP06-098": {
     "_name": "",
-    "_matcher": "启动主要(横置自身)：领袖含恐怖之船海盗团时，从废弃区休息登场1张费用≤2该特征角色；原文另有可选『费用区指定数量咚转休息』成本，为非固定数量无对应cost键，按规范跳过。",
+    "_matcher": "启动主要(横置1张活跃咚与自身)：领袖含恐怖之船海盗团时，从废弃区休息登场1张费用≤2该特征角色。",
     "_src": "wf-dsl",
     "activated": {
       "cost": {
-        "restSelf": true
+        "restSelf": true,
+        "restActiveDon": 1
       },
       "if": {
         "leaderHasKeyword": "恐怖之船海盗团"
@@ -1323,7 +1321,7 @@
   },
   "OP06-114": {
     "_name": "",
-    "_matcher": "登场时(成本:将1张费1舞台放回卡组底)看顶5公开≤1张神之岛/山迪亚战士加手牌余放底",
+    "_matcher": "登场时可以将双方任意1张费用为1的舞台放回持有者卡组底，确认顶5并公开最多1张神之岛或山迪亚战士卡牌。",
     "_src": "wf-dsl",
     "triggers": [
       {
@@ -1342,13 +1340,12 @@
                 {
                   "keyword": "山迪亚战士"
                 }
-              ],
-              "excludeName": "瓦帕"
+              ]
             }
           }
         ],
         "cost": {
-          "returnOwnStage": {
+          "returnStage": {
             "originalCostLte": 1,
             "originalCostGte": 1
           }

@@ -40,9 +40,9 @@ public class OP12_028_Hiyori : IScriptedEffect
         if (ctx.Source.IsTapped) return;
 
         // 支付代价
+        if (!AtomicOps.RestCard(ctx.Source)) return;
         activeDon.State = DonState.Rest;
         activeDon.AttachedToCardId = null;
-        ctx.Source.IsTapped = true;
 
         // 效果：确认卡组顶 5 张
         int peek = Math.Min(5, me.Deck.Count);
@@ -51,7 +51,7 @@ public class OP12_028_Hiyori : IScriptedEffect
 
         // 可公开并加入手牌：拥有属性（斩）的卡牌 或 绿色（风）事件
         var candidates = top.Where(c =>
-            c.Info.Property.Split('/').Contains("斩")
+            c.HasProperty("斩")
             || (c.Info.Kind == CardKind.Event && c.Info.ColorList.Contains("绿")))
             .ToList();
 
@@ -71,6 +71,7 @@ public class OP12_028_Hiyori : IScriptedEffect
                 var picked = candidates.First(c => c.Id.ToString() == chosen[0]);
                 me.Deck.Remove(picked);
                 me.Hand.Add(picked);
+                ctx.BroadcastReveal(picked);
             }
         }
 

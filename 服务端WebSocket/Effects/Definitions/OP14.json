@@ -52,6 +52,7 @@
             "op": "LookTopReveal",
             "count": 5,
             "max": 1,
+            "pickedTo": "field",
             "match": {
               "kind": "Character",
               "keyword": "超新星",
@@ -98,7 +99,6 @@
             "count": 5,
             "max": 1,
             "match": {
-              "kind": "Character",
               "keyword": "超新星",
               "excludeName": "蒙奇·D·路飞"
             }
@@ -205,13 +205,26 @@
         "text": "将手牌中最多1张力量不高于2000的红色角色登场"
       }
     ],
-    "counter": [
-      {
-        "op": "AddPowerThisBattle",
-        "target": "selfLeader",
-        "delta": 4000
-      }
-    ]
+    "counter": {
+      "if": {
+        "boardHasCharPowerGte": 8000
+      },
+      "then": [
+        {
+          "op": "Choose",
+          "prompt": "OwnLeaderOrCharacter",
+          "max": 1,
+          "min": 0,
+          "as": "$tgt",
+          "text": "本次战斗中，我方最多1张领袖或角色力量+4000"
+        },
+        {
+          "op": "AddPowerThisBattle",
+          "target": "$tgt",
+          "delta": 4000
+        }
+      ]
+    }
   },
   "OP14-019": {
     "trigger": [
@@ -246,7 +259,8 @@
         "then": [
           {
             "op": "ActiveOwnDon",
-            "n": 2
+            "n": 2,
+            "chooseCount": true
           }
         ]
       }
@@ -272,7 +286,8 @@
         "then": [
           {
             "op": "ActiveOwnDon",
-            "n": 3
+            "n": 3,
+            "chooseCount": true
           },
           {
             "op": "NoPlayCharacter"
@@ -353,7 +368,8 @@
           "prompt": "OpponentRestingCharacter",
           "max": 1,
           "min": 0,
-          "as": "$tgt"
+          "as": "$tgt",
+          "filter": { "originalPowerLte": 7000 }
         },
         {
           "op": "KO",
@@ -372,7 +388,7 @@
   "OP14-038": {
     "main": {
       "cost": {
-        "restActiveDon": 2
+        "restCards": 2
       },
       "then": [
         {
@@ -381,9 +397,12 @@
         },
         {
           "op": "Choose",
-          "prompt": "OpponentCharacterCostLe7",
+          "prompt": "OpponentCharacter",
           "max": 1,
           "min": 0,
+          "filter": {
+            "originalPowerLte": 7000
+          },
           "as": "$tgt"
         },
         {
@@ -422,7 +441,8 @@
         "then": [
           {
             "op": "ActiveOwnDon",
-            "n": 1
+            "n": 1,
+            "chooseCount": true
           }
         ]
       }
@@ -496,13 +516,15 @@
         "on": "OnEnterField",
         "then": [
           {
-            "op": "LookTopReveal",
+            "op": "RevealTopThen",
             "count": 1,
-            "max": 1,
-            "restTo": "bottom",
             "match": {
-              "keyword": "白胡子海盗团"
-            }
+              "keywordContains": "白胡子海盗团"
+            },
+            "then": [
+              { "op": "Draw", "n": 2 },
+              { "op": "DiscardOwnChosen", "n": 1 }
+            ]
           }
         ]
       }
@@ -619,6 +641,12 @@
     "triggers": [
       {
         "on": "OnEnterField",
+        "cost": {
+          "handDiscard": {
+            "n": 3,
+            "text": "可以丢弃3张手牌作为成本（可放弃）"
+          }
+        },
         "then": [
           {
             "op": "Choose",
@@ -828,11 +856,11 @@
       },
       {
         "on": "OnKO",
+        "cost": {
+          "donReturn": 1
+        },
+        "costPrompt": "咚!!-1：发动增加生命效果？",
         "then": [
-          {
-            "op": "ReturnDonToDeck",
-            "n": 1
-          },
           {
             "op": "AddLifeFromDeck",
             "n": 1
@@ -1024,7 +1052,7 @@
       {
         "on": "OnEnterField",
         "if": {
-          "leaderHasKeyword": "巴洛克工作室"
+          "leaderKeywordContains": "巴洛克工作室"
         },
         "then": [
           {
@@ -1032,10 +1060,10 @@
             "prompt": "OwnTrashCharacterCostLe4",
             "max": 1,
             "min": 0,
-            "text": "选择废弃区中最多1张费用不高于4且拥有《巴洛克工作室》特征的角色登场",
+            "text": "选择废弃区中最多1张费用不高于4且特征中包含〈巴洛克工作室〉的角色登场",
             "as": "$c1",
             "filter": {
-              "keyword": "巴洛克工作室"
+              "keywordContains": "巴洛克工作室"
             }
           },
           {
@@ -1047,10 +1075,11 @@
             "prompt": "OwnTrashCharacterCostLe1",
             "max": 1,
             "min": 0,
-            "text": "选择废弃区中最多1张费用为1且拥有《巴洛克工作室》特征的角色登场",
+            "text": "选择废弃区中最多1张费用为1且特征中包含〈巴洛克工作室〉的角色登场",
             "as": "$c2",
             "filter": {
-              "keyword": "巴洛克工作室"
+              "keywordContains": "巴洛克工作室",
+              "originalCostGte": 1
             }
           },
           {
@@ -1083,7 +1112,7 @@
       {
         "on": "OnEnterField",
         "if": {
-          "leaderHasKeyword": "巴洛克工作室"
+          "leaderKeywordContains": "巴洛克工作室"
         },
         "then": [
           {
@@ -1092,8 +1121,8 @@
             "max": 1,
             "restTo": "trash",
             "match": {
-              "keyword": "巴洛克工作室",
-              "excludeName": "Miss.情人节(美琪塔)"
+              "excludeName": "Miss.情人节(美琪塔)",
+              "keywordContains": "巴洛克工作室"
             }
           }
         ]
@@ -1216,10 +1245,10 @@
             "prompt": "OwnTrashCharacterCostLe8",
             "max": 1,
             "min": 0,
-            "text": "选择废弃区中最多1张费用不高于8且拥有《巴洛克工作室》特征的角色",
+            "text": "选择废弃区中最多1张费用不高于8且特征包含《巴洛克工作室》的角色",
             "as": "$c",
             "filter": {
-              "keyword": "巴洛克工作室"
+              "keywordContains": "巴洛克工作室"
             }
           },
           {
@@ -1272,12 +1301,24 @@
           "max": 1,
           "restTo": "trash",
           "match": {
-            "keyword": "巴洛克工作室",
-            "excludeName": "不服气吗？"
+            "excludeName": "不服气吗？",
+            "keywordContains": "巴洛克工作室"
           }
         }
       ]
-    }
+    },
+    "trigger": [
+      {
+        "op": "LookTopReveal",
+        "count": 3,
+        "max": 1,
+        "restTo": "trash",
+        "match": {
+          "excludeName": "不服气吗？",
+          "keywordContains": "巴洛克工作室"
+        }
+      }
+    ]
   },
   "OP14-100": {
     "triggers": [
@@ -1363,10 +1404,13 @@
         "then": [
           {
             "op": "Choose",
-            "prompt": "OpponentCharacterCostLe7",
+            "prompt": "OpponentCharacter",
             "max": 1,
             "min": 0,
-            "as": "$tgt"
+            "as": "$tgt",
+            "valueBasis": "original",
+            "filter": { "originalPowerLte": 7000 },
+            "text": "将对方最多1张原本力量不高于7000的角色KO"
           },
           {
             "op": "KO",
@@ -1473,7 +1517,14 @@
             "count": 5,
             "max": 1,
             "match": {
-              "keyword": "亚马逊·百合"
+              "anyOf": [
+                {
+                  "keyword": "亚马逊·百合"
+                },
+                {
+                  "keyword": "九蛇海盗团"
+                }
+              ]
             }
           },
           {
@@ -1616,13 +1667,27 @@
         "text": "将手牌中最多1张力量不高于6000且拥有【触发】效果的角色登场"
       }
     ],
-    "counter": [
-      {
-        "op": "AddPowerThisBattle",
-        "target": "selfLeader",
-        "delta": 3000
-      }
-    ]
+    "counter": {
+      "if": {
+        "ownLifeCountLte": 2
+      },
+      "then": [
+        {
+          "op": "Choose",
+          "prompt": "OpponentActiveCharacter",
+          "max": 1,
+          "min": 0,
+          "as": "$tgt",
+          "text": "本回合中，对方最多1张活跃状态的角色无法攻击"
+        },
+        {
+          "op": "AddRestriction",
+          "target": "$tgt",
+          "kind": "CannotAttack",
+          "duration": "ThisTurn"
+        }
+      ]
+    }
   },
   "OP14-119": {
     "_name": "杰拉基尔·米霍克",

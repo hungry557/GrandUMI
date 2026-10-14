@@ -59,12 +59,20 @@ export enum ProtocolEnum {
   MsgLikeDeckPlaza = 54,
   MsgCopyDeckPlaza = 55,
   MsgDeleteDeckPlaza = 56,
+  MsgCardBackReviewQueue = 57,
+  MsgReviewCardBack = 58,
 }
 
 // WebSocket JSON 消息基类
 // 字段名 proto 使用枚举名字符串（如 "MsgLogin"），与 C# EncodeName 一致
 export interface MsgBase {
   proto: string; // ProtocolEnum 枚举名
+}
+
+export interface MsgPublicPlayerIdentities extends MsgBase {
+  proto: "MsgPublicPlayerIdentities";
+  names?: string[];
+  identities?: { name: string; equippedSeasonTitle: string | null }[];
 }
 
 // ── 握手 ──────────────────────────────────────────────────────────────
@@ -74,6 +82,7 @@ export interface MsgSecret extends MsgBase {
   proto: "MsgSecret";
   vesion?: string;   // 客户端版本号（发送）
   supportsStateDelta?: boolean; // 客户端声明支持 MsgGameStateDelta
+  supportsOpeningPreparation?: boolean;
   Secret?: string;   // 服务器返回的 AES 密钥
   result?: boolean;  // 版本是否匹配
   stateDeltaEnabled?: boolean; // 服务端确认本连接启用增量快照
@@ -92,13 +101,25 @@ export interface MsgLogin extends MsgBase {
   account: string;
   password?: string;
   authToken?: string;
+  /** QQ 始终作为字符串传输，禁止用 JS number。 */
+  qq?: string;
+  clientInstanceId?: string;
+  resume?: boolean;
   needsPassword?: boolean;
   needsPasswordSetup?: boolean;
+  needsQqBinding?: boolean;
+  needsQqWhitelistInitialization?: boolean;
+  canInitializeQqWhitelist?: boolean;
   authChallenge?: boolean;
+  qqMasked?: string | null;
+  qqWhitelistVersion?: number | null;
   name?: string;     // 服务器返回的玩家昵称
   avatar?: string;
   cardBackId?: string;
+  canChangeDisplayName?: boolean;
   selectedDeckName?: string | null;
+  championLeaderNumbers?: string[];
+  equippedChampionLeaderNumber?: string | null;
   decks?: SavedDeck[];
   result?: boolean;  // true = 成功（C# 中是 bool 不是 int）
   logStr?: string;   // 服务器提示文本
@@ -128,8 +149,16 @@ export interface MsgPlayerData extends MsgBase {
   displayName?: string;
   avatar?: string;
   cardBackId?: string;
+  canChangeDisplayName?: boolean;
   selectedDeckName?: string | null;
+  championLeaderNumbers?: string[];
+  equippedChampionLeaderNumber?: string | null;
   decks?: SavedDeck[];
+}
+
+export interface MsgUpdateChampionTitle extends MsgBase {
+  proto: "MsgUpdateChampionTitle";
+  leaderNumber: string;
 }
 
 export interface MsgSaveDeck extends MsgBase {
@@ -166,15 +195,27 @@ export interface CardBackGalleryItem {
   likes: number;
   liked: boolean;
   owned: boolean;
+  publiclyListed: boolean;
   createdAt: number;
+  reviewStatus: "pending" | "approved" | "rejected";
+  reviewReason: string;
 }
 
-/** 客户端空请求读取广场；服务端返回按红心数量排序后的投稿。 */
+export type CardBackGallerySortOrder = "likesDesc" | "likesAsc";
+
+/** 卡背广场游标分页请求与响应；本人投稿单独返回，不占热门分页名额。 */
 export interface MsgCardBackGallery extends MsgBase {
   proto: "MsgCardBackGallery";
   result?: boolean;
   logStr?: string;
+  cursor?: string | null;
+  pageSize?: number;
   items?: CardBackGalleryItem[];
+  ownedItems?: CardBackGalleryItem[];
+  total?: number;
+  hasMore?: boolean;
+  nextCursor?: string | null;
+  sortOrder?: CardBackGallerySortOrder;
 }
 
 export interface MsgUploadCardBack extends MsgBase {
@@ -182,16 +223,44 @@ export interface MsgUploadCardBack extends MsgBase {
   name: string;
   mimeType: "image/png" | "image/jpeg" | "image/webp";
   imageBase64: string;
+  sortOrder?: CardBackGallerySortOrder;
 }
 
 export interface MsgLikeCardBack extends MsgBase {
   proto: "MsgLikeCardBack";
-  cardBackId: string;
+  cardBackId?: string;
+  result?: boolean;
+  logStr?: string;
+  item?: CardBackGalleryItem;
 }
 
 export interface MsgDeleteCardBack extends MsgBase {
   proto: "MsgDeleteCardBack";
   cardBackId: string;
+  sortOrder?: CardBackGallerySortOrder;
+}
+
+export interface CardBackReviewItem {
+  id: string;
+  name: string;
+  authorName: string;
+  imageUrl: string;
+  createdAt: number;
+}
+
+export interface MsgCardBackReviewQueue extends MsgBase {
+  proto: "MsgCardBackReviewQueue";
+  result?: boolean;
+  canReview?: boolean;
+  logStr?: string;
+  items?: CardBackReviewItem[];
+}
+
+export interface MsgReviewCardBack extends MsgBase {
+  proto: "MsgReviewCardBack";
+  cardBackId: string;
+  approved: boolean;
+  reason?: string;
 }
 
 export interface MsgImportDecks extends MsgBase {
@@ -273,12 +342,50 @@ export interface MsgEnterMatch extends MsgBase {
   proto: "MsgEnterMatch";
   deck: string;
   deckName?: string;
+  queueKind?: MatchQueueKind;
   result?: boolean;
   logStr?: string;
 }
 
 export interface MsgCancelMatch extends MsgBase {
   proto: "MsgCancelMatch";
+}
+
+export type RankFaction = "pirate" | "marine" | "government" | "east" | "west" | "south" | "north";
+export type RankedMode = "standard" | "wild";
+// casual 保留为旧客户端兼容值，语义等同狂野休闲；新客户端默认使用 casualStandard。
+export type MatchQueueKind = "ranked" | "rankedWild" | "casualStandard" | "casual" | "hex";
+
+export interface MsgSelectRankFaction extends MsgBase {
+  proto: "MsgSelectRankFaction";
+  faction: RankFaction;
+  /** 更换已选阵营时，明确确认清空本赛季排位进度。 */
+  resetRankProgress?: boolean;
+  mode?: RankedMode;
+  result?: boolean;
+  logStr?: string;
+  profile?: RankProfileSnapshot;
+  leaderboard?: RankLeaderboardItem[];
+  factionStandings?: FactionStanding[];
+  snapshotVersion?: number;
+  generatedAtUtc?: string;
+}
+
+export interface MsgEquipSeasonTitle extends MsgBase {
+  proto: "MsgEquipSeasonTitle";
+  title: string | null;
+  requestId?: string;
+  result?: boolean;
+  logStr?: string;
+  profiles?: Partial<Record<RankedMode, RankProfileSnapshot>>;
+  snapshots?: Array<{
+    mode: RankedMode;
+    profile: RankProfileSnapshot;
+    leaderboard: RankLeaderboardItem[];
+    factionStandings: FactionStanding[];
+    snapshotVersion: number;
+    generatedAtUtc: string;
+  }>;
 }
 
 // 单人测试模式：与机器人对战
@@ -294,6 +401,105 @@ export interface MsgEnterBotMatch extends MsgBase {
 export interface MsgMatchFound extends MsgBase {
   proto: "MsgMatchFound";
   opponentName: string;
+  queueKind?: MatchQueueKind;
+}
+
+export interface RankProfileSnapshot {
+  seasonTitles?: string[];
+  equippedSeasonTitle?: string | null;
+  seasonId: string;
+  seasonStartsAtUtc: string;
+  seasonEndsAtUtc: string;
+  placementGames: number;
+  placementRequired: number;
+  rankPoints: number;
+  faction: RankFaction | null;
+  tier: string;
+  division: number | null;
+  games: number;
+  wins: number;
+  losses: number;
+  highestRankPoints: number;
+  championLeaderNumbers?: string[];
+}
+
+export interface RankLeaderboardItem {
+  seasonTitles?: string[];
+  equippedSeasonTitle?: string | null;
+  rank: number;
+  factionRank: number;
+  displayName: string;
+  rankPoints: number;
+  faction: RankFaction;
+  tier: string;
+  division: number | null;
+  games: number;
+  wins: number;
+  winRate: number;
+  favoriteLeader?: string | null;
+  championLeaderNumbers?: string[];
+  isCurrentPlayer?: boolean;
+}
+
+export interface FactionStanding {
+  rank: number;
+  faction: RankFaction;
+  totalRankPoints: number;
+  playerCount: number;
+  games: number;
+  wins: number;
+}
+
+export interface RankPlayerSettlement {
+  isHunterSeason?: boolean;
+  account: string;
+  rankPointsBefore: number;
+  rankPointsAfter: number;
+  rankPointDelta: number;
+  baseRankPointDelta: number;
+  streakAdjustment: number;
+  winStreakEndedBounty: number;
+  endedWinStreak: number;
+  rankDifference: number;
+  rankDifferenceAdjustment: number;
+  rankProtectionAdjustment: number;
+  resultStreak: number;
+  won: boolean;
+  rankPointFormulaApplied: boolean;
+  faction: RankFaction;
+  tier: string;
+  division: number | null;
+  placementGames: number;
+  placementRequired: number;
+  placementCompleted: boolean;
+  winStreak: number;
+}
+
+export interface MsgRankSnapshot extends MsgBase {
+  proto: "MsgRankSnapshot";
+  mode?: RankedMode;
+  requestId?: string;
+  result?: boolean;
+  profile?: RankProfileSnapshot;
+  leaderboard?: RankLeaderboardItem[];
+  factionStandings?: FactionStanding[];
+  snapshotVersion?: number;
+  generatedAtUtc?: string;
+  error?: string;
+  retryable?: boolean;
+}
+
+export interface MsgRankResult extends MsgBase {
+  proto: "MsgRankResult";
+  mode?: RankedMode;
+  result?: RankPlayerSettlement;
+  profile?: RankProfileSnapshot;
+  leaderboard?: RankLeaderboardItem[];
+  factionStandings?: FactionStanding[];
+  snapshotVersion?: number;
+  generatedAtUtc?: string;
+  leaderboardError?: string;
+  error?: string;
 }
 
 // ── 房间码对战 ──────────────────────────────────────────────────────────
@@ -301,6 +507,7 @@ export interface MsgCreateRoom extends MsgBase {
   proto: "MsgCreateRoom";
   deck: string;
   deckName?: string;
+  hexMode?: boolean;
   roomCode?: string;  // 服务器返回的房间码
   result?: boolean;
   logStr?: string;
@@ -315,6 +522,7 @@ export interface MsgJoinRoom extends MsgBase {
   roomCode: string;
   deck: string;
   deckName?: string;
+  hexMode?: boolean;
   result?: boolean;
   logStr?: string;
   opponentName?: string;
@@ -327,6 +535,12 @@ export interface MsgPrepare extends MsgBase {
   proto: "MsgPrepare";
   IsPrepare?: boolean;
   deck?: string; // DeckMapper.ListToString 格式：卡号以逗号分隔
+}
+
+/** 对局页、卡牌资料及开场动画准备完毕；房间身份由服务端绑定会话复核。 */
+export interface MsgGamePrepared extends MsgBase {
+  proto: "MsgGamePrepared";
+  roomId: string;
 }
 
 export interface MsgGameStart extends MsgBase {
@@ -374,6 +588,15 @@ export interface MsgChatMsg extends MsgBase {
   type?: number; // 0=大厅, 1=房间, 2=游戏中
   Name?: string;
   Msg?: string;
+}
+
+export interface MsgGlobalAnnouncement extends MsgBase {
+  proto: "MsgGlobalAnnouncement";
+  content?: string;
+  kind?: "rankedStreak";
+  issuedAt?: number;
+  result?: boolean;
+  logStr?: string;
 }
 
 // 局内聊天（房间内：对战双方 + 观战者）。区别于大厅全局 MsgChatMsg。
@@ -428,9 +651,11 @@ export interface MsgOnlineCount extends MsgBase {
 export interface PlayerInfo {
   account: string;
   name: string;
+  championLeaderNumbers?: string[];
   status: "idle" | "matching" | "playing" | "spectating";
   roomId?: string | null;   // 对战中玩家所在的对局房间ID，供一键观战；无对局房间时为 null
   seatIndex?: 0 | 1 | null; // 对战中的座位，用于让一键观战保持被点击玩家为主视角
+  spectateMode?: SpectateMode | null;
 }
 
 // 客户端 → 服务器:请求在线玩家列表;服务器 → 客户端:返回列表
@@ -449,10 +674,14 @@ export type FriendPresenceStatus = PlayerInfo["status"] | "offline";
 export interface FriendInfo {
   account: string;
   name: string;
+  championLeaderNumbers?: string[];
   avatar: string;
   friendsSince: number;
   online: boolean;
   status: FriendPresenceStatus;
+  roomId?: string | null;
+  seatIndex?: 0 | 1 | null;
+  spectateMode?: SpectateMode | null;
 }
 
 export interface FriendRequestInfo {
@@ -470,6 +699,7 @@ export interface FriendSearchPlayer {
   account: string;
   name: string;
   avatar: string;
+  championLeaderNumbers?: string[];
   relationship: FriendRelationship;
   online: boolean;
   status: FriendPresenceStatus;
@@ -495,6 +725,8 @@ export interface MsgFriendSearch extends MsgBase {
 export interface MsgFriendRequest extends MsgBase {
   proto: "MsgFriendRequest";
   toAccount?: string;
+  /** 对局内快捷申请：由服务端按当前会话解析交战对手，不向客户端公开账号。 */
+  currentOpponent?: boolean;
   result?: boolean;
   autoAccepted?: boolean;
   logStr?: string;
@@ -523,8 +755,50 @@ export interface MsgFriendCancel extends MsgBase {
   logStr?: string;
 }
 
+export interface BlockedPlayerInfo {
+  account: string;
+  name: string;
+  createdAt: number;
+}
+
+export type PlayerReportCategory = "harassment" | "stalling" | "cheating" | "spam" | "other";
+
+export interface MsgPlayerSafety extends MsgBase {
+  proto: "MsgPlayerSafety";
+  action?: "list" | "block" | "unblock" | "report";
+  targetAccount?: string;
+  currentOpponent?: boolean;
+  category?: PlayerReportCategory;
+  description?: string;
+  requestId?: string;
+  caseId?: string;
+  blockedPlayers?: BlockedPlayerInfo[];
+  result?: boolean;
+  logStr?: string;
+}
+
 // ── Leader 排行榜 ─────────────────────────────────────────────────────
 export type LeaderboardPeriod = "7d" | "30d" | "all";
+export type LeaderFilterTier = "100" | "300" | "500" | "1000" | "3000" | "all";
+
+export interface LeaderChampionInfo {
+  displayName: string;
+}
+
+export interface LeaderChampionQueryStats {
+  games: number;
+  winRate: number;
+}
+
+/** 按 Leader 编号匿名查询当前“最强”称号的近 30 日总场次和原始胜率。 */
+export interface MsgLeaderChampionQuery extends MsgBase {
+  proto: "MsgLeaderChampionQuery";
+  leaderNumber: string;
+  result?: boolean;
+  error?: string;
+  generatedAtUtc?: string;
+  champion?: LeaderChampionQueryStats | null;
+}
 
 export interface LeaderLeaderboardItem {
   rank: number | null;
@@ -539,12 +813,16 @@ export interface LeaderLeaderboardItem {
   secondGames: number;
   secondWinRate: number | null;
   insufficientSample: boolean;
+  /** 当前全服最强使用者；按统一的近 30 日称号规则计算。 */
+  champion?: LeaderChampionInfo | null;
 }
 
-/** 客户端发送时只带 period；服务端回包附带聚合结果。 */
+/** 客户端分别发送统计周期与固定场次档位；服务端仍兼容旧客户端的 relaxed / standard 值。 */
 export interface MsgLeaderLeaderboard extends MsgBase {
   proto: "MsgLeaderLeaderboard";
   period: LeaderboardPeriod;
+  filterTier?: LeaderFilterTier;
+  requestId?: string;
   result?: boolean;
   error?: string;
   generatedAtUtc?: string;
@@ -562,22 +840,36 @@ export interface LeaderMatchupItem {
   losses: number | null;
   winRate: number | null;
   firstGames: number;
+  firstWins: number;
+  firstLosses: number;
   firstWinRate: number | null;
   secondGames: number;
+  secondWins: number;
+  secondLosses: number;
   secondWinRate: number | null;
   isMirror: boolean;
 }
 
-/** 点击榜单项后，查询该 Leader 对阵当前周期榜前十的统计。 */
+export interface LeaderStartingHandItem {
+  cardNumber: string;
+  games: number;
+  percentage: number;
+}
+
+/** 点击榜单项后，查询该 Leader 对阵当前周期榜前二十的统计及起手留牌数据。 */
 export interface MsgLeaderMatchups extends MsgBase {
   proto: "MsgLeaderMatchups";
   period: LeaderboardPeriod;
+  filterTier?: LeaderFilterTier;
+  requestId?: string;
   leaderNumber: string;
   result?: boolean;
   error?: string;
   generatedAtUtc?: string;
   sinceUtc?: string | null;
   items?: LeaderMatchupItem[];
+  startingHandSampleGames?: number;
+  startingHandItems?: LeaderStartingHandItem[];
 }
 
 export interface LeaderMatchupMatrixRow {
@@ -585,10 +877,12 @@ export interface LeaderMatchupMatrixRow {
   items: LeaderMatchupItem[];
 }
 
-/** 当前周期胜率榜前十五名的完整对阵矩阵。 */
+/** 当前筛选条件下胜率榜最多前二十名的完整对阵矩阵。 */
 export interface MsgLeaderMatchupMatrix extends MsgBase {
   proto: "MsgLeaderMatchupMatrix";
   period: LeaderboardPeriod;
+  filterTier?: LeaderFilterTier;
+  requestId?: string;
   result?: boolean;
   error?: string;
   generatedAtUtc?: string;
@@ -684,6 +978,7 @@ export interface MsgFriendlyRoom extends MsgBase {
   roomId: string;
   origin?: "roomCode" | "invite";
   roomCode?: string | null;
+  hexMode?: boolean;
   players: FriendlyPlayer[];
   scores: number[];
   state: "lobby" | "starting" | "playing";
@@ -720,8 +1015,12 @@ export interface MsgFriendlyLeft extends MsgBase {
 export type GameActionType =
   | "ChooseFirstPlayer" // { goFirst: boolean }
   | "Mulligan"          // { redraw: boolean }
+  | "ChooseHex"         // { roundId: string, hexId: number }
+  | "RefreshHex"        // { roundId: string, candidateIndex: number, expectedHexId: number }
   | "PlayCard"          // { handIndex: number, freeCost?: boolean }
   | "AttachDon"         // { targetId: "leader" | cardId, count: number }
+  | "DetachAllDon"      // { characterId: cardId }，屠宰场：移除目标角色的全部附加咚
+  | "UndoAttachDon"     // { operationId: string }，只能撤回服务端快照确认的最近一次贴咚
   | "Attack"            // { attackerId: cardId | "leader", targetIsLeader: boolean, targetId?: cardId }
   | "DeclareBlocker"    // { blockerId: cardId }
   | "PassBlock"         // {}
@@ -730,6 +1029,10 @@ export type GameActionType =
   | "UseEffect"         // { sourceId, effectKey, ... }
   | "EndTurn"           // {}
   | "ConfirmDamage"     // {}
+  | "PlayerActivity"    // { kind?: "presence" }，仅用于挂机提醒中的明确在线确认
+  | "RequestTurnExtension" // {}：每位玩家每局一次，当前回合最多加至 8 分钟
+  | "RequestDraw"       // { description: string }
+  | "RespondDraw"       // { accept: boolean }
   | "DebugAddCard"      // { cardNumber: string }  ← GM 调试：加牌到手牌
   | "DebugAddLife"      // { cardNumber: string; target: "self" | "opponent" } ← GM 调试：置于生命区顶端
   | "DebugAddDon"       // { count: number }       ← GM 调试：加咚
@@ -749,30 +1052,62 @@ export interface FieldCardSnapshot {
   powerCurrent: number;
   cost: number;              // 当前费用（含持续光环，如 OP16-080 对方回合 +1）
   attachedDon: number;
+  canDetachAllDon?: boolean; // 屠宰场：当前是否可移除该角色的全部附加咚
   gainedKeywords: string[];
+  effectsNullified: boolean; // 当前角色效果是否处于无效状态
   cannotActivateNextReset: boolean;
   cannotBeRested: boolean;   // 无法被效果转为休息状态
   activatedUsedThisTurn: boolean;  // 本回合【启动主要】【每回合1次】是否已用（已用则隐藏启动按钮）
+  oncePerTurnEffectAvailable: boolean; // 至少一项【每回合1次】效果本回合仍可发动
   turnPlayed: number;
   canAttack: boolean;        // 该角色当前是否可发起攻击（后端权威，对手/非我方回合恒 false）
   cannotAttack: boolean;     // 该角色是否存在明确的“无法攻击”状态（不含横置、新登场等普通条件）
+  canActivateEffect?: boolean; // 该角色当前是否可发动【启动主要】（后端权威；旧回放可缺失）
 }
 
 /** 服务器推送的单方玩家快照（已按视角脱敏） */
+export interface PlayerRankIdentitySnapshot {
+  seasonTitles?: string[];
+  equippedSeasonTitle?: string | null;
+  faction: RankFaction;
+  tier: string;
+  division: number | null;
+  placementGames: number;
+  placementRequired: number;
+}
+
+/** 海克斯模式允许的舞台快照；普通模式通常只有一项，海克斯效果可扩展至两项。 */
+export interface StageSnapshot {
+  id: string;
+  number: string;
+  tapped: boolean;
+  canActivateEffect: boolean;
+  activatedUsedThisTurn: boolean;
+  oncePerTurnEffectAvailable: boolean;
+}
+
 export interface PlayerSnapshot {
   name: string;
+  /** 所有对局类型均可展示佩戴称号；缺失时兼容旧快照。 */
+  equippedSeasonTitle?: string | null;
+  /** 仅排位对局携带；旧回放及其他对局类型缺失时不展示。 */
+  rankIdentity?: PlayerRankIdentitySnapshot | null;
   /** 旧回放没有该字段时回退经典卡背。 */
   cardBackId?: string;
   /** 该玩家卡组公开的卡面选择；旧回放缺失时使用正画。 */
   spriteMap?: Record<string, string>;
+  handCardIds?: string[];     // 仅自己有内容；用于本地拖动排序时维持同名牌身份
   handCardNumbers: string[];  // 仅自己有内容
   handCardCosts: number[];    // 每张手牌的有效费用（含静态减费），仅自己有内容；对手为空
   handCardCounters: number[]; // 每张手牌的有效反击值（含静态光环），仅自己有内容；对手为空
+  handCardCanPlay?: boolean[]; // 每张手牌当前是否可从主要阶段打出（后端权威；旧回放可缺失）
   handCount: number;
   fieldCards: FieldCardSnapshot[];
   stageNumber: string | null;
   stageId: string | null;
   stageTapped: boolean;
+  /** 新快照使用数组承载至多两个舞台；旧回放仍可只携带上方扁平字段。 */
+  stages?: StageSnapshot[];
   trashNumbers: string[];
   deckCount: number;
   lifeCount: number;
@@ -780,17 +1115,26 @@ export interface PlayerSnapshot {
   lifeFaceUp?: { faceUp: boolean; number: string | null }[];
   leaderId: string;
   leaderNumber: string;
+  /** 当且仅当该玩家正使用自己全服最强的 Leader 时返回对应卡号。 */
+  championLeaderNumber?: string | null;
   leaderTapped: boolean;
   leaderPower: number;
   leaderAttachedDon: number;
   leaderGainedKeywords: string[]; // 领袖动态获得的关键词（含持续效果）
   leaderCanAttack: boolean;   // 领袖当前是否可发起攻击（后端权威）
   leaderCannotAttack: boolean; // 领袖是否存在明确的“无法攻击”状态
+  leaderEnterEffectNullified: boolean; // 【登场时】效果当前被无效
+  leaderCanActivateEffect?: boolean; // 领袖当前是否可发动【启动主要】（后端权威）
+  stageCanActivateEffect?: boolean;  // 舞台当前是否可发动【启动主要】（后端权威）
   leaderActivatedUsedThisTurn: boolean;  // 领袖【启动主要】【每回合1次】本回合是否已用
   stageActivatedUsedThisTurn: boolean;   // 舞台【启动主要】【每回合1次】本回合是否已用
+  leaderOncePerTurnEffectAvailable: boolean; // 领袖的【每回合1次】效果本回合仍可发动
+  stageOncePerTurnEffectAvailable: boolean;  // 舞台的【每回合1次】效果本回合仍可发动
   costActive: number;
   costRest: number;
   costAttached: number;
+  /** 旧快照缺失时按 0；表示下个重置阶段仍不会活跃的咚!!数量。 */
+  costNextResetInactive?: number;
   donDeckCount: number;
   hasReDraw: boolean;
   mulliganDone: boolean;
@@ -799,6 +1143,8 @@ export interface PlayerSnapshot {
 /** 服务器推送的 prompt 信息 */
 export interface PromptSnapshot {
   promptId: string;
+  /** 该选择操作的稳定身份；旧服务端缺失时回退 promptId。 */
+  operationId?: string;
   kind: string;
   text: string;
   validChoices: string[];
@@ -818,34 +1164,153 @@ export interface BattleSnapshot {
   defenderBonus: number;
 }
 
-/** 对局结束后附带的回放手牌变化帧；实时对局与观战不会收到内容。 */
+/** 对局结束后附带的回放隐藏区变化帧；实时对局与观战不会收到内容。 */
 export interface ReplayHandFrameSnapshot {
   tick: number;
   myCardNumbers: string[];
   opponentCardNumbers: string[];
+  /** 旧回放帧不含生命区字段，客户端保持卡背显示。 */
+  myLifeCardNumbers?: string[];
+  opponentLifeCardNumbers?: string[];
+}
+
+export type HexTierSnapshot = "Silver" | "Gold" | "Rainbow";
+export type HexTierLabelSnapshot = "银色" | "金色" | "棱彩";
+
+export interface HexDefinitionSnapshot {
+  id: number;
+  name: string;
+  tier: HexTierSnapshot;
+  /** 新服务端提供权威玩家文案；旧快照缺失时客户端按稳定 tier 值回退。 */
+  tierLabel?: HexTierLabelSnapshot;
+  description: string;
+  /** 新版权威快照标记该项由质变授予；名称已由服务端添加“质变-”前缀。 */
+  grantedByTransmutation?: boolean;
+}
+
+export interface HexDraftSnapshot {
+  roundId: string;
+  ownTurnNumber: 1 | 3 | 6;
+  tier: HexTierSnapshot;
+  tierLabel?: HexTierLabelSnapshot;
+  deadlineUtc: string;
+  /** activeDraft 本身仅下发给拥有者；兼容旧快照时仍允许 null。 */
+  candidates: HexDefinitionSnapshot[] | null;
+  myLocked: boolean;
+  mySelectedHexId: number | null;
+  /** 旧快照兼容：仅表示旧版整轮一次刷新，或新版尚未使用第一次刷新。 */
+  refreshAvailable: boolean;
+  /** 旧快照兼容：新版中表示最近一次刷新的槽位。 */
+  refreshedCandidateIndex: number | null;
+  /** 修订版 3 起由服务端下发；旧房间/旧快照缺失时客户端回退到旧字段。 */
+  refreshRemaining?: number;
+  refreshAvailableByCandidate?: boolean[];
+  refreshedCandidateIndices?: number[];
+}
+
+export interface HexModeSnapshot {
+  enabled: true;
+  /** 服务端在建局时锁定；旧快照可缺失，客户端无需据此计算规则。 */
+  rulesRevision?: number;
+  /** 双方共享的第 1/3/6 回合品质序列，允许重复。 */
+  tierSequence: HexTierSnapshot[];
+  draftOwnTurns: number[];
+  draftResolving: boolean;
+  myOwned: HexDefinitionSnapshot[];
+  opponentOwned: HexDefinitionSnapshot[];
+  activeDraft: HexDraftSnapshot | null;
+}
+
+export type GameCinematicSide = "self" | "opponent";
+
+export interface GameCinematicPhraseEvent {
+  eventId: string;
+  sourceSeat: 0 | 1;
+  displaySide: GameCinematicSide;
+  displayName: string;
+  id: string;
+  name: string;
+  text: string;
+  rarity: "common" | "rare" | "epic" | "legendary";
+  styleToken: string;
+}
+
+export interface GameCinematicTerminalEvent {
+  eventId: string;
+  winnerSeat: 0 | 1 | null;
+  loserSeat: 0 | 1 | null;
+  winnerSide: GameCinematicSide | null;
+  loserSide: GameCinematicSide | null;
+  reason: string;
+  victory: GameCinematicPhraseEvent | null;
+}
+
+/** 服务端随权威状态重复携带；客户端必须按稳定 eventId 去重。 */
+export interface GameCinematicSnapshot {
+  matchId: string;
+  openingEvents: GameCinematicPhraseEvent[];
+  terminal: GameCinematicTerminalEvent | null;
 }
 
 /** 服务器 → 双方：权威游戏状态快照 */
 export interface MsgGameState extends MsgBase {
+  roomId?: string;
   proto: "MsgGameState";
+  /** 生成该快照时的服务端 UTC 时间，供客户端校准权威倒计时。 */
+  serverNowUtc?: string;
+  /** 本局锁定的卡牌效果规则版本；断线恢复和回放期间保持不变。 */
+  rulesetId?: string;
   tick: number;
   my: PlayerSnapshot;
   opponent: PlayerSnapshot;
   phase: string;
   currentTurn: boolean;
+  /** 服务端权威撤回资格；刷新/重连后仍由最新快照恢复。 */
+  canUndoAttachDon?: boolean;
+  /** 当前可撤回贴咚的服务端单调操作令牌；撤回请求必须原样回传。 */
+  undoAttachDonOperationId?: string | null;
+  undoAttachDonCount?: number;
+  undoAttachDonDepth?: number;
   turnCount: number;
   firstPlayer: number;
   firstPlayerChosen: boolean;
+  openingStage?: "NotStarted" | "ResolvingOpeningEffects" | "WaitingOpeningPrompt" | "RollingDice" | "WaitingFirstPlayerChoice" | "Mulligan" | "HexDraft" | "Playing";
   isFirstPlayer: boolean;
   canChooseFirstPlayer: boolean;
   diceWinnerIsMe: boolean;
+  startingPlayerChoiceDeadlineUtc?: string | null;
   startingDiceRolls: Array<{ my: number; opponent: number; tie: boolean }>;
   mulliganBothDone: boolean;
   mulliganDeadlineUtc?: string | null;
+  openingPreparationDeadlineUtc?: string | null;
+  operationClockEnabled?: boolean;
+  myOperationTimeMs?: number;
+  opponentOperationTimeMs?: number;
+  myTurnOperationTimeMs?: number;
+  opponentTurnOperationTimeMs?: number;
+  myTurnExtensionUsed?: boolean;
+  opponentTurnExtensionUsed?: boolean;
+  inactivityActive?: "my" | "opponent" | null;
+  inactivityWarningActive?: boolean;
+  inactivityLossRemainingMs?: number;
+  inactivitySyncUtc?: string | null;
+  operationClockActive?: "my" | "opponent" | null;
+  operationClockSyncUtc?: string | null;
+  operationClockPaused?: boolean;
+  matchKind?: "Ranked" | "RankedWild" | "Casual" | "CasualStandard" | "CasualWild" | "Matchmaking" | "RoomCode" | "Friendly" | "Bot" | "Hex" | "UnknownHuman";
+  hexState?: HexModeSnapshot | null;
+  cinematic?: GameCinematicSnapshot | null;
   isGameOver: boolean;
+  isDraw?: boolean;
   winnerIsMe: boolean;
   gameOverReason: string;
+  drawRequestPendingFromMe?: boolean;
+  drawRequestPendingFromOpponent?: boolean;
+  drawRequestDescription?: string | null;
+  drawRequestRejectionCount?: number;
+  drawRequestRejectionLimit?: number;
   viewerKind: "player" | "spectator";
+  spectatorHandVisible?: boolean;
   /** 对应触发本次状态变化的客户端请求；无客户端请求时为空。 */
   requestId?: string | null;
   lastAction: string;
@@ -856,7 +1321,7 @@ export interface MsgGameState extends MsgBase {
   logLines?: string[];
   /** 自上一份快照以来进入解析的卡牌效果；按实际结算顺序排列。 */
   effectActivations?: EffectActivationSnapshot[];
-  /** 仅终局玩家快照携带，用于回放时明示双方手牌。 */
+  /** 仅终局玩家快照携带，用于回放时明示双方手牌与生命区。 */
   replayHands?: ReplayHandFrameSnapshot[] | null;
   pendingPrompt: PromptSnapshot | null;
   battle: BattleSnapshot | null;
@@ -887,6 +1352,8 @@ export interface RevealSnapshot {
 
 /** 卡牌进入效果解析时下发的瞬时表现事件。 */
 export interface EffectActivationSnapshot {
+  /** 服务端确定性效果执行标识；旧回放可缺失。 */
+  executionId?: string;
   sourceId: string;
   cardNumber: string;
   trigger: string;
@@ -902,10 +1369,14 @@ export interface MsgPromptResponse extends MsgBase {
 }
 
 /** 客户端 → 服务器：申请观战 */
+export type SpectateMode = "open" | "closed" | "friends" | "password";
+
 export interface MsgSpectateRoom extends MsgBase {
   proto: "MsgSpectateRoom";
   roomId: string;
   viewPlayerIndex?: 0 | 1;
+  spectateCode?: string;
+  spectatorHandVisible?: boolean;
   result?: boolean;
   logStr?: string;
 }
@@ -917,10 +1388,61 @@ export interface MsgLeaveSpectate extends MsgBase {
   logStr?: string;
 }
 
-/** 服务端 → 对战双方：当前观战者名称列表 */
+/** 服务端 → 对战双方/观战者：当前观战者名称列表 */
 export interface MsgSpectatorList extends MsgBase {
   proto: "MsgSpectatorList";
   spectators: string[];
+  /** 仅对战玩家会收到用于管理观战席的详情，观战者不会收到。 */
+  details?: Array<{
+    account: string;
+    name: string;
+    viewingYou: boolean;
+    handVisible: boolean;
+  }>;
+}
+
+export interface MsgUpdateSpectateSettings extends MsgBase {
+  proto: "MsgUpdateSpectateSettings";
+  mode: SpectateMode;
+  handsPublic: boolean;
+  regenerateCode?: boolean;
+  spectateCode?: string | null;
+  result?: boolean;
+  logStr?: string;
+}
+
+export interface MsgSpectatorHandRequest extends MsgBase {
+  proto: "MsgSpectatorHandRequest";
+  requestId: string;
+  spectatorAccount: string;
+  spectatorName: string;
+}
+
+export interface MsgSpectatorHandStatus extends MsgBase {
+  proto: "MsgSpectatorHandStatus";
+  status: "pending" | "approved" | "denied";
+  logStr?: string;
+  retryAfterMs?: number;
+}
+
+export interface MsgSpectatorHandResponse extends MsgBase {
+  proto: "MsgSpectatorHandResponse";
+  requestId?: string;
+  result?: boolean;
+  accepted?: boolean;
+  logStr?: string;
+}
+
+export interface MsgKickSpectator extends MsgBase {
+  proto: "MsgKickSpectator";
+  spectatorAccount: string;
+  result?: boolean;
+  logStr?: string;
+}
+
+export interface MsgSpectatorKicked extends MsgBase {
+  proto: "MsgSpectatorKicked";
+  logStr?: string;
 }
 
 /** 服务端 → 客户端：动作被拒绝（不发对手） */
@@ -928,6 +1450,21 @@ export interface MsgActionRejected extends MsgBase {
   proto: "MsgActionRejected";
   reason: string;
   requestId?: string | null;
+}
+
+/** 服务端 → 客户端：恢复存储不可用时，对局进入只读安全暂停。 */
+export interface MsgGameRecoveryPaused extends MsgBase {
+  proto: "MsgGameRecoveryPaused";
+  roomId: string;
+  reason: string;
+  message: string;
+}
+
+/** 服务端 → 客户端：请求被限流；客户端不得自行重试有副作用的操作。 */
+export interface MsgRateLimited extends MsgBase {
+  proto: "MsgRateLimited";
+  scope: string;
+  retryAfterMs: number;
 }
 
 /** 客户端 → 服务器：游戏动作请求 */
@@ -944,16 +1481,160 @@ export interface MsgRequestState extends MsgBase {
 }
 
 export type FeedbackCategory = "bug" | "suggestion";
+export type FeedbackDisconnectCategory =
+  | "unknown"
+  | "normal"
+  | "going_away"
+  | "abnormal"
+  | "session_replaced"
+  | "timeout"
+  | "network"
+  | "maintenance"
+  | "access_revoked"
+  | "websocket_error"
+  | "other";
 
-/** 游戏内反馈（客户端 → 服务器；服务端回执带 result/path） */
+/** 客户端提供的非权威、白名单化排障证据；服务端会再次裁剪和校验。 */
+export interface ClientFeedbackEvidenceV1 {
+  schema: "grandumi.feedback.client.v1";
+  capturedAtUtc: string;
+  client: {
+    version: string;
+    commit: string;
+    context: "lobby" | "game";
+  };
+  connection: {
+    state: string;
+    endpointHost: string;
+    connectionGeneration: number;
+    reconnectCount: number;
+    endpointFailureCount: number;
+    handshakeMs: number | null;
+    rttMs: number | null;
+    rttP95Ms: number | null;
+    actionRoundTripMs: number | null;
+    actionRoundTripP95Ms: number | null;
+    disconnectCategory: FeedbackDisconnectCategory;
+    stateDeltaEnabled: boolean;
+    stateDeltaCount: number;
+    fullStateCount: number;
+    maxMessageQueueDepth: number;
+  };
+  viewport: {
+    width: number;
+    height: number;
+    orientation: "portrait" | "landscape";
+    devicePixelRatio: number;
+    standalone: boolean;
+    online: boolean;
+  };
+}
+
+/** 游戏内反馈；新客户端发送结构化证据，clientInfo 仅保留用于兼容旧客户端。 */
 export interface MsgBugReport extends MsgBase {
   proto: "MsgBugReport";
   category: FeedbackCategory; // bug 或优化建议
   description: string;   // 问题描述
-  clientInfo: string;    // 客户端全量信息（JSON 字符串）
+  clientEvidence?: ClientFeedbackEvidenceV1;
+  clientInfo?: string;
+  requestId?: string;
   result?: boolean;      // 服务端回执：是否保存成功
-  path?: string;         // 服务端回执：保存路径
+  replayId?: string;     // 可选：关联的云回放 ID
+  feedbackId?: string;   // 服务端生成的公开反馈 ID
+  caseId?: string;
+  replayLinked?: boolean;
   error?: string;        // 服务端回执：失败原因
+}
+
+export type CloudReplaySharePolicy = "masked" | "final_hands" | "full_timeline";
+export type CloudReplayOutcome = "win" | "loss" | "draw";
+
+export interface CloudReplayListItem {
+  replayId: string;
+  startedAt: number;
+  completedAt: number;
+  myName: string;
+  opponentName: string;
+  myLeader: string;
+  opponentLeader: string;
+  winnerIsMe: boolean;
+  isDraw: boolean;
+  gameOverReason: string;
+  turnCount: number;
+  matchKind: string;
+  bookmarked: boolean;
+  shared: boolean;
+  sharePolicy: CloudReplaySharePolicy;
+  feedbackCount: number;
+  sizeBytes: number;
+  runtimeArtifactId: string;
+}
+
+export interface MsgCloudReplayList extends MsgBase {
+  proto: "MsgCloudReplayList";
+  requestId: string;
+  opponent?: string;
+  outcome?: CloudReplayOutcome;
+  matchKind?: string;
+  bookmarkedOnly?: boolean;
+  from?: number;
+  to?: number;
+  offset?: number;
+  limit?: number;
+  result?: boolean;
+  items?: CloudReplayListItem[];
+  total?: number;
+  usedBytes?: number;
+  quotaBytes?: number;
+  retentionDays?: number;
+  maximumReplays?: number;
+  errorCode?: string;
+  logStr?: string;
+}
+
+export interface MsgCloudReplayLoad extends MsgBase {
+  proto: "MsgCloudReplayLoad";
+  requestId: string;
+  replayId: string;
+  shareToken?: string;
+  result?: boolean;
+  sharedAccess?: boolean;
+  sharePolicy?: CloudReplaySharePolicy;
+  document?: unknown;
+  errorCode?: string;
+  logStr?: string;
+}
+
+export interface MsgCloudReplayBookmark extends MsgBase {
+  proto: "MsgCloudReplayBookmark";
+  requestId: string;
+  replayId: string;
+  bookmarked: boolean;
+  result?: boolean;
+  errorCode?: string;
+  logStr?: string;
+}
+
+export interface MsgCloudReplayShare extends MsgBase {
+  proto: "MsgCloudReplayShare";
+  requestId: string;
+  replayId: string;
+  enabled: boolean;
+  sharePolicy: CloudReplaySharePolicy;
+  result?: boolean;
+  shared?: boolean;
+  shareToken?: string;
+  errorCode?: string;
+  logStr?: string;
+}
+
+export interface MsgCloudReplayDelete extends MsgBase {
+  proto: "MsgCloudReplayDelete";
+  requestId: string;
+  replayId: string;
+  result?: boolean;
+  errorCode?: string;
+  logStr?: string;
 }
 
 /** 服务器 → 客户端：对手断线通知 */
@@ -967,11 +1648,499 @@ export interface MsgPlayerReconnected extends MsgBase {
   proto: "MsgPlayerReconnected";
 }
 
+/** 旧规则对局结束后通知玩家：后续对局已切换至新版卡效。 */
+export interface MsgRulesetUpdated extends MsgBase {
+  proto: "MsgRulesetUpdated";
+  previousRulesetId: string;
+  currentRulesetId: string;
+  description?: string;
+  changedCards?: string[];
+  logStr?: string;
+}
+
+export interface CardRulesetSummary {
+  id: string;
+  baseRulesetId?: string | null;
+  description?: string;
+  changedCards: string[];
+  active: boolean;
+}
+
+/** 管理员查询/激活卡效规则后的状态。 */
+export interface MsgRulesetState extends MsgBase {
+  proto: "MsgRulesetState";
+  activeRulesetId?: string;
+  availableRulesets?: CardRulesetSummary[];
+  activeRoomCounts?: Record<string, number>;
+  result?: boolean;
+  logStr?: string;
+}
+
+export interface MsgActivateRuleset extends MsgBase {
+  proto: "MsgActivateRuleset";
+  rulesetId: string;
+}
+
+export type AdminDeploymentEnvironment = "test" | "production";
+export type AdminDeploymentState = "idle" | "queued" | "running" | "success" | "failed" | "unavailable";
+
+export interface OnlinePlayerPeakPoint {
+  date: string;
+  peak: number;
+}
+
+export interface DailyMatchCountPoint {
+  date: string;
+  count: number;
+}
+
+export interface DailyActivePlayerPoint {
+  date: string;
+  count: number;
+}
+
+export interface AdminStorageSnapshot {
+  healthy: boolean;
+  reason: string;
+  totalBytes: number;
+  availableBytes: number;
+  updatedAt: number;
+  refreshIntervalHours: number;
+}
+
+export interface AdminPlayerSummary {
+  account: string;
+  displayName: string;
+  createdAt: number;
+  lastLoginAt: number;
+  hasPassword: boolean;
+  online: boolean;
+  qqBound?: boolean;
+  /** 仅管理员协议返回；始终为字符串，禁止转为 JS number。 */
+  qq?: string | null;
+  qqMasked?: string | null;
+  qqCurrentlyWhitelisted?: boolean;
+  qqBoundAt?: number | null;
+  bindingRevision?: number;
+  matchKind?: "account_exact" | "nickname_exact" | "qq_exact" | "fuzzy";
+}
+
+export interface QqAccountBindingStatus {
+  bound: boolean;
+  maskedQq?: string | null;
+  currentlyWhitelisted: boolean;
+  boundAt?: number | null;
+  revision?: number;
+}
+
+export interface QqWhitelistUpdateEvent {
+  id: number;
+  eventKey: string;
+  outcome: "success" | "failure";
+  source: string;
+  operationKey?: string | null;
+  /** Unix 毫秒，与账号、审计和导入时间字段保持一致。 */
+  occurredAt: number;
+  /** UTC+8 自然整点对应的 Unix 秒，仅用于同步任务关联。 */
+  scheduledHour?: number | null;
+  version?: number | null;
+  memberCount?: number | null;
+  addedCount?: number | null;
+  removedCount?: number | null;
+  removedBoundCount?: number | null;
+  error?: string | null;
+}
+
+export interface MsgQqWhitelistStatus extends MsgBase {
+  proto: "MsgQqWhitelistStatus";
+  result?: boolean;
+  logStr?: string;
+  initialized?: boolean;
+  version?: number;
+  memberCount?: number;
+  importedAt?: number | null;
+  importedBy?: string | null;
+  duplicateCount?: number;
+  addedCount?: number;
+  removedCount?: number;
+  removedBoundCount?: number;
+  maxImportBytes?: number;
+  maxImportMembers?: number;
+  bootstrapOnly?: boolean;
+  canImport?: boolean;
+  recentUpdates?: QqWhitelistUpdateEvent[];
+  accountBinding?: QqAccountBindingStatus;
+}
+
+export interface MsgQqWhitelistImport extends MsgBase {
+  proto: "MsgQqWhitelistImport";
+  json?: string;
+  result?: boolean;
+  logStr?: string;
+  version?: number;
+  importedAt?: number;
+  memberCount?: number;
+  duplicateCount?: number;
+  addedCount?: number;
+  removedCount?: number;
+  removedBoundCount?: number;
+  requiresQqBinding?: boolean;
+}
+
+export interface MsgQqAccessDenied extends MsgBase {
+  proto: "MsgQqAccessDenied";
+  result?: false;
+  logStr?: string;
+  currentGameContinues?: boolean;
+}
+
+export interface MsgQqBindingChanged extends MsgBase {
+  proto: "MsgQqBindingChanged";
+  result?: boolean;
+  bound?: boolean;
+  qqMasked?: string | null;
+  currentlyWhitelisted?: boolean;
+  logStr?: string;
+}
+
+export interface AdminDeploymentStatus {
+  environment: AdminDeploymentEnvironment;
+  state: AdminDeploymentState;
+  targetCommit?: string | null;
+  deployedCommit?: string | null;
+  message: string;
+  updatedAt?: number | null;
+}
+
+export interface MsgAdminOperations extends MsgBase {
+  proto: "MsgAdminOperations";
+  result?: boolean;
+  logStr?: string;
+  currentCommit?: string;
+  deploymentAvailable?: boolean;
+  onlineCount?: number | null;
+  peaks7?: OnlinePlayerPeakPoint[];
+  peaks30?: OnlinePlayerPeakPoint[];
+  dailyActive7?: DailyActivePlayerPoint[];
+  dailyActive30?: DailyActivePlayerPoint[];
+  playerTrafficUpdatedAt?: number | null;
+  matches7?: DailyMatchCountPoint[];
+  matches30?: DailyMatchCountPoint[];
+  matchesUpdatedAt?: number | null;
+  storage?: AdminStorageSnapshot | null;
+  test?: AdminDeploymentStatus;
+  production?: AdminDeploymentStatus;
+}
+
+export interface MsgAdminDeploy extends MsgBase {
+  proto: "MsgAdminDeploy";
+  environment: AdminDeploymentEnvironment;
+  requestId?: string;
+  challengeId?: string;
+  confirmationToken?: string;
+}
+
+export interface AdminHexCatalogEntry {
+  id: number;
+  name: string;
+  description: string;
+  tier: HexTierSnapshot;
+  activeTier: HexTierSnapshot;
+  alternative: boolean;
+}
+
+export interface AdminHexCatalogDeploymentStatus {
+  environment: AdminDeploymentEnvironment;
+  state: AdminDeploymentState;
+  targetDigest?: string | null;
+  message: string;
+  updatedAt?: number | null;
+}
+
+export interface AdminHexCatalogEnvironmentState {
+  environment: AdminDeploymentEnvironment;
+  activeRevision: number;
+  activeDigest: string;
+  activePublishedAt?: number | null;
+  activePublishedBy?: string | null;
+  draftRevision: number;
+  baseActiveRevision: number;
+  baseActiveDigest: string;
+  draftDigest: string;
+  draftSavedAt?: number | null;
+  draftSavedBy?: string | null;
+  entries: AdminHexCatalogEntry[];
+  deployment: AdminHexCatalogDeploymentStatus;
+}
+
+export interface MsgAdminHexCatalog extends MsgBase {
+  proto: "MsgAdminHexCatalog";
+  action?: "get" | "save" | "publish";
+  environment?: AdminDeploymentEnvironment;
+  requestId?: string;
+  expectedDraftRevision?: number;
+  expectedActiveRevision?: number;
+  draftRevision?: number;
+  draftDigest?: string;
+  tiers?: Array<{ id: number; tier: HexTierSnapshot }>;
+  challengeId?: string;
+  confirmationToken?: string;
+  result?: boolean;
+  errorCode?: string;
+  logStr?: string;
+  replayed?: boolean;
+  deploymentAvailable?: boolean;
+  test?: AdminHexCatalogEnvironmentState;
+  production?: AdminHexCatalogEnvironmentState;
+}
+
+export type OperationsCaseStatus =
+  | "new" | "triaged" | "investigating" | "actioned"
+  | "resolved" | "rejected" | "appealed" | "closed";
+export type OperationsPenaltyKind = "mute" | "match_ban" | "spectate_chat_ban";
+
+export interface OperationsCaseSummary {
+  caseId: string;
+  source: string;
+  category: string;
+  title: string;
+  status: OperationsCaseStatus;
+  priority: "low" | "normal" | "high" | "critical";
+  reporterAccount?: string | null;
+  subjectAccount?: string | null;
+  relatedAccount?: string | null;
+  roomId?: string | null;
+  replayId?: string | null;
+  assignee?: string | null;
+  disposition?: string | null;
+  createdAt: number;
+  firstActionAt?: number | null;
+  updatedAt: number;
+  evidenceCount: number;
+  activePenaltyCount: number;
+}
+
+export interface OperationsPenalty {
+  penaltyId: string;
+  caseId: string;
+  account: string;
+  kind: OperationsPenaltyKind;
+  reason: string;
+  operatorAccount: string;
+  source: string;
+  startsAt: number;
+  expiresAt: number;
+  revokedAt?: number | null;
+  revokedBy?: string | null;
+  revokeReason?: string | null;
+}
+
+export interface OperationsCaseDetail {
+  summary: OperationsCaseSummary;
+  description: string;
+  externalEventId?: string | null;
+  appealText?: string | null;
+  evidence: Array<{ id: number; type: string; payloadJson: string; createdAt: number; expiresAt?: number | null }>;
+  events: Array<{
+    id: number; eventType: string; fromStatus?: string | null; toStatus?: string | null;
+    actorAccount: string; source: string; requestId?: string | null; note: string; createdAt: number;
+  }>;
+  penalties: OperationsPenalty[];
+}
+
+export interface OperationsCaseMetrics {
+  total: number;
+  awaitingFirstAction: number;
+  firstActionP90Ms?: number | null;
+  byStatus: Record<string, number>;
+}
+
+export interface PrivilegedAuditEntry {
+  id: number;
+  actorAccount: string;
+  source: string;
+  operation: string;
+  target?: string | null;
+  requestId: string;
+  result: string;
+  detailJson: string;
+  createdAt: number;
+  previousHash: string;
+  eventHash: string;
+}
+
+export interface ConsistencyFinding {
+  id: number;
+  scope: string;
+  findingKey: string;
+  status: string;
+  severity: string;
+  authoritativeJson: string;
+  observedJson: string;
+  repairAction: string;
+  lastError?: string | null;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  resolvedAt?: number | null;
+}
+
+export interface ConsistencyDoctorSnapshot {
+  checkedAt: number;
+  processed: number;
+  succeeded: number;
+  retried: number;
+  openFindings: number;
+  outboxCounts: Record<string, number>;
+  schemas: Array<{
+    name: string; path: string; exists: boolean; healthy: boolean; integrity: string;
+    userVersion: number; migrationTables: string[]; sizeBytes: number; lastWriteAt?: number | null;
+  }>;
+}
+
+export interface MsgOperationsCases extends MsgBase {
+  proto: "MsgOperationsCases";
+  result?: boolean;
+  errorCode?: string;
+  logStr?: string;
+  requestId?: string;
+  status?: string;
+  source?: string;
+  assignee?: string;
+  account?: string;
+  offset?: number;
+  limit?: number;
+  canManage?: boolean;
+  items?: OperationsCaseSummary[];
+  total?: number;
+  metrics?: OperationsCaseMetrics | null;
+}
+
+export interface MsgOperationsCaseDetail extends MsgBase {
+  proto: "MsgOperationsCaseDetail";
+  result?: boolean;
+  errorCode?: string;
+  logStr?: string;
+  requestId?: string;
+  caseId?: string;
+  canManage?: boolean;
+  detail?: OperationsCaseDetail;
+}
+
+export interface MsgOperationsCaseUpdate extends MsgBase {
+  proto: "MsgOperationsCaseUpdate";
+  result?: boolean;
+  errorCode?: string;
+  logStr?: string;
+  requestId: string;
+  caseId?: string;
+  toStatus?: OperationsCaseStatus;
+  assignee?: string;
+  disposition?: string;
+  note?: string;
+  detail?: OperationsCaseDetail;
+}
+
+export interface MsgOperationsCaseAppeal extends MsgBase {
+  proto: "MsgOperationsCaseAppeal";
+  result?: boolean;
+  errorCode?: string;
+  logStr?: string;
+  requestId: string;
+  caseId?: string;
+  appealText?: string;
+  detail?: OperationsCaseDetail;
+}
+
+export interface MsgOperationsPenalty extends MsgBase {
+  proto: "MsgOperationsPenalty";
+  result?: boolean;
+  errorCode?: string;
+  logStr?: string;
+  requestId: string;
+  action?: "apply" | "revoke";
+  caseId?: string;
+  account?: string;
+  kind?: OperationsPenaltyKind;
+  expiresAt?: number;
+  reason?: string;
+  penaltyId?: string;
+  penalty?: OperationsPenalty;
+}
+
+export interface MsgPrivilegedAudit extends MsgBase {
+  proto: "MsgPrivilegedAudit";
+  result?: boolean;
+  errorCode?: string;
+  logStr?: string;
+  requestId?: string;
+  offset?: number;
+  limit?: number;
+  chainValid?: boolean;
+  entries?: PrivilegedAuditEntry[];
+}
+
+export interface MsgConsistencyDoctor extends MsgBase {
+  proto: "MsgConsistencyDoctor";
+  result?: boolean;
+  errorCode?: string;
+  logStr?: string;
+  requestId: string;
+  action?: "snapshot" | "repair";
+  findingId?: number;
+  challengeId?: string;
+  confirmationToken?: string;
+  snapshot?: ConsistencyDoctorSnapshot;
+  findings?: ConsistencyFinding[];
+}
+
+export interface MsgAdminApproval extends MsgBase {
+  proto: "MsgAdminApproval";
+  result?: boolean;
+  errorCode?: string;
+  logStr?: string;
+  requestId: string;
+  operation?: "deploy_test" | "deploy_production" | "publish_hex_catalog" | "reset_password" | "database_repair";
+  target?: string;
+  challengeId?: string;
+  confirmationToken?: string;
+  expiresAt?: number;
+}
+
+export interface MsgAdminPlayerSearch extends MsgBase {
+  proto: "MsgAdminPlayerSearch";
+  result?: boolean;
+  logStr?: string;
+  query?: string;
+  searchBy?: "player" | "qq";
+  players?: AdminPlayerSummary[];
+}
+
+export interface MsgAdminPlayerUpdate extends MsgBase {
+  proto: "MsgAdminPlayerUpdate";
+  result?: boolean;
+  logStr?: string;
+  action: "rename" | "resetPassword" | "setQq" | "unbindQq";
+  targetAccount?: string;
+  displayName?: string;
+  qq?: string;
+  expectedBindingRevision?: number;
+  requestId?: string;
+  challengeId?: string;
+  confirmationToken?: string;
+  player?: AdminPlayerSummary | null;
+  temporaryPassword?: string | null;
+  replayed?: boolean;
+}
+
 // ── 联合类型（用于分发时的类型收窄）──────────────────────────────────────
 export type AnyMsg =
   | MsgSecret
   | MsgPing
   | MsgLogin
+  | MsgQqWhitelistStatus
+  | MsgQqWhitelistImport
+  | MsgQqAccessDenied
+  | MsgQqBindingChanged
   | MsgAddAccount
   | MsgUpdatePs
   | MsgPlayerData
@@ -979,11 +2148,14 @@ export type AnyMsg =
   | MsgDeleteDeck
   | MsgSelectDeck
   | MsgUpdateProfile
+  | MsgUpdateChampionTitle
   | MsgUpdateCardBack
   | MsgCardBackGallery
   | MsgUploadCardBack
   | MsgLikeCardBack
   | MsgDeleteCardBack
+  | MsgCardBackReviewQueue
+  | MsgReviewCardBack
   | MsgDeckPlazaList
   | MsgPublishDeckPlaza
   | MsgLikeDeckPlaza
@@ -992,7 +2164,12 @@ export type AnyMsg =
   | MsgImportDecks
   | MsgEnterMatch
   | MsgCancelMatch
+  | MsgSelectRankFaction
+  | MsgEquipSeasonTitle
+  | MsgPublicPlayerIdentities
   | MsgMatchFound
+  | MsgRankSnapshot
+  | MsgRankResult
   | MsgCreateRoom
   | MsgJoinRoom
   | MsgCancelRoom
@@ -1005,20 +2182,51 @@ export type AnyMsg =
   | MsgDuelOver
   | MsgGameState
   | MsgGameAction
+  | MsgGamePrepared
   | MsgPromptResponse
   | MsgSpectateRoom
   | MsgLeaveSpectate
   | MsgSpectatorList
+  | MsgUpdateSpectateSettings
+  | MsgSpectatorHandRequest
+  | MsgSpectatorHandStatus
+  | MsgSpectatorHandResponse
+  | MsgKickSpectator
+  | MsgSpectatorKicked
   | MsgActionRejected
+  | MsgGameRecoveryPaused
+  | MsgRateLimited
   | MsgRequestState
   | MsgPlayerDisconnected
   | MsgPlayerReconnected
+  | MsgRulesetUpdated
+  | MsgRulesetState
+  | MsgAdminOperations
+  | MsgAdminDeploy
+  | MsgAdminHexCatalog
+  | MsgAdminPlayerSearch
+  | MsgAdminPlayerUpdate
+  | MsgOperationsCases
+  | MsgOperationsCaseDetail
+  | MsgOperationsCaseUpdate
+  | MsgOperationsCaseAppeal
+  | MsgOperationsPenalty
+  | MsgPrivilegedAudit
+  | MsgConsistencyDoctor
+  | MsgAdminApproval
   | MsgBugReport
+  | MsgCloudReplayList
+  | MsgCloudReplayLoad
+  | MsgCloudReplayBookmark
+  | MsgCloudReplayShare
+  | MsgCloudReplayDelete
   | MsgChatMsg
+  | MsgGlobalAnnouncement
   | MsgGameChat
   | MsgFriendChat
   | MsgLeaveGameChat
   | MsgLeaderLeaderboard
+  | MsgLeaderChampionQuery
   | MsgLeaderMatchups
   | MsgLeaderMatchupMatrix
   | MsgPlayerProfileStats
@@ -1030,6 +2238,7 @@ export type AnyMsg =
   | MsgFriendRespond
   | MsgFriendRemove
   | MsgFriendCancel
+  | MsgPlayerSafety
   | MsgInvitePlayer
   | MsgInviteNotify
   | MsgInviteResponse

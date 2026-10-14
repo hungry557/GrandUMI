@@ -10,8 +10,7 @@
     "keyWords": "海军/利刃",
     "counter": "1000",
     "effectTags": [
-      "OnAttackDeclare",
-      "OnEnterField"
+      "OnAttackDeclare"
     ],
     "abilities": [],
     "effectEvent": "",
@@ -126,7 +125,7 @@
     "power": "4000",
     "cost": "4",
     "keyWords": "超新星/草帽一伙",
-    "counter": "1000",
+    "counter": "2000",
     "effectTags": [
       "OnCharRested"
     ],
@@ -311,7 +310,7 @@
     "power": "6000",
     "cost": "6",
     "keyWords": "德莱斯罗兹/革命军",
-    "counter": "1000",
+    "counter": "2000",
     "effectTags": [],
     "abilities": [
       "阻挡者"
@@ -356,7 +355,7 @@
     "power": "0",
     "cost": "2",
     "keyWords": "和之国",
-    "counter": "1000",
+    "counter": "2000",
     "effectTags": [
       "ActivatedMain"
     ],

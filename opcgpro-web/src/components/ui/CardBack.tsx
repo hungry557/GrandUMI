@@ -1,5 +1,19 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
 import { clsx } from "clsx";
-import { cardBackImageSrc, cardBackName, normalizeCardBackId } from "@/lib/cardBacks";
+import {
+  cardBackImageSrc,
+  cardBackName,
+  DEFAULT_CARD_BACK_ID,
+  normalizeCardBackId,
+} from "@/lib/cardBacks";
+import { resolveVisibleCardBackId } from "@/lib/cardBackVisibility.mjs";
+import { assetSrc, directAssetSrc } from "@/lib/sprite";
+import { useSettingsStore } from "@/store/settingsStore";
+import { useSlowImageFallback } from "@/hooks/useSlowImageFallback";
+
+const CUSTOM_CARD_BACK_TIMEOUT_MS = 6_000;
 
 const themes = {
   classic: {
@@ -38,24 +52,107 @@ const themes = {
 
 export default function CardBack({
   cardBackId,
+  side,
   className,
   decorative = false,
+  lazy = false,
 }: {
   cardBackId?: string | null;
+  /** 牌桌按当前主视角归一化后的区域归属；非牌桌预览不传。 */
+  side?: "my" | "opponent";
   className?: string;
   decorative?: boolean;
+  lazy?: boolean;
 }) {
-  const id = normalizeCardBackId(cardBackId);
-  const customImage = cardBackImageSrc(id);
-  if (customImage) {
+  const hideOpponentCardBack = useSettingsStore((state) => state.hideOpponentCardBack);
+  const visibleCardBackId = resolveVisibleCardBackId(
+    cardBackId,
+    side,
+    hideOpponentCardBack,
+    DEFAULT_CARD_BACK_ID,
+  );
+  const id = normalizeCardBackId(visibleCardBackId);
+  const customImagePath = cardBackImageSrc(id);
+  const customImage = customImagePath ? assetSrc(customImagePath) : null;
+  const [customImageSrc, setCustomImageSrc] = useState(customImage ?? "");
+  const [customImageFailed, setCustomImageFailed] = useState(false);
+  const [isNearViewport, setIsNearViewport] = useState(!lazy);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
+  useSlowImageFallback(imageRef, customImageSrc, setCustomImageSrc, !customImageFailed && isNearViewport);
+  const loadTimeoutRef = useRef<number | null>(null);
+
+  const clearLoadTimeout = useCallback(() => {
+    if (loadTimeoutRef.current !== null) window.clearTimeout(loadTimeoutRef.current);
+    loadTimeoutRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    clearLoadTimeout();
+    setCustomImageSrc(customImage ?? "");
+    setCustomImageFailed(false);
+  }, [clearLoadTimeout, customImage]);
+
+  useEffect(() => {
+    if (!lazy) {
+      setIsNearViewport(true);
+      return;
+    }
+    const container = containerRef.current;
+    if (!container || isNearViewport) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        setIsNearViewport(true);
+        observer.disconnect();
+      },
+      { rootMargin: "500px 0px" },
+    );
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [isNearViewport, lazy]);
+
+  const handleCustomImageFailure = useCallback(() => {
+    clearLoadTimeout();
+    const directSource = customImage ? directAssetSrc(customImage) : null;
+    if (directSource && customImageSrc !== directSource) {
+      setCustomImageSrc(directSource);
+      return;
+    }
+    setCustomImageFailed(true);
+  }, [clearLoadTimeout, customImage, customImageSrc]);
+
+  useEffect(() => {
+    clearLoadTimeout();
+    if (!customImage || customImageFailed || !isNearViewport || (imageRef.current?.complete && imageRef.current.naturalWidth > 0)) return;
+    loadTimeoutRef.current = window.setTimeout(handleCustomImageFailure, CUSTOM_CARD_BACK_TIMEOUT_MS);
+    return clearLoadTimeout;
+  }, [clearLoadTimeout, customImage, customImageFailed, customImageSrc, handleCustomImageFailure, isNearViewport]);
+
+  if (customImage && !customImageFailed) {
     return (
       <div
+        ref={containerRef}
         className={clsx("relative h-full w-full overflow-hidden rounded-[inherit] border-2 border-white/35 bg-gray-950 shadow-inner", className)}
         role={decorative ? undefined : "img"}
         aria-hidden={decorative || undefined}
         aria-label={decorative ? undefined : `${cardBackName(id)}卡背`}
       >
-        <img src={customImage} alt="" draggable={false} className="h-full w-full object-cover" />
+        {isNearViewport ? (
+          <img
+            ref={imageRef}
+            src={customImageSrc}
+            alt=""
+            draggable={false}
+            loading={lazy ? "lazy" : "eager"}
+            decoding="async"
+            onLoad={clearLoadTimeout}
+            onError={handleCustomImageFailure}
+            className="h-full w-full object-cover"
+          />
+        ) : (
+          <div className="h-full w-full animate-pulse bg-gradient-to-br from-gray-900 via-gray-800 to-gray-950" aria-hidden="true" />
+        )}
         <div className="pointer-events-none absolute inset-[4%] rounded-[8%] border border-white/20" />
       </div>
     );

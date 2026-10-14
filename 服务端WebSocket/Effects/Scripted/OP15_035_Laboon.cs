@@ -21,13 +21,14 @@ public class OP15_035_Laboon : IScriptedEffect
         if (vOwner != ctx.OwnerIndex || vId is null) return;
         var victim = me.Characters.FirstOrDefault(c => c.Id.ToString() == vId);
         if (victim is null || victim.Info.Power > 7000) return;
-        if (AtomicOps.RestableCount(me) < 2) return;
+        if (AtomicOps.RestableCount(ctx.State, me) < 2) return;
 
         bool use = await ctx.Prompts.ConfirmOptional(ctx.OwnerIndex,
             $"拉布：将我方2张卡牌转为休息状态，使「{victim.Info.Name}」不离场？");
         if (!use) return;
         if (!await AtomicOps.PromptRestOwnCards(ctx, 2,
             "将我方 2 张卡牌转为休息状态（成本，可选活跃 领袖/角色/舞台/咚!!）")) return;
-        ctx.State.MarkPreventLeave(victim.Id);
+        ctx.State.MarkPreventEffectLeaveBatch(ctx.OwnerIndex, victim.Id,
+            card => card.Info.Power <= 7000);
     }
 }

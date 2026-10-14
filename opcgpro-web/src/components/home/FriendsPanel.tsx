@@ -1,13 +1,22 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import type { FormEvent } from "react";
-import Modal from "@/components/ui/Modal";
-import { HomeRequest } from "@/net/HomeProtocol";
-import { useNetStore } from "@/store/netStore";
-import type { FriendInfo, FriendPresenceStatus, FriendRequestInfo, FriendSearchPlayer } from "@/types/net";
+import PlayerName from "@/components/ui/PlayerName";
 
-type Tab = "friends" | "requests" | "search";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent } from "react";
+import FriendChatView from "@/components/chat/FriendChatView";
+import Modal from "@/components/ui/Modal";
+import { GameRequest } from "@/net/GameRequest";
+import { HomeRequest } from "@/net/HomeProtocol";
+import { LeaderChampionBadgeList } from "@/components/ui/LeaderChampionBadge";
+import { friendAccountKey, useNetStore } from "@/store/netStore";
+import type { FriendInfo, FriendPresenceStatus, FriendRequestInfo, FriendSearchPlayer } from "@/types/net";
+import SpectateJoinButton from "./SpectateJoinButton";
+import PlayerSafetyActions from "@/components/ui/PlayerSafetyActions";
+
+type Tab = "chat" | "requests" | "search" | "blocked";
+
+const FRIEND_CHAT_COOLDOWN_MS = 1300;
 
 const STATUS_LABEL: Record<FriendPresenceStatus, { text: string; cls: string }> = {
   offline: { text: "离线", cls: "text-gray-500" },
@@ -29,18 +38,20 @@ function PlayerAvatar({ name, online }: { name: string; online: boolean }) {
   );
 }
 
-function PlayerIdentity({ name, account, online, status }: {
+function PlayerIdentity({ name, account, online, status, championLeaderNumbers }: {
   name: string;
   account: string;
   online: boolean;
   status?: FriendPresenceStatus;
+  championLeaderNumbers?: string[];
 }) {
   const statusView = STATUS_LABEL[status ?? (online ? "idle" : "offline")];
   return (
     <>
       <PlayerAvatar name={name} online={online} />
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-bold text-white">{name}</p>
+        <p className="truncate text-sm font-bold text-white"><PlayerName name={name} /></p>
+        <LeaderChampionBadgeList leaderNumbers={championLeaderNumbers} className="mt-1" />
         <p className="truncate text-[11px] text-gray-500">@{account}</p>
         <p className={`mt-0.5 text-[10px] ${statusView.cls}`}>{statusView.text}</p>
       </div>
@@ -58,23 +69,57 @@ function EmptyState({ children }: { children: string }) {
 
 export default function FriendsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
   const friends = useNetStore((state) => state.friends);
+  const friendChatMessages = useNetStore((state) => state.friendChatMessages);
+  const friendChatUnreadByAccount = useNetStore((state) => state.friendChatUnreadByAccount);
+  const markFriendChatRead = useNetStore((state) => state.markFriendChatRead);
+  const myAccount = useNetStore((state) => state.account);
+  const connState = useNetStore((state) => state.connState);
   const incoming = useNetStore((state) => state.incomingFriendRequests);
   const outgoing = useNetStore((state) => state.outgoingFriendRequests);
   const searchResults = useNetStore((state) => state.friendSearchResults);
-  const [tab, setTab] = useState<Tab>("friends");
+  const blockedPlayers = useNetStore((state) => state.blockedPlayers);
+  const [tab, setTab] = useState<Tab>("chat");
   const [query, setQuery] = useState("");
   const [hasSearched, setHasSearched] = useState(false);
   const [removeConfirm, setRemoveConfirm] = useState<string | null>(null);
+  const [selectedFriendAccount, setSelectedFriendAccount] = useState("");
+  const [friendConversationOpen, setFriendConversationOpen] = useState(false);
+  const [friendInput, setFriendInput] = useState("");
+  const [friendChatCoolingDown, setFriendChatCoolingDown] = useState(false);
+  const chatBottomRef = useRef<HTMLDivElement>(null);
+  const cooldownTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (!open) return;
     HomeRequest.requestFriendList();
+    HomeRequest.requestPlayerSafety();
   }, [open]);
 
-  const sortedFriends = useMemo(() => [...friends].sort((a, b) => {
-    const onlineOrder = Number(b.online) - Number(a.online);
-    return onlineOrder || a.name.localeCompare(b.name, "zh-CN");
-  }), [friends]);
+  useEffect(() => () => {
+    if (cooldownTimer.current) clearTimeout(cooldownTimer.current);
+  }, []);
+
+  const selectedFriend = useMemo(() => friends.find(
+    (friend) => friendAccountKey(friend.account) === friendAccountKey(selectedFriendAccount),
+  ), [friends, selectedFriendAccount]);
+
+  const totalFriendUnread = Object.values(friendChatUnreadByAccount).reduce((total, count) => total + count, 0);
+
+  useEffect(() => {
+    if (!selectedFriendAccount || selectedFriend) return;
+    setSelectedFriendAccount("");
+    setFriendConversationOpen(false);
+  }, [selectedFriend, selectedFriendAccount]);
+
+  useEffect(() => {
+    if (!open || tab !== "chat" || !friendConversationOpen || !selectedFriendAccount) return;
+    markFriendChatRead(selectedFriendAccount);
+  }, [friendChatMessages, friendConversationOpen, markFriendChatRead, open, selectedFriendAccount, tab]);
+
+  useEffect(() => {
+    if (!open || tab !== "chat") return;
+    chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [friendChatMessages, open, selectedFriendAccount, tab]);
 
   const currentRelationships = useMemo(() => {
     const relationships = new Map<string, FriendSearchPlayer["relationship"]>();
@@ -101,52 +146,107 @@ export default function FriendsPanel({ open, onClose }: { open: boolean; onClose
     setRemoveConfirm(null);
   };
 
+  const selectFriend = (account: string) => {
+    setSelectedFriendAccount(account);
+    setFriendInput("");
+    setFriendConversationOpen(true);
+    setRemoveConfirm(null);
+    markFriendChatRead(account);
+  };
+
+  const sendFriendMessage = () => {
+    const text = friendInput.trim();
+    if (!text || !selectedFriend || friendChatCoolingDown || connState !== "connected") return;
+    GameRequest.sendFriendChat(selectedFriend.account, text);
+    setFriendInput("");
+    setFriendChatCoolingDown(true);
+    if (cooldownTimer.current) clearTimeout(cooldownTimer.current);
+    cooldownTimer.current = setTimeout(() => setFriendChatCoolingDown(false), FRIEND_CHAT_COOLDOWN_MS);
+  };
+
   const switchTab = (next: Tab) => {
     setTab(next);
     setRemoveConfirm(null);
   };
 
+  const chatHeaderActions = selectedFriend ? (
+    <>
+      {selectedFriend.status === "playing" && selectedFriend.roomId ? (
+        <SpectateJoinButton
+          roomId={selectedFriend.roomId}
+          seatIndex={selectedFriend.seatIndex ?? 0}
+          mode={selectedFriend.spectateMode}
+          isFriend
+        />
+      ) : (
+        <button
+          type="button"
+          onClick={() => HomeRequest.invitePlayer(selectedFriend.account)}
+          disabled={!selectedFriend.online || selectedFriend.status !== "idle"}
+          aria-label={`邀请 ${selectedFriend.name} 对战`}
+          title="邀请对战"
+          className="flex h-11 min-w-11 items-center justify-center rounded-lg bg-orange-500 px-2 text-xs font-bold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:bg-gray-700 disabled:text-gray-500"
+        >
+          对战
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={() => removeFriend(selectedFriend)}
+        aria-label={removeConfirm === selectedFriend.account ? `确认删除好友 ${selectedFriend.name}` : `删除好友 ${selectedFriend.name}`}
+        title={removeConfirm === selectedFriend.account ? "再次点击确认删除" : "删除好友"}
+        className={`flex h-11 min-w-11 items-center justify-center rounded-lg border px-2 text-xs font-bold transition-colors ${removeConfirm === selectedFriend.account ? "border-red-500 bg-red-950 text-red-300" : "border-gray-600 text-gray-400 hover:border-red-700 hover:text-red-400"}`}
+      >
+        {removeConfirm === selectedFriend.account ? "确认" : (
+          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5M14 11v5" /></svg>
+        )}
+      </button>
+      <PlayerSafetyActions targetAccount={selectedFriend.account} targetName={selectedFriend.name} compact />
+    </>
+  ) : null;
+
   return (
-    <Modal open={open} onClose={onClose} title="好友中心" mobileSheet maxWidthClass="max-w-2xl">
-      <div className="flex min-h-[28rem] flex-col" data-testid="friends-panel">
-        <div className="grid grid-cols-3 gap-1 rounded-xl bg-gray-950 p-1">
-          <button type="button" onClick={() => switchTab("friends")} className={`min-h-11 rounded-lg text-sm font-bold transition-colors ${tab === "friends" ? "bg-orange-500 text-white" : "text-gray-500 hover:bg-gray-800 hover:text-gray-200"}`}>
-            好友 {friends.length > 0 ? `(${friends.length})` : ""}
+    <Modal open={open} onClose={onClose} title="好友中心" mobileSheet maxWidthClass="max-w-4xl">
+      <div className="flex h-[min(76cqh,40rem)] min-h-0 max-h-[calc(100cqh-7rem)] flex-col" data-testid="friends-panel">
+        <div className="grid grid-cols-4 gap-1 rounded-xl bg-gray-950 p-1">
+          <button type="button" onClick={() => switchTab("chat")} className={`relative min-h-12 rounded-lg text-sm font-bold transition-colors ${tab === "chat" ? "bg-emerald-600 text-white" : "text-gray-500 hover:bg-gray-800 hover:text-gray-200"}`}>
+            聊天 {friends.length > 0 ? `(${friends.length})` : ""}
+            {totalFriendUnread > 0 && <span className="ml-1 rounded-full bg-red-500 px-1.5 py-0.5 text-[10px] text-white">{totalFriendUnread > 99 ? "99+" : totalFriendUnread}</span>}
           </button>
-          <button type="button" onClick={() => switchTab("requests")} className={`relative min-h-11 rounded-lg text-sm font-bold transition-colors ${tab === "requests" ? "bg-orange-500 text-white" : "text-gray-500 hover:bg-gray-800 hover:text-gray-200"}`}>
+          <button type="button" onClick={() => switchTab("requests")} className={`relative min-h-12 rounded-lg text-sm font-bold transition-colors ${tab === "requests" ? "bg-emerald-600 text-white" : "text-gray-500 hover:bg-gray-800 hover:text-gray-200"}`}>
             申请
             {incoming.length > 0 && <span className="ml-1 rounded-full bg-red-500 px-1.5 py-0.5 text-[10px] text-white">{incoming.length}</span>}
           </button>
-          <button type="button" onClick={() => switchTab("search")} className={`min-h-11 rounded-lg text-sm font-bold transition-colors ${tab === "search" ? "bg-orange-500 text-white" : "text-gray-500 hover:bg-gray-800 hover:text-gray-200"}`}>
+          <button type="button" onClick={() => switchTab("search")} className={`min-h-12 rounded-lg text-sm font-bold transition-colors ${tab === "search" ? "bg-emerald-600 text-white" : "text-gray-500 hover:bg-gray-800 hover:text-gray-200"}`}>
             添加好友
+          </button>
+          <button type="button" onClick={() => switchTab("blocked")} className={`min-h-12 rounded-lg text-sm font-bold transition-colors ${tab === "blocked" ? "bg-emerald-600 text-white" : "text-gray-500 hover:bg-gray-800 hover:text-gray-200"}`}>
+            屏蔽
           </button>
         </div>
 
-        <div className="mt-3 min-h-0 flex-1 overflow-y-auto pr-1">
-          {tab === "friends" && (
-            <div className="flex flex-col gap-2">
-              {sortedFriends.length === 0 ? <EmptyState>还没有好友，去“添加好友”搜索账号或昵称吧</EmptyState> : sortedFriends.map((friend) => (
-                <div key={friend.account} className="flex min-h-16 items-center gap-3 rounded-xl border border-gray-800 bg-gray-900/70 p-3">
-                  <PlayerIdentity name={friend.name} account={friend.account} online={friend.online} status={friend.status} />
-                  <button
-                    type="button"
-                    onClick={() => HomeRequest.invitePlayer(friend.account)}
-                    disabled={!friend.online || friend.status !== "idle"}
-                    className="min-h-11 rounded-lg bg-orange-500 px-3 text-xs font-bold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:bg-gray-800 disabled:text-gray-600"
-                  >
-                    邀请对战
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => removeFriend(friend)}
-                    className={`min-h-11 rounded-lg border px-3 text-xs font-bold transition-colors ${removeConfirm === friend.account ? "border-red-500 bg-red-950 text-red-300" : "border-gray-700 text-gray-500 hover:border-red-800 hover:text-red-400"}`}
-                  >
-                    {removeConfirm === friend.account ? "确认删除" : "删除"}
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
+        {tab === "chat" ? (
+          <div className="mt-3 min-h-0 flex-1 overflow-hidden rounded-xl border border-gray-800">
+            <FriendChatView
+              friends={friends}
+              messages={friendChatMessages}
+              myAccount={myAccount}
+              selectedAccount={selectedFriendAccount}
+              unreadByAccount={friendChatUnreadByAccount}
+              input={friendInput}
+              disabled={!selectedFriend || friendChatCoolingDown || connState !== "connected"}
+              placeholder={connState !== "connected" ? "等待服务器连接" : selectedFriend?.online ? `发给 ${selectedFriend.name}` : `给 ${selectedFriend?.name ?? "好友"} 留言`}
+              onInputChange={setFriendInput}
+              onSelect={selectFriend}
+              onBack={() => { setFriendConversationOpen(false); setRemoveConfirm(null); }}
+              onSend={sendFriendMessage}
+              conversationOpen={friendConversationOpen}
+              bottomRef={chatBottomRef}
+              headerActions={chatHeaderActions}
+            />
+          </div>
+        ) : (
+          <div className="mt-3 min-h-0 flex-1 touch-pan-y overflow-y-auto overscroll-contain pr-1 [-webkit-overflow-scrolling:touch]">
 
           {tab === "requests" && (
             <div className="space-y-5">
@@ -207,7 +307,7 @@ export default function FriendsPanel({ open, onClose }: { open: boolean; onClose
                   const relationship = currentRelationships.get(player.account) ?? player.relationship;
                   return (
                     <div key={player.account} className="flex min-h-16 items-center gap-3 rounded-xl border border-gray-800 bg-gray-900/70 p-3">
-                      <PlayerIdentity name={player.name} account={player.account} online={player.online} status={player.status} />
+                      <PlayerIdentity name={player.name} account={player.account} online={player.online} status={player.status} championLeaderNumbers={player.championLeaderNumbers} />
                       {relationship === "none" && <button type="button" onClick={() => HomeRequest.sendFriendRequest(player.account)} className="min-h-11 rounded-lg bg-orange-500 px-3 text-xs font-bold text-white hover:bg-orange-400">添加好友</button>}
                       {relationship === "friend" && <span className="text-xs font-bold text-emerald-400">已是好友</span>}
                       {relationship === "outgoing" && <span className="text-xs font-bold text-amber-400">已申请</span>}
@@ -219,7 +319,24 @@ export default function FriendsPanel({ open, onClose }: { open: boolean; onClose
               </div>
             </div>
           )}
-        </div>
+          {tab === "blocked" && (
+            <div className="space-y-2">
+              {blockedPlayers.length === 0 ? <EmptyState>当前没有已屏蔽的玩家</EmptyState> : blockedPlayers.map((player) => (
+                <div key={player.account} className="flex min-h-16 items-center gap-3 rounded-xl border border-gray-800 bg-gray-900/70 p-3">
+                  <PlayerIdentity name={player.name} account={player.account} online={false} />
+                  <button
+                    type="button"
+                    onClick={() => HomeRequest.unblockPlayer(player.account)}
+                    className="min-h-12 rounded-lg border border-gray-600 px-3 text-xs font-bold text-gray-300 transition-colors hover:border-emerald-600 hover:text-emerald-300"
+                  >
+                    解除屏蔽
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          </div>
+        )}
       </div>
     </Modal>
   );

@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Server = "root@8.210.155.25",
+    [string]$Server = "root@103.146.230.37",
     [string]$RemoteDir = "/opt/qq-bug-bot",
     [switch]$EnableAgent
 )
@@ -14,19 +14,26 @@ if ($RemoteDir -notmatch '^/[A-Za-z0-9._/-]+$') {
 
 $botDir = $PSScriptRoot
 $repo = Split-Path -Parent $botDir
+. (Join-Path $repo "ops\windows\GrandUmiTemp.ps1")
 $commit = (& git -C $repo rev-parse --short=12 HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{12}$') {
     throw "无法读取当前提交。"
 }
 $files = @(
     ".dockerignore",
+    ".env.example",
     "Dockerfile",
     "docker-compose.yml",
+    "napcat-init.sh",
     "requirements.txt",
     "bot.py",
     "storage.py",
+    "abuse_moderation.py",
+    "qq_whitelist_sync.py",
+    "import_activation_codes.py",
     "github_issue.py",
     "agent_bridge.py",
+    "media_pipeline.py",
     "export_by_date.py",
     "mark.py",
     "dedup.py",
@@ -38,7 +45,8 @@ foreach ($name in $files) {
     }
 }
 
-$bundle = Join-Path ([IO.Path]::GetTempPath()) "grandumi-bug-bot-$commit.tar.gz"
+$deployTempDirectory = Get-GrandUmiTempDirectory -Category "Deploy"
+$bundle = Join-Path $deployTempDirectory "grandumi-bug-bot-$commit.tar.gz"
 $remoteBundle = "/tmp/grandumi-bug-bot-$commit.tar.gz"
 $remoteScript = "/tmp/grandumi-deploy-bug-bot-$commit.sh"
 $tar = (Get-Command tar.exe -ErrorAction Stop).Source

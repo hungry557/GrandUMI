@@ -1,10 +1,43 @@
 import { ALL_SET_NAMES } from "@/data/cardSets";
+import { parseCardColors, sharesCardColor } from "@/lib/colorMap";
+import { normalizeAttackAttributes } from "@/lib/attackAttributeEffects";
 import type { CardData } from "@/types/card";
 
-export const CARD_PROPERTIES = ["", "斩", "打", "射", "智", "特"];
+export const CARD_PROPERTIES = ["", "斩", "打", "射", "知", "特"];
 export const CARD_TYPES = ["", "Character", "Stage", "Event"];
 export const CARD_RARITIES = ["", "L", "SR", "R", "UC", "C", "SEC", "P"];
 export const CARD_COSTS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+/**
+ * 官方确认可在当前标准环境继续使用的角标 1 卡。
+ * 这些卡保留真实角标数据，但不受“默认隐藏角标 1 卡”的浏览筛选影响。
+ */
+export const STANDARD_LEGAL_SUBSCRIPT_ONE_CARDS = new Set<string>([
+  "OP01-016",
+  "OP01-039",
+  "OP01-055",
+  "OP01-120",
+  "OP02-005",
+  "OP02-013",
+  "OP02-068",
+  "OP03-008",
+  "OP03-025",
+  "OP03-044",
+  "OP03-048",
+  "OP03-072",
+  "OP03-097",
+  "OP04-016",
+  "OP04-077",
+  "OP04-083",
+  "OP04-096",
+  "ST01-011",
+  "ST02-007",
+  "ST06-008",
+]);
+
+export function isSubscriptOneHiddenByDefault(card: CardData): boolean {
+  return card.subscript === 1 && !STANDARD_LEGAL_SUBSCRIPT_ONE_CARDS.has(card.number);
+}
 
 export const CARD_SET_GROUPS: { label: string; sets: string[] }[] = [
   { label: "OP 主弹", sets: ALL_SET_NAMES.filter((set) => set.startsWith("OP")) },
@@ -34,6 +67,8 @@ export interface CardSearchFilters {
   filterCost: number | null;
   filterSets: string[];
   filterShowSub1: boolean;
+  /** 仅显示拥有生命【触发】效果的卡牌。 */
+  filterHasTrigger?: boolean;
 }
 
 interface CardSearchOptions {
@@ -50,8 +85,7 @@ export function cardSetOf(card: CardData): string {
 }
 
 export function colorMatch(leaderColor: string, cardColor: string): boolean {
-  const leaderColors = new Set(leaderColor.split("/"));
-  return cardColor.split("/").some((color) => leaderColors.has(color));
+  return sharesCardColor(leaderColor, cardColor);
 }
 
 const TYPE_ORDER: Record<string, number> = {
@@ -85,6 +119,7 @@ const SET_RELEASE_ORDER: Record<string, number> = (() => {
     "OP14",    "ST29","ST30",
     "OP15",
     "OP16",    "ST31","ST32","ST33","ST34","ST35","ST36",
+    "OP17",    "EB05", "OP18", "ST37", "ST38",
     "P",
   ];
   const map: Record<string, number> = {};
@@ -157,6 +192,7 @@ export function filterAndSortCards(
     filterCost,
     filterSets,
     filterShowSub1,
+    filterHasTrigger = false,
   } = filters;
   const isLeaderMode = filterType === "Leader";
   const normalizedQuery = searchQuery.trim().toLocaleLowerCase();
@@ -167,7 +203,8 @@ export function filterAndSortCards(
       const setCode = cardSetOf(card);
       if (options.allowedSets && !options.allowedSets.includes(setCode)) return false;
       if (filterSets.length > 0 && !filterSets.includes(setCode)) return false;
-      if (!filterShowSub1 && card.subscript === 1) return false;
+      if (!filterShowSub1 && isSubscriptOneHiddenByDefault(card)) return false;
+      if (filterHasTrigger && !card.trigger.trim()) return false;
 
       if (isLeaderMode && card.type !== "Leader") return false;
       if (!isLeaderMode && !options.includeLeadersWhenAllTypes && card.type === "Leader") {
@@ -179,11 +216,13 @@ export function filterAndSortCards(
 
       if (
         selectedColors.size > 0 &&
-        !card.color.split("/").some((color) => selectedColors.has(color))
+        !parseCardColors(card.color).some((color) => selectedColors.has(color))
       ) {
         return false;
       }
-      if (filterProperty && card.property !== filterProperty) return false;
+      if (filterProperty && !normalizeAttackAttributes(card.property).includes(
+        normalizeAttackAttributes(filterProperty)[0],
+      )) return false;
       if (filterRarity && card.rarity !== filterRarity) return false;
       if (filterCost !== null && card.cost !== filterCost) return false;
       if (!isLeaderMode && filterType && card.type !== filterType) return false;

@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Text;
+using GrandUMI.Training;
 
 namespace GrandUMI.Cards;
 
@@ -14,6 +16,8 @@ public static class CardDatabase
     private static bool _loaded;
 
     public static int Count => _byNumber.Count;
+    /// <summary>启动时一次性计算的“规范相对路径 + 原始文件字节”SHA-256。</summary>
+    public static string ContentHash { get; private set; } = string.Empty;
 
     /// <summary>
     /// 加载所有卡集。幂等且线程安全：首次加载后重复调用直接返回。
@@ -35,38 +39,42 @@ public static class CardDatabase
         if (!Directory.Exists(cardDataRoot))
             throw new DirectoryNotFoundException($"卡牌数据目录不存在: {cardDataRoot}");
 
+        var manifest = CardContentManifest.Validate(cardDataRoot);
         var jsonOpts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+        var files = manifest.Files.Select(file => Path.Combine(cardDataRoot, file)).ToArray();
+        // 哈希只在启动加载阶段遍历磁盘；新建房间和逐动作路径只读取缓存字符串。
+        var runtimeFiles = manifest.PlayabilityFile is null
+            ? files
+            : files.Append(Path.Combine(cardDataRoot, manifest.PlayabilityFile)).ToArray();
+        var contentHash = ReplayContentManifest.HashFiles(cardDataRoot, runtimeFiles);
+        var byNumber = new Dictionary<string, CardInfo>(StringComparer.OrdinalIgnoreCase);
+        var bySet = new Dictionary<string, List<CardInfo>>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var file in Directory.GetFiles(cardDataRoot, "*.json"))
+        foreach (var file in files)
         {
-            var fileName = Path.GetFileNameWithoutExtension(file);
-            if (fileName.StartsWith("_")) continue; // 跳过 _index.json
+            using var fs = File.OpenRead(file);
+            var raw = JsonSerializer.Deserialize<List<RawCard>>(fs, jsonOpts)
+                ?? throw new InvalidDataException($"卡牌数据文件为空：{Path.GetFileName(file)}");
 
-            try
+            for (var index = 0; index < raw.Count; index++)
             {
-                using var fs = File.OpenRead(file);
-                var raw = JsonSerializer.Deserialize<List<RawCard>>(fs, jsonOpts);
-                if (raw is null) continue;
-
-                foreach (var r in raw)
-                {
-                    var info = MapToCardInfo(r);
-                    if (info is null) continue;
-                    _byNumber[info.Number] = info;
-
-                    if (!_bySet.TryGetValue(info.SetCode, out var list))
-                    {
-                        list = new List<CardInfo>();
-                        _bySet[info.SetCode] = list;
-                    }
-                    list.Add(info);
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[CardDB] 加载 {Path.GetFileName(file)} 失败: {ex.Message}");
+                var info = MapToCardInfo(raw[index], manifest.PendingCards)
+                    ?? throw new InvalidDataException($"卡牌必填字段无效：{Path.GetFileName(file)}[{index}]");
+                if (!byNumber.TryAdd(info.Number, info))
+                    throw new InvalidDataException($"卡牌番号重复：{info.Number}");
+                if (!bySet.TryGetValue(info.SetCode, out var list))
+                    bySet[info.SetCode] = list = new List<CardInfo>();
+                list.Add(info);
             }
         }
+
+        if (byNumber.Count != manifest.TotalCards)
+            throw new InvalidDataException($"卡牌唯一番号数 {byNumber.Count} 与清单总数 {manifest.TotalCards} 不一致");
+        _byNumber.Clear();
+        _bySet.Clear();
+        foreach (var (number, card) in byNumber) _byNumber.Add(number, card);
+        foreach (var (set, cards) in bySet) _bySet.Add(set, cards);
+        ContentHash = contentHash;
 
         Console.WriteLine($"[CardDB] 已加载 {_byNumber.Count} 张卡，{_bySet.Count} 个卡集");
     }
@@ -98,15 +106,18 @@ public static class CardDatabase
         public string[]? abilities { get; set; }
         public string? trigger     { get; set; }
         public string? rarity      { get; set; }
+        public JsonElement subscript { get; set; }
         public string[]? alsoNames { get; set; }
     }
 
-    private static CardInfo? MapToCardInfo(RawCard r)
+    private static CardInfo? MapToCardInfo(RawCard r, IReadOnlySet<string> pendingCards)
     {
         if (string.IsNullOrEmpty(r.number) || string.IsNullOrEmpty(r.name)) return null;
 
-        int.TryParse(r.power,   out int power);
-        int.TryParse(r.cost,    out int cost);
+        // 历史卡表偶有全角数字（如 OP08-044 的“４”）；兼容性归一化后再解析，
+        // 避免合法费用被静默解析为 0。
+        int.TryParse(r.power?.Normalize(NormalizationForm.FormKC), out int power);
+        int.TryParse(r.cost?.Normalize(NormalizationForm.FormKC),  out int cost);
         // counter 字段可能是 "反击+1000" 这类带文字前缀的格式，需抽取数字（与客户端解析一致）
         int counter = ParseCounterValue(r.counter);
 
@@ -120,7 +131,7 @@ public static class CardDatabase
             "角色"           => CardKind.Character,
             "事件"           => CardKind.Event,
             "舞台"           => CardKind.Stage,
-            _                 => CardKind.Character,
+            _                 => throw new InvalidDataException($"未知卡牌类型：{r.number}={r.type}"),
         };
 
         return new CardInfo
@@ -138,7 +149,9 @@ public static class CardDatabase
             Abilities  = r.abilities ?? Array.Empty<string>(),
             Trigger    = r.trigger ?? "",
             Rarity     = r.rarity ?? "",
+            Subscript  = ParseSubscript(r.subscript),
             AlsoNames  = r.alsoNames ?? Array.Empty<string>(),
+            Playability = pendingCards.Contains(r.number) ? CardPlayability.Pending : CardPlayability.Playable,
         };
     }
 
@@ -148,5 +161,12 @@ public static class CardDatabase
         if (string.IsNullOrEmpty(raw)) return 0;
         var m = System.Text.RegularExpressions.Regex.Match(raw, @"\d+");
         return m.Success ? int.Parse(m.Value) : 0;
+    }
+
+    private static int ParseSubscript(JsonElement raw)
+    {
+        if (raw.ValueKind == JsonValueKind.Number && raw.TryGetInt32(out var number)) return number;
+        if (raw.ValueKind == JsonValueKind.String && int.TryParse(raw.GetString(), out number)) return number;
+        return 0;
     }
 }

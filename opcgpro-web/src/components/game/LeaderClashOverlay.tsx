@@ -6,10 +6,19 @@ import { getGameCard } from "@/data/CardLoader";
 import leaderIntroQuotes from "@/data/leaderIntroQuotes.json";
 import { useGameStore } from "@/store/gameStore";
 import { advanceImageFallback, CARD_BACK_SRC, displaySrc } from "@/lib/sprite";
+import { LeaderChampionBadge } from "@/components/ui/LeaderChampionBadge";
+import PlayerName from "@/components/ui/PlayerName";
+import { snapshotSeasonTitle } from "@/lib/seasonTitles";
+import { useAudio } from "@/hooks/useAudio";
+import { useAudioStore } from "@/store/audioStore";
+import { useSettingsStore } from "@/store/settingsStore";
 
 type IntroPhase = "waiting" | "playing" | "exiting" | "done";
 
 const IMPACT_SHARDS = [-78, -52, -29, -11, 14, 33, 57, 82, 108, 137, 164, 191];
+const IMPACT_SOUND_DELAY_MS = 1_020;
+const REDUCED_MOTION_IMPACT_SOUND_DELAY_MS = 120;
+const IMPACT_SOUND_GRACE_MS = 450;
 
 interface LeaderIntroQuoteData {
   fallback: string;
@@ -35,6 +44,8 @@ interface FighterCardProps {
   playerName: string;
   leaderName: string;
   leaderNumber: string;
+  championLeaderNumber?: string | null;
+  seasonTitle?: string | null;
   quote: string;
   sprite: string;
   playing: boolean;
@@ -46,6 +57,8 @@ function FighterCard({
   playerName,
   leaderName,
   leaderNumber,
+  championLeaderNumber,
+  seasonTitle,
   quote,
   sprite,
   playing,
@@ -132,8 +145,9 @@ function FighterCard({
         transition={{ delay: reducedMotion ? 0.12 : 1.18, duration: reducedMotion ? 0.2 : 0.35 }}
       >
         <p className={`truncate text-[clamp(9px,1.1vw,13px)] font-bold tracking-widest ${isLeft ? "text-cyan-200" : "text-orange-200"}`}>
-          {playerName || (isLeft ? "我方" : "对手")}
+          <PlayerName name={playerName || (isLeft ? "我方" : "对手")} seasonTitle={seasonTitle} align={isLeft ? "end" : "start"} />
         </p>
+        <LeaderChampionBadge leaderNumber={championLeaderNumber} className={`mt-1 ${isLeft ? "ml-auto" : "mr-auto"}`} />
         <p className="truncate text-[clamp(14px,2vw,24px)] font-black italic text-white drop-shadow-lg">
           {leaderName}
         </p>
@@ -168,15 +182,24 @@ export default function LeaderClashOverlay({ ready, onComplete }: Props) {
   const myLeaderNumber = useGameStore((state) => state.my?.leaderNumber ?? "");
   const mySpriteMap = useGameStore((state) => state.my?.spriteMap);
   const myName = useGameStore((state) => state.my?.name ?? "");
+  const myChampionLeaderNumber = useGameStore((state) => state.my?.championLeaderNumber);
+  const mySeasonTitle = useGameStore((state) => snapshotSeasonTitle(state.my));
   const opponentLeaderId = useGameStore((state) => state.opponent?.leaderId ?? "");
   const opponentLeaderNumber = useGameStore((state) => state.opponent?.leaderNumber ?? "");
   const opponentSpriteMap = useGameStore((state) => state.opponent?.spriteMap);
   const opponentName = useGameStore((state) => state.opponent?.name ?? "");
+  const opponentChampionLeaderNumber = useGameStore((state) => state.opponent?.championLeaderNumber);
+  const opponentSeasonTitle = useGameStore((state) => snapshotSeasonTitle(state.opponent));
   const firstPlayerChosen = useGameStore((state) => state.firstPlayerChosen);
   const turnCount = useGameStore((state) => state.turnCount);
   const reducedMotion = useReducedMotion() ?? false;
+  const animationSpeed = useSettingsStore((state) => state.animationSpeed);
+  const isAudioUnlocked = useAudioStore((state) => state.isUnlocked);
+  const { play } = useAudio();
   const [phase, setPhase] = useState<IntroPhase>("waiting");
   const completedRef = useRef(false);
+  const introStartedAtRef = useRef<number | null>(null);
+  const impactSoundPlayedRef = useRef(false);
 
   const myLeader = getGameCard(myLeaderNumber, mySpriteMap);
   const opponentLeader = getGameCard(opponentLeaderNumber, opponentSpriteMap);
@@ -202,8 +225,8 @@ export default function LeaderClashOverlay({ ready, onComplete }: Props) {
       onComplete();
     };
 
-    // 已进入正式回合时说明这是恢复中的对局，不应重新遮挡玩家。
-    if (turnCount > 0) {
+    // 已进入正式回合或玩家关闭动画时，不应遮挡开局流程。
+    if (turnCount > 0 || animationSpeed === "off") {
       skipIntro();
       return;
     }
@@ -235,6 +258,7 @@ export default function LeaderClashOverlay({ ready, onComplete }: Props) {
     const begin = () => {
       if (cancelled || started) return;
       started = true;
+      introStartedAtRef.current = performance.now();
       setPhase("playing");
     };
 
@@ -255,6 +279,7 @@ export default function LeaderClashOverlay({ ready, onComplete }: Props) {
     };
   }, [
     firstPlayerChosen,
+    animationSpeed,
     introKey,
     myLeaderNumber,
     mySprite,
@@ -267,10 +292,38 @@ export default function LeaderClashOverlay({ ready, onComplete }: Props) {
   ]);
 
   useEffect(() => {
+    if (phase !== "playing" || impactSoundPlayedRef.current || !isAudioUnlocked) return;
+
+    const introStartedAt = introStartedAtRef.current;
+    if (introStartedAt === null) return;
+
+    const impactDelay = reducedMotion
+      ? REDUCED_MOTION_IMPACT_SOUND_DELAY_MS
+      : IMPACT_SOUND_DELAY_MS;
+    const remainingDelay = introStartedAt + impactDelay - performance.now();
+    // 自动播放尚未解锁时只等待当前碰撞窗口，避免用户稍后操作时补播过时音效。
+    if (remainingDelay < -IMPACT_SOUND_GRACE_MS) return;
+
+    let stopSound = () => {};
+    const timer = window.setTimeout(() => {
+      impactSoundPlayedRef.current = true;
+      stopSound = play("damage", { volume: 0.68 });
+    }, Math.max(0, remainingDelay));
+
+    return () => {
+      window.clearTimeout(timer);
+      stopSound();
+    };
+  }, [isAudioUnlocked, phase, play, reducedMotion]);
+
+  useEffect(() => {
     if (phase !== "playing") return;
-    const timer = window.setTimeout(() => setPhase("exiting"), reducedMotion ? 2800 : 4800);
+    const timer = window.setTimeout(
+      () => setPhase("exiting"),
+      animationSpeed === "fast" || reducedMotion ? 2200 : 4800,
+    );
     return () => window.clearTimeout(timer);
-  }, [phase, reducedMotion]);
+  }, [animationSpeed, phase, reducedMotion]);
 
   useEffect(() => {
     if (phase !== "exiting") return;
@@ -284,9 +337,9 @@ export default function LeaderClashOverlay({ ready, onComplete }: Props) {
       }
       setPhase("done");
       onComplete();
-    }, reducedMotion ? 140 : 320);
+    }, animationSpeed === "fast" || reducedMotion ? 140 : 320);
     return () => window.clearTimeout(timer);
-  }, [introKey, onComplete, phase, reducedMotion]);
+  }, [animationSpeed, introKey, onComplete, phase, reducedMotion]);
 
   if (phase === "done") return null;
 
@@ -299,6 +352,7 @@ export default function LeaderClashOverlay({ ready, onComplete }: Props) {
       role="dialog"
       aria-label="开场领航对决动画"
       initial={{ opacity: 1 }}
+      data-leader-clash={phase}
       animate={{ opacity: phase === "exiting" ? 0 : 1 }}
       transition={{ duration: reducedMotion ? 0.14 : 0.3 }}
     >
@@ -359,12 +413,14 @@ export default function LeaderClashOverlay({ ready, onComplete }: Props) {
           />
         ))}
 
-        <div className="absolute inset-0 flex items-center justify-center gap-[clamp(44px,12vw,190px)] px-5 pb-[clamp(10px,4vh,42px)]">
+        <div className="absolute inset-0 flex items-center justify-center gap-[clamp(120px,16vw,250px)] px-5 pb-[clamp(10px,4vh,42px)]">
           <FighterCard
             side="left"
             playerName={myName}
             leaderName={myLeaderName}
             leaderNumber={myLeaderNumber}
+            championLeaderNumber={myChampionLeaderNumber}
+            seasonTitle={mySeasonTitle}
             quote={myQuote}
             sprite={mySprite}
             playing={playing}
@@ -375,6 +431,8 @@ export default function LeaderClashOverlay({ ready, onComplete }: Props) {
             playerName={opponentName}
             leaderName={opponentLeaderName}
             leaderNumber={opponentLeaderNumber}
+            championLeaderNumber={opponentChampionLeaderNumber}
+            seasonTitle={opponentSeasonTitle}
             quote={opponentQuote}
             sprite={opponentSprite}
             playing={playing}
@@ -383,6 +441,7 @@ export default function LeaderClashOverlay({ ready, onComplete }: Props) {
         </div>
 
         <motion.div
+          data-leader-clash-versus
           className="absolute left-1/2 top-1/2 z-30 text-center"
           initial={{ x: "-50%", y: "-50%", opacity: 0, scale: 2.6, rotate: -14 }}
           animate={playing ? { x: "-50%", y: "-50%", opacity: 1, scale: 1, rotate: -6 } : undefined}

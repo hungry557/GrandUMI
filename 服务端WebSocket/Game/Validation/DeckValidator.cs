@@ -13,6 +13,9 @@ namespace GrandUMI.Game.Validation;
 public static class DeckValidator
 {
     public const string FormatUnrestricted = "Unrestricted";
+    public const string FormatPublicUnrestricted = "PublicUnrestricted";
+    public const string FormatStandard = "Standard";
+    public const string FormatStandardRanked = "StandardRanked";
     public const string FormatOp15Only = "OP15-Only";
     public const string FormatOp16Only = "OP16-Only";
     public const string FormatOp15Op16 = "OP15-OP16";
@@ -29,11 +32,60 @@ public static class DeckValidator
         "OP01-075", // 和平主义者
         "OP08-072", // 饼干士兵
         "OP16-042", // 因佩尔地狱的囚犯
+        "OP18-093", // MMA
+    };
+
+    /// <summary>
+    /// 官方确认仍可在当前标准环境使用的角标 1 卡。
+    /// 与前端 cardSearch.STANDARD_LEGAL_SUBSCRIPT_ONE_CARDS 保持一致。
+    /// </summary>
+    private static readonly HashSet<string> StandardLegalSubscriptOneCards = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "OP01-016", "OP01-039", "OP01-055", "OP01-120",
+        "OP02-005", "OP02-013", "OP02-068",
+        "OP03-008", "OP03-025", "OP03-044", "OP03-048", "OP03-072", "OP03-097",
+        "OP04-016", "OP04-077", "OP04-083", "OP04-096",
+        "ST01-011", "ST02-007", "ST06-008",
+    };
+
+    /// <summary>
+    /// ONE PIECE CARD GAME 亚洲官网自 2026-05-01 起生效的完全禁用卡。
+    /// 所有公开对战与单人测试均禁用；仅好友对战和房间码对战允许使用。
+    /// </summary>
+    private static readonly HashSet<string> OfficialBannedCards = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "OP06-047", // 夏洛特·布玲
+        "OP03-040", // 奈美
+        "OP06-086", // 月光·莫利亚
+        "ST10-001", // 特拉法尔加·罗
+        "OP06-116", // 排击
+    };
+
+    /// <summary>
+    /// 官网当前禁用组合：组合内两张卡不能同时出现在同一卡组中，单独使用合法。
+    /// </summary>
+    private static readonly (string CardA, string CardB)[] OfficialBannedPairs =
+    {
+        ("OP11-040", "OP11-067"),
+        ("OP11-040", "OP08-069"),
+        ("OP07-115", "EB04-058"),
+    };
+
+    /// <summary>
+    /// GrandUMI 平台额外禁用卡，与官网禁卡分开维护。
+    /// 适用范围与官网禁卡一致：公开对战及单人测试禁用，好友或房间码对战允许。
+    /// </summary>
+    private static readonly HashSet<string> PlatformBannedCards = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "OP14-020", // 杰拉基尔·米霍克（领航）
     };
 
     private static readonly Dictionary<string, FormatRule> Rules = new()
     {
         [FormatUnrestricted] = new(FormatUnrestricted, null,             50, 4),
+        [FormatPublicUnrestricted] = new(FormatPublicUnrestricted, null, 50, 4),
+        [FormatStandard] = new(FormatStandard, null,                     50, 4),
+        [FormatStandardRanked] = new(FormatStandard, null,               50, 4),
         [FormatOp15Only] = new(FormatOp15Only, new[] { "OP15" },         50, 4),
         [FormatOp16Only] = new(FormatOp16Only, new[] { "OP16" },         50, 4),
         [FormatOp15Op16] = new(FormatOp15Op16, new[] { "OP15", "OP16" }, 50, 4),
@@ -42,11 +94,30 @@ public static class DeckValidator
     public record Result(bool Ok, string? Reason, string? LeaderNumber);
 
     /// <summary>
+    /// 新对局最终入口使用的轻量可用状态检查。它只检查卡牌是否被明确标记为 pending，
+    /// 不重复格式、张数与颜色规则，因此也可安全用于已经完成完整校验的建房临界区。
+    /// </summary>
+    public static Result ValidateNewGamePlayability(string deckRaw)
+    {
+        var numbers = ParseCardNumbers(deckRaw);
+        if (numbers.Length == 0) return new(false, "卡组为空", null);
+        var leaderNumber = numbers[0];
+        foreach (var number in numbers.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var card = CardDatabase.Get(number);
+            if (card?.Playability == CardPlayability.Pending)
+                return PendingCard(number, leaderNumber);
+        }
+        return new(true, null, leaderNumber);
+    }
+
+    /// <summary>
     /// 解析客户端 deck 字符串（DeckMapper 格式：
     ///   第 1 行 = 领航卡号，第 2~51 行 = 50 张主卡组）
-    /// 并校验是否符合指定格式
+    /// 并校验是否符合指定格式。默认按公开狂野校验，避免新增公开入口漏传格式时放行禁卡；
+    /// 好友邀请、房间码对战和卡组保存必须显式传入 FormatUnrestricted。
     /// </summary>
-    public static Result Validate(string deckRaw, string format = FormatUnrestricted)
+    public static Result Validate(string deckRaw, string format = FormatPublicUnrestricted)
     {
         if (string.IsNullOrWhiteSpace(deckRaw))
             return new(false, "卡组为空", null);
@@ -54,12 +125,7 @@ public static class DeckValidator
         if (!Rules.TryGetValue(format, out var rule))
             return new(false, $"未知卡组格式：{format}", null);
 
-        var lines = deckRaw
-            .Replace("\r\n", "\n")
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-            .Select(l => l.Trim())
-            .Where(l => l.Length > 0)
-            .ToArray();
+        var lines = ParseCardNumbers(deckRaw);
 
         if (lines.Length < 2)
             return new(false, "卡组格式错误：至少需要 1 张领航 + 1 张主卡组", null);
@@ -70,12 +136,26 @@ public static class DeckValidator
             return new(false, $"领航卡不存在：{leaderNum}", null);
         if (leader.Kind != CardKind.Leader)
             return new(false, $"指定的领航卡 {leaderNum} 不是领航类型", null);
+        if (leader.Playability == CardPlayability.Pending)
+            return PendingCard(leader.Number, leader.Number);
 
         var mainCards = lines.Skip(1).ToArray();
-        return ValidateAgainstRule(leader, mainCards, rule);
+        var enforcePublicBanList = format is FormatPublicUnrestricted or FormatStandard or FormatStandardRanked;
+        var enforceStandardRotation = format is FormatStandard or FormatStandardRanked;
+        return ValidateAgainstRule(
+            leader,
+            mainCards,
+            rule,
+            enforcePublicBanList,
+            enforceStandardRotation);
     }
 
-    private static Result ValidateAgainstRule(CardInfo leader, string[] mainCards, FormatRule rule)
+    private static Result ValidateAgainstRule(
+        CardInfo leader,
+        string[] mainCards,
+        FormatRule rule,
+        bool enforcePublicBanList,
+        bool enforceStandardRotation)
     {
         var allowed = rule.AllowedSets;
         var setList = allowed is null ? "" : string.Join("/", allowed);
@@ -83,6 +163,12 @@ public static class DeckValidator
         // 1. 领航必须来自白名单卡集（allowed=null 表示不限卡集，跳过此检查）
         if (allowed is not null && !allowed.Contains(leader.SetCode))
             return new(false, $"{rule.Name} 格式：领航必须来自 {setList}（当前 {leader.SetCode}）", leader.Number);
+        if (enforcePublicBanList && PlatformBannedCards.Contains(leader.Number))
+            return PlatformBannedCard(leader.Number, leader.Number);
+        if (enforcePublicBanList && OfficialBannedCards.Contains(leader.Number))
+            return OfficialBannedCard(leader.Number, leader.Number);
+        if (enforceStandardRotation && IsRotatedOutOfStandard(leader))
+            return new(false, $"标准模式不能使用禁限领航卡：{leader.Number}；可改用狂野模式", leader.Number);
 
         // 2. 主卡组张数
         if (mainCards.Length != rule.MainSize)
@@ -96,6 +182,22 @@ public static class DeckValidator
             if (cnt > rule.CopyLimit && !UnlimitedCopyCards.Contains(num))
                 return new(false, $"同名卡超过 {rule.CopyLimit} 张：{num} × {cnt}", leader.Number);
 
+        var pendingCard = counts.Keys.FirstOrDefault(number =>
+            CardDatabase.Get(number)?.Playability == CardPlayability.Pending);
+        if (pendingCard is not null)
+            return PendingCard(pendingCard, leader.Number);
+
+        if (enforcePublicBanList)
+        {
+            var includedCards = counts.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+            includedCards.Add(leader.Number);
+            foreach (var (cardA, cardB) in OfficialBannedPairs)
+            {
+                if (includedCards.Contains(cardA) && includedCards.Contains(cardB))
+                    return new(false, $"公开对战不能同时使用官方禁用组合：{cardA} + {cardB}；仅好友或房间对战允许", leader.Number);
+            }
+        }
+
         // 4. 每张卡：存在 + 非领航 + 卡集白名单 + 颜色与领航相容
         foreach (var num in counts.Keys)
         {
@@ -104,12 +206,57 @@ public static class DeckValidator
                 return new(false, $"卡牌不存在：{num}", leader.Number);
             if (card.Kind == CardKind.Leader)
                 return new(false, $"主卡组不能包含领航卡：{num}", leader.Number);
+            if (card.Playability == CardPlayability.Pending)
+                return PendingCard(num, leader.Number);
+            if (enforcePublicBanList && PlatformBannedCards.Contains(card.Number))
+                return PlatformBannedCard(num, leader.Number);
+            if (enforcePublicBanList && OfficialBannedCards.Contains(card.Number))
+                return OfficialBannedCard(num, leader.Number);
+            if (enforceStandardRotation && IsRotatedOutOfStandard(card))
+                return new(false, $"标准模式不能使用禁限卡：{num}；可改用狂野模式", leader.Number);
             if (allowed is not null && !allowed.Contains(card.SetCode))
                 return new(false, $"{rule.Name} 格式：主卡组不能包含 {num}（{card.SetCode} 卡集）", leader.Number);
+            if (leader.Number == "P-117" && !card.HasKeyword("东海"))
+                return new(false, $"P-117 奈美的主卡组只能包含拥有《东海》特征的卡牌：{num}", leader.Number);
+            if (leader.Number == "ST37-001" && !card.HasKeyword("阿拉巴斯坦王国"))
+                return new(false, $"ST37-001 路飞的主卡组只能包含拥有《阿拉巴斯坦王国》特征的卡牌：{num}", leader.Number);
+            if (leader.Number == "OP12-001" && card.Cost >= 5)
+                return new(false, $"OP12-001 希尔巴兹·雷利的主卡组不能包含费用为 5 或更高的卡牌：{num}", leader.Number);
             if (!card.SharesColorWith(leader))
                 return new(false, $"颜色不符：{num}（{card.Color}）与领航（{leader.Color}）无共同颜色", leader.Number);
         }
 
         return new(true, null, leader.Number);
     }
+
+    private static bool IsRotatedOutOfStandard(CardInfo card)
+        => card.Subscript == 1 && !StandardLegalSubscriptOneCards.Contains(card.Number);
+
+    private static Result OfficialBannedCard(string cardNumber, string leaderNumber)
+        => new(
+            false,
+            $"公开对战不能使用官方禁卡：{cardNumber}；仅好友或房间对战允许",
+            leaderNumber);
+
+    private static Result PlatformBannedCard(string cardNumber, string leaderNumber)
+        => new(
+            false,
+            $"公开对战不能使用平台禁卡：{cardNumber}；仅好友或房间对战允许",
+            leaderNumber);
+
+    private static string[] ParseCardNumbers(string deckRaw)
+        => string.IsNullOrWhiteSpace(deckRaw)
+            ? Array.Empty<string>()
+            : deckRaw
+                .Replace("\r\n", "\n")
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(line => line.Trim())
+                .Where(line => line.Length > 0)
+                .ToArray();
+
+    private static Result PendingCard(string cardNumber, string leaderNumber)
+        => new(
+            false,
+            $"卡牌效果开发中，暂不可用于对战：{cardNumber}",
+            leaderNumber);
 }

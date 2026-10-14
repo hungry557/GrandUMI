@@ -1,42 +1,129 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading.Channels;
+using System.Text.RegularExpressions;
 using GrandUMI.Cluster;
 using GrandUMI.Diagnostics;
+using GrandUMI.Effects.Rules;
 using GrandUMI.Game.Logging;
 using GrandUMI.Game.Snapshot;
 using GrandUMI.Game.Stats;
+using GrandUMI.Game.Ranked;
+using GrandUMI.Game.Validation;
+using GrandUMI.Persistence;
+using GrandUMI.Training;
 
 namespace GrandUMI.Game;
 
 /// <summary>
 /// 房间池：管理活跃的 GameEngine 实例 + 会话↔房间映射 + 断线宽限期
 /// </summary>
-public static class GameRoomManager
+public static partial class GameRoomManager
 {
     public static IRoomPlacementDirectory RoomDirectory { get; set; } = LocalRoomPlacementDirectory.Instance;
     private const int GracePeriodSeconds = 90;
+    private const long OperationTimeLimitMs = 20 * 60 * 1000;
+    internal const long OperationTurnTimeLimitMs = 6 * 60 * 1000;
+    internal const long OperationTurnExtendedTimeLimitMs = 8 * 60 * 1000;
+    internal const long InactivityWarningThresholdMs = 60 * 1000;
+    internal const long InactivityLossLimitMs = 4 * 60 * 1000;
+    private static readonly Regex FeedbackCardNumberPattern = new(
+        @"\b(?:OP|ST|EB|PRB)\d{2}-\d{3}\b|\bP-\d{3}\b",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    private static readonly Regex FeedbackGuidPattern = new(
+        @"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    private static readonly Regex FeedbackActionNamePattern = new(
+        @"^[A-Za-z][A-Za-z0-9_]{0,79}$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
     /// <summary>仅排障时开启；私有快照平均约 63 KB，不应作为正式服常态日志。</summary>
     private static readonly bool PrivateSnapshotLogEnabled =
         string.Equals(Environment.GetEnvironmentVariable("GRANDUMI_PRIVATE_SNAPSHOT_LOG"), "1", StringComparison.OrdinalIgnoreCase)
         || string.Equals(Environment.GetEnvironmentVariable("GRANDUMI_PRIVATE_SNAPSHOT_LOG"), "true", StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>对局存活上限：自最后一次操作起超过此时长即弃局（重启不恢复）。</summary>
-    private static readonly TimeSpan RestoreTtl = TimeSpan.FromMinutes(30);
+    /// <summary>对局无有效操作的存活上限；启动恢复与运行期清理使用同一口径。</summary>
+    internal static readonly TimeSpan RoomInactivityTimeout = TimeSpan.FromMinutes(30);
+
+    /// <summary>运行期死房间扫描间隔。</summary>
+    internal static readonly TimeSpan RoomExpirationSweepInterval = TimeSpan.FromMinutes(1);
 
     /// <summary>房间池</summary>
     private static readonly ConcurrentDictionary<string, RoomEntry> _rooms = new();
-    private static int _roomsBeingCreated;
+    private static readonly ConcurrentDictionary<string, string> _accountRoom = new(StringComparer.OrdinalIgnoreCase);
+    private static GameMaintenanceState Maintenance = new();
+    private static CloudReplayStore? CloudReplays;
 
     public static int RoomCount => _rooms.Count;
+    public static bool HasActivePlayerAccount(string account)
+        => !string.IsNullOrWhiteSpace(account)
+           && _accountRoom.TryGetValue(account, out var roomId)
+           && _rooms.ContainsKey(roomId);
+    internal static bool TryGetAccountRoomOccupancy(
+        string? account,
+        out AccountRoomOccupancy occupancy)
+    {
+        occupancy = default;
+        if (string.IsNullOrWhiteSpace(account)
+            || !_accountRoom.TryGetValue(account, out var roomId))
+            return false;
+
+        if (roomId.StartsWith("creating:", StringComparison.Ordinal))
+        {
+            occupancy = new AccountRoomOccupancy(roomId, AccountRoomOccupancyKind.Creating);
+            return true;
+        }
+        if (_rooms.TryGetValue(roomId, out var room))
+        {
+            occupancy = new AccountRoomOccupancy(
+                roomId,
+                room.Engine.State.IsGameOver
+                    ? AccountRoomOccupancyKind.TerminalFinalizing
+                    : AccountRoomOccupancyKind.ActiveGame);
+            return true;
+        }
+
+        // 映射可能正处于创建提交或清理的极短窗口；仍返回明确的状态变更提示，
+        // 不把这一类可重试冲突伪装成服务器整体繁忙。
+        occupancy = new AccountRoomOccupancy(roomId, AccountRoomOccupancyKind.StateChanging);
+        return true;
+    }
     public static int SpectatorCount => _rooms.Values.Sum(room => room.Spectators.Count);
     public static int TotalActionQueueDepth => _rooms.Values.Sum(room => Math.Max(0, Volatile.Read(ref room.ActionQueueDepth)));
+    public static int RecoveryPausedRoomCount => _rooms.Values.Count(room => room.RecoveryAvailability != RoomRecoveryAvailability.Healthy);
+    public static long RecoveryPausedTotal => RecoveryReliabilityHealth.PausedTotal;
+    public static long RecoveryQuarantinedTotal => RecoveryReliabilityHealth.QuarantinedTotal;
+    public static IReadOnlyDictionary<string, int> RoomCountsByRuleset
+        => _rooms.Values
+            .GroupBy(room => room.Engine.State.RulesetId, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+
+    public static MaintenanceSnapshot GetMaintenanceSnapshot()
+        => Maintenance.GetSnapshot(RoomCount);
+
+    public static MaintenanceSnapshot SetMaintenanceMode(bool enabled)
+        => Maintenance.SetEnabled(enabled, RoomCount);
+
+    public static void InitializeMaintenance(string persistencePath)
+        => Maintenance = new GameMaintenanceState(persistencePath);
+
+    public static void ConfigureCloudReplays(CloudReplayStore? store)
+        => CloudReplays = store;
 
     /// <summary>sessionId → roomId</summary>
     private static readonly ConcurrentDictionary<string, string> _sessionRoom = new();
 
     /// <summary>roomId → 断线计时器</summary>
     private static readonly ConcurrentDictionary<string, CancellationTokenSource> _grace = new();
+
+    /// <summary>roomId → 先后手选择超时任务；实际结算仍排入房间串行队列。</summary>
+    private static readonly ConcurrentDictionary<string, StartingPlayerChoiceTimeout> _startingPlayerChoiceTimeouts = new();
+    private sealed record StartingPlayerChoiceTimeout(
+        DateTime DeadlineUtc,
+        CancellationTokenSource Cancellation,
+        CancellationToken Token,
+        int RetryAttempt);
 
     /// <summary>roomId → 调度手牌超时任务；实际结算仍排入房间串行队列。</summary>
     private static readonly ConcurrentDictionary<string, MulliganTimeout> _mulliganTimeouts = new();
@@ -46,23 +133,69 @@ public static class GameRoomManager
         CancellationToken Token,
         int RetryAttempt);
 
+    /// <summary>roomId → 海克斯私密选秀超时任务；只负责入队，选择与随机数均由权威引擎动作完成。</summary>
+    private static readonly ConcurrentDictionary<string, HexDraftTimeout> _hexDraftTimeouts = new();
+    private sealed record HexDraftTimeout(
+        string RoundId,
+        DateTime DeadlineUtc,
+        CancellationTokenSource Cancellation,
+        CancellationToken Token,
+        int RetryAttempt);
+
     public class RoomEntry
     {
         public required string RoomId { get; init; }
         public required GameEngine Engine { get; init; }
+        internal OpeningPreparationGate? OpeningPreparation { get; set; }
         public required string[] PlayerSessionIds { get; init; }  // [P0, P1]
         public required string[] PlayerAccounts   { get; init; }
-        /// <summary>观战会话及其主视角座位（0/1）。</summary>
-        public ConcurrentDictionary<string, int> Spectators { get; } = new();
-        public DateTime CreatedAt { get; } = DateTime.UtcNow;
-        public string? ReplayPath { get; set; }
+        public required string[] PlayerDisplayNames { get; init; }
+        /// <summary>观战会话、主视角与个人手牌授权。</summary>
+        public ConcurrentDictionary<string, SpectatorConnection> Spectators { get; } = new();
+        public string[] SpectateModes { get; init; } = [SpectatingRules.Open, SpectatingRules.Open];
+        public bool[] SpectatorHandsPublic { get; init; } = [false, false];
+        public string?[] SpectateCodes { get; init; } = [null, null];
+        public ConcurrentDictionary<string, byte> KickedSpectatorAccounts { get; } = new(StringComparer.OrdinalIgnoreCase);
+        internal object SpectatorGate { get; } = new();
+        internal Dictionary<string, SpectatorHandRequest> PendingHandRequests { get; } = new(StringComparer.Ordinal);
+        public DateTime CreatedAt { get; init; } = DateTime.UtcNow;
+        private long _lastActivityUtcTicks = DateTime.UtcNow.Ticks;
+        public DateTime LastActivityUtc
+            => new(Interlocked.Read(ref _lastActivityUtcTicks), DateTimeKind.Utc);
+
+        internal void MarkActivity(DateTime? activityUtc = null)
+        {
+            var normalized = activityUtc?.ToUniversalTime() ?? DateTime.UtcNow;
+            Interlocked.Exchange(ref _lastActivityUtcTicks, normalized.Ticks);
+        }
         public string? MatchLogPath { get; set; }
         /// <summary>是否为单人测试模式（P1 为机器人）</summary>
         public bool VsBot { get; init; }
         /// <summary>对局来源，用于 Leader 统计与后续分模式分析。</summary>
         public MatchKind MatchKind { get; init; }
-        /// <summary>机器人思考是否已排队（去抖）</summary>
-        public bool BotScheduled { get; set; }
+        internal object ClockGate { get; } = new();
+        internal long OperationClockActiveSince;
+        internal CancellationTokenSource? OperationClockTimer;
+        internal int OperationClockTimerVersion;
+        /// <summary>挂机计时只使用单调时钟；与操作棋钟共用 ClockGate 和唯一计时任务。</summary>
+        internal int InactivityActivePlayer = -1;
+        internal long InactivityActiveSince;
+        /// <summary>等待动作判定、断线或平局协商暂停时保存的本段连续无操作时长；合法操作被接受后会清零。</summary>
+        internal int InactivityPausedPlayer = -1;
+        internal long InactivityPausedElapsedMs;
+        internal bool[] DisconnectedPlayers { get; } = new bool[2];
+        internal long[] DisconnectGraceRemainingMs { get; } = [GracePeriodSeconds * 1000L, GracePeriodSeconds * 1000L];
+        internal long[] DisconnectStartedAt { get; } = new long[2];
+        /// <summary>连接诊断只记录代际与次数，不保存会话标识。</summary>
+        internal int[] ConnectionGenerations { get; } = [1, 1];
+        internal int[] ReconnectCounts { get; } = new int[2];
+        internal int[] DisconnectCounts { get; } = new int[2];
+        internal bool RestoredFromRecovery { get; set; }
+        internal object FeedbackEvidenceGate { get; } = new();
+        internal Queue<RecentFeedbackAction> RecentFeedbackActions { get; } = new();
+        internal long FeedbackActionSequence;
+        /// <summary>机器人思考是否已排队（0=空闲，1=延迟/队列/决策中）。</summary>
+        internal int BotScheduleState;
         /// <summary>关联的友谊战房间 ID(非友谊战为 null);对局结束时回调更新比分并退回房间</summary>
         public string? FriendlyRoomId { get; set; }
         internal Channel<RoomWork> ActionQueue { get; } = Channel.CreateBounded<RoomWork>(new BoundedChannelOptions(256)
@@ -74,9 +207,98 @@ public static class GameRoomManager
         });
         internal Task ActionWorker { get; set; } = Task.CompletedTask;
         internal int ActionQueueDepth;
+        /// <summary>同一玩家的 requestId 只执行一次；房间销毁时随 RoomEntry 一并释放。</summary>
+        internal RequestDedupeWindow ProcessedPlayerRequests { get; } = new(512, TimeSpan.FromMinutes(10));
+        /// <summary>服务端为已接受动作分配的持久化序号。</summary>
+        internal long JournalSequence;
+        internal long[] LastOperationSequences { get; } = [-1, -1];
+        internal int AcceptedActionsSinceSnapshot;
+        internal ReplayCheckpointLogCoordinator? ReplayCheckpoints;
+        internal RoomOutboundCommitGate OutboundCommitGate { get; } = new();
+        internal RoomRecoveryAvailability RecoveryAvailability;
+        internal string? RecoveryFailureReason;
+        internal CloudReplayCapture? CloudReplay;
+        /// <summary>终局收尾的单房间互斥门；房间只有在全部核心权威持久化完成后才可从池中移除。</summary>
+        internal object CleanupGate { get; } = new();
+        internal DateTime? TerminalCompletedAtUtc;
+        internal bool TerminalOutcomePersisted;
+        internal bool RankedSettlementCompleted;
+        internal bool LeaderStatsCompleted;
+        internal bool CloudReplayCompleted;
+        internal bool TerminalMatchLogCompleted;
+        internal string? TerminalFinalizationFailure;
+        internal string? CloudReplayFinalizationFailure;
+        /// <summary>云回放补偿意图未能落盘时保留房间 WAL/快照，供进程恢复再次补偿；不保留内存占位。</summary>
+        internal bool PreserveRecoveryArtifactsForCloudReplay;
+        internal ChatDecorationCinematicRuntime ChatDecorationCinematics { get; } = new();
+        public bool IsRecoveryPaused => RecoveryAvailability != RoomRecoveryAvailability.Healthy;
+        public string? RecoveryPauseReason => RecoveryFailureReason;
     }
 
     internal sealed record RoomWork(string Name, long EnqueuedAt, Func<Task> Execute, long ReceivedAt = 0);
+
+    private sealed record RecoveredServerTerminal(
+        long JournalSequence,
+        int WinnerIndex,
+        int ExpiredPlayer,
+        string TerminalKind,
+        string Reason,
+        DateTime CompletedAtUtc);
+
+    internal sealed record RecentFeedbackAction(
+        long Sequence,
+        DateTime AtUtc,
+        int ActorIndex,
+        string Action,
+        string Outcome,
+        string? RequestId,
+        string? Reason,
+        GameActionSource Source,
+        string? CardNumber = null,
+        string? PromptId = null,
+        string? PromptKind = null);
+
+    private static void DeliverPlayerPayload(RoomEntry room, int playerIndex, object payload)
+        => room.OutboundCommitGate.Deliver(() =>
+            WebSocketBridge.Send(room.PlayerSessionIds[playerIndex], payload));
+
+    private static void DeliverSpectatorPayload(RoomEntry room, string sessionId, object payload)
+        => room.OutboundCommitGate.Deliver(() => WebSocketBridge.Send(sessionId, payload));
+
+    private static void PauseForRecoveryFailure(RoomEntry room, string reason, Exception exception)
+    {
+        if (room.RecoveryAvailability != RoomRecoveryAvailability.Healthy) return;
+        room.RecoveryAvailability = RoomRecoveryAvailability.Paused;
+        room.RecoveryFailureReason = reason;
+        room.OutboundCommitGate.AbortAndBlock();
+        lock (room.ClockGate)
+        {
+            StopOperationClockLocked(room);
+            room.Engine.State.OperationClockPaused = true;
+        }
+        CancelStartingPlayerChoiceTimeout(room.RoomId);
+        CancelMulliganTimeout(room.RoomId);
+        CancelHexDraftTimeout(room.RoomId);
+        foreach (var sessionId in room.PlayerSessionIds)
+        {
+            if (!_grace.TryRemove(room.RoomId + ":" + sessionId, out var grace)) continue;
+            grace.Cancel();
+            grace.Dispose();
+        }
+        RecoveryReliabilityHealth.RecordPaused();
+        Console.Error.WriteLine($"[恢复可靠性] 房间 {room.RoomId} 已安全暂停：{reason}；{exception.Message}");
+        foreach (var sessionId in room.PlayerSessionIds)
+        {
+            if (sessionId.StartsWith("offline-", StringComparison.Ordinal)) continue;
+            WebSocketBridge.Send(sessionId, new
+            {
+                proto = "MsgGameRecoveryPaused",
+                roomId = room.RoomId,
+                reason,
+                message = "恢复存储暂时不可用，对局已安全暂停，未确认操作不会被继续执行。",
+            });
+        }
+    }
 
     /// <summary>双方匹配/房间码成功后创建房间</summary>
     public static RoomEntry CreateRoom(string p0Sid, string p0Account, string p0Deck,
@@ -89,12 +311,28 @@ public static class GameRoomManager
                                           bool vsBot = false,
                                           string? friendlyRoomId = null,
                                           MatchKind matchKind = MatchKind.UnknownHuman,
-                                          bool broadcastInitialState = true)
+                                          bool broadcastInitialState = true,
+                                          string? p0DisplayName = null,
+                                          string? p1DisplayName = null,
+                                          string? p0SpectateMode = null,
+                                          string? p1SpectateMode = null,
+                                          bool p0SpectatorHandsPublic = false,
+                                          bool p1SpectatorHandsPublic = false,
+                                          string? p0SpectateCode = null,
+                                          string? p1SpectateCode = null,
+                                          bool hexMode = false,
+                                          int openingReadinessMask = 0)
     {
         if (string.Equals(p0Sid, p1Sid, StringComparison.Ordinal))
             throw new InvalidOperationException("同一连接不能同时作为对局双方");
         if (!vsBot && string.Equals(p0Account, p1Account, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("同一账号不能同时作为真人对局双方");
+
+        EnsureNewGameDeckPlayable("玩家 1", p0Deck);
+        EnsureNewGameDeckPlayable(vsBot ? "机器人" : "玩家 2", p1Deck);
+
+        using var accountAdmission = ReserveAccountSeats(
+            vsBot ? [p0Account] : [p0Account, p1Account]);
 
         if (!ServerCapacity.CanCreateRoom(out var overloadReason))
             throw new InvalidOperationException($"服务器暂时无法创建新对局：{overloadReason}");
@@ -112,7 +350,12 @@ public static class GameRoomManager
             (p1Sid, p1Account, p1Deck),
             firstPlayer: firstPlayer,
             leaderKeywordWildcard: vsBot,
-            deferOpeningSetupUntilFirstPlayerChosen: openingSetupAfterFirstPlayerChoice);
+            deferOpeningSetupUntilFirstPlayerChosen: openingSetupAfterFirstPlayerChoice,
+            deferInitialSetupUntilStart: true,
+            matchKind: matchKind,
+            hexMode: hexMode);
+        engine.State.Players[0].DisplayName = p0DisplayName ?? p0Account;
+        engine.State.Players[1].DisplayName = p1DisplayName ?? p1Account;
         engine.EnablePrivateSnapshotLog = PrivateSnapshotLogEnabled;
         engine.State.Players[0].AlwaysPromptOnLifeReveal = p0AlwaysPrompt;
         engine.State.Players[1].AlwaysPromptOnLifeReveal = p1AlwaysPrompt;
@@ -127,50 +370,107 @@ public static class GameRoomManager
             Engine = engine,
             PlayerSessionIds = new[] { p0Sid, p1Sid },
             PlayerAccounts   = new[] { p0Account, p1Account },
+            PlayerDisplayNames = new[] { p0DisplayName ?? p0Account, p1DisplayName ?? p1Account },
+            SpectateModes = [SpectatingRules.NormalizeMode(p0SpectateMode), SpectatingRules.NormalizeMode(p1SpectateMode)],
+            SpectatorHandsPublic = [p0SpectatorHandsPublic, p1SpectatorHandsPublic],
+            SpectateCodes = [p0SpectateCode, p1SpectateCode],
             VsBot = vsBot,
             MatchKind = matchKind,
             FriendlyRoomId = friendlyRoomId,
+        };
+        if (ReplayCheckpointFeature.IsEnabled())
+            entry.ReplayCheckpoints = new ReplayCheckpointLogCoordinator(roomId);
+        engine.State.MatchKind = matchKind;
+        var readinessMask = openingReadinessMask & (vsBot ? 1 : 3);
+        if (readinessMask != 0)
+        {
+            entry.OpeningPreparation = new OpeningPreparationGate(readinessMask,
+                DateTime.UtcNow.AddSeconds(OpeningPreparationTimeoutSeconds));
+            engine.State.OpeningPreparationDeadlineUtc = entry.OpeningPreparation.DeadlineUtc;
+        }
+        AttachRankIdentities(engine.State, matchKind, entry.PlayerAccounts, entry.PlayerDisplayNames);
+        engine.State.OperationClockEnabled = UsesPublicMatchClock(matchKind);
+        engine.State.OperationClockRemainingMs[0] = OperationTimeLimitMs;
+        engine.State.OperationClockRemainingMs[1] = OperationTimeLimitMs;
+        ResetOperationTurnClock(engine.State);
+        ConfigureChatDecorationCinematics(entry);
+        engine.BeforeSnapshot = () => SyncOperationClock(entry);
+        engine.OnOpeningSequenceReady = () =>
+        {
+            EnsureStartingPlayerChoiceTimeout(entry);
+            EnsureMulliganTimeout(entry);
+            EnsureHexDraftTimeout(entry);
         };
 
         // 配置回调：人类走 WS 下发；单人模式下 P1(机器人) 的消息驱动 BotDriver 思考
         engine.OnSendToPlayer = (idx, payload) =>
         {
-            if (idx == 1 && vsBot) { BotDriver.OnBotMessage(entry); return; }
-            WebSocketBridge.Send(entry.PlayerSessionIds[idx], payload);
+            entry.CloudReplay?.AppendSnapshot(idx, payload);
+            if (idx == 1 && vsBot)
+            {
+                if (engine.State.OpeningPreparationDeadlineUtc is null) BotDriver.OnBotMessage(entry);
+                return;
+            }
+            DeliverPlayerPayload(entry, idx, payload);
         };
 
-        engine.OnSendToSpectators = (viewPlayerIndex, payload) =>
+        engine.OnSendToSpectators = (viewPlayerIndex, payload, handPayload) =>
         {
             foreach (var spectator in entry.Spectators)
             {
-                if (spectator.Value == viewPlayerIndex)
-                    WebSocketBridge.Send(spectator.Key, payload);
+                if (spectator.Value.ViewPlayerIndex == viewPlayerIndex)
+                    DeliverSpectatorPayload(entry, spectator.Key,
+                        spectator.Value.HandVisible && handPayload is not null ? handPayload : payload);
             }
         };
         engine.HasSpectators = () => !entry.Spectators.IsEmpty;
         engine.HasSpectatorsForPerspective = viewPlayerIndex =>
-            entry.Spectators.Values.Any(value => value == viewPlayerIndex);
-        entry.ReplayPath = ReplayRecorder.Open(roomId);
+            entry.Spectators.Values.Any(value => value.ViewPlayerIndex == viewPlayerIndex);
+        engine.HasSpectatorsWithHandForPerspective = viewPlayerIndex =>
+            entry.Spectators.Values.Any(value => value.ViewPlayerIndex == viewPlayerIndex && value.HandVisible);
         entry.MatchLogPath = MatchLogRecorder.Open(roomId);
-        engine.OnReplay = (entryObj) => ReplayRecorder.Append(roomId, entryObj);
-        engine.OnMatchLog = (kind, actor, payload) => MatchLogRecorder.Append(roomId, engine.State, kind, actor, payload);
-
-        engine.RecordMatchLog("match_start", -1, new
+        engine.OnMatchLogWithReceipt = (kind, actor, payload) =>
         {
-            players = new[]
-            {
-                new { index = 0, accountName = p0Account, deckRaw = p0Deck },
-                new { index = 1, accountName = p1Account, deckRaw = p1Deck },
-            },
+            var receipt = MatchLogRecorder.Append(roomId, engine.State, kind, actor, payload);
+            entry.ReplayCheckpoints?.Observe(engine.State, kind, actor, payload, receipt);
+            return receipt;
+        };
+
+        var replayIdentity = ReplayRuntimeIdentityProvider.For(
+            engine.State.Ruleset ?? CardRulesetManager.GetRequired(engine.State.RulesetId));
+        try
+        {
+            entry.CloudReplay = CloudReplays?.BeginMatch(new CloudReplayMatchStart(
+                roomId,
+                entry.CreatedAt,
+                matchKind.ToString(),
+                replayIdentity,
+                new CloudReplayPlayer(p0Account, entry.PlayerDisplayNames[0], Record: true),
+                new CloudReplayPlayer(p1Account, entry.PlayerDisplayNames[1], Record: !vsBot)));
+        }
+        catch (Exception ex)
+        {
+            // 云回放属于赛后能力；存储不可用不得扩大为正在进行对局的失败。
+            entry.CloudReplay = null;
+            Console.Error.WriteLine($"[云回放] 房间 {roomId} 未开始录制：{ex.Message}");
+        }
+        engine.RecordMatchLog("match_start", -1, ReplayRuntimeIdentityFactory.CreateMatchStartPayload(
+            replayIdentity,
+            [
+                new ReplayMatchStartPlayer(0, p0Account, p0Deck, p0AlwaysPrompt),
+                new ReplayMatchStartPlayer(1, p1Account, p1Deck, p1AlwaysPrompt),
+            ],
             firstPlayer,
-            startingPlayerChooser = engine.State.StartingPlayerChooser,
-            startingDiceRolls = engine.State.StartingDiceRounds,
-            rngSeed = engine.State.RngSeed,
+            engine.State.StartingPlayerChooser,
+            engine.State.StartingDiceRounds.Select(round => (object)new
+            {
+                player0 = round.Player0,
+                player1 = round.Player1,
+            }).ToArray(),
+            engine.State.RngSeed,
             openingSetupAfterFirstPlayerChoice,
-            matchKind = matchKind.ToString(),
-            rulesVersion = "opcg-grandumi-v1",
-            cardDbVersion = "local-card-json",
-        });
+            matchKind.ToString(),
+            leaderKeywordWildcard: vsBot));
         engine.FlushPendingMatchLogs();
 
         // 动作日志持久化（仅 PvP 真人对局；重启恢复用）
@@ -182,30 +482,59 @@ public static class GameRoomManager
                 roomId,
                 seed = engine.State.RngSeed,
                 firstPlayer,
+                rulesetId = engine.State.RulesetId,
+                hexMode = engine.State.HexState.Enabled,
+                hexRulesRevision = engine.State.HexState.RulesRevision,
+                hexCatalogRevision = engine.State.HexState.CatalogRevision,
+                hexCatalogDigest = engine.State.HexState.CatalogDigest,
+                hexCatalogTiers = engine.State.HexState.CatalogTiers
+                    .OrderBy(item => item.Key)
+                    .Select(item => new { id = item.Key, tier = item.Value.ToString() })
+                    .ToArray(),
                 openingSetupAfterFirstPlayerChoice,
-                p0 = new { account = p0Account, deckRaw = p0Deck, alwaysPrompt = p0AlwaysPrompt, cardBackId = p0CardBackId, spriteMap = engine.State.Players[0].SpriteMap },
-                p1 = new { account = p1Account, deckRaw = p1Deck, alwaysPrompt = p1AlwaysPrompt, cardBackId = p1CardBackId, spriteMap = engine.State.Players[1].SpriteMap },
+                p0 = new { account = p0Account, displayName = entry.PlayerDisplayNames[0], deckRaw = p0Deck, alwaysPrompt = p0AlwaysPrompt, cardBackId = p0CardBackId, spriteMap = engine.State.Players[0].SpriteMap, spectateMode = entry.SpectateModes[0], spectatorHandsPublic = entry.SpectatorHandsPublic[0], spectateCode = entry.SpectateCodes[0] },
+                p1 = new { account = p1Account, displayName = entry.PlayerDisplayNames[1], deckRaw = p1Deck, alwaysPrompt = p1AlwaysPrompt, cardBackId = p1CardBackId, spriteMap = engine.State.Players[1].SpriteMap, spectateMode = entry.SpectateModes[1], spectatorHandsPublic = entry.SpectatorHandsPublic[1], spectateCode = entry.SpectateCodes[1] },
                 vsBot,
                 matchKind = matchKind.ToString(),
                 createdAtUtc = DateTime.UtcNow,
+                chatDecorations = entry.ChatDecorationCinematics.ExportForJournal(),
             });
-            engine.OnPersistAction = (pi, act, data) => RoomJournal.Append(roomId, pi, act, data);
+            engine.OnPersistActionWithSource = (pi, act, data, requestId, source, feedbackContext) =>
+                PersistAcceptedAction(entry, pi, act, data, requestId, source, feedbackContext);
         }
 
+        CaptureRecoverySnapshot(entry);
         _rooms[roomId] = entry;
         RoomDirectory.RegisterLocal(roomId);
+        if (broadcastInitialState && entry.OpeningPreparation is null)
+            engine.BeginOpeningSequence();
+        if (broadcastInitialState && entry.OpeningPreparation is null)
+            ScheduleOpeningReplayCheckpoint(entry);
+        else if (entry.ReplayCheckpoints is not null && !broadcastInitialState && entry.OpeningPreparation is null)
+            entry.ReplayCheckpoints.Disable(engine.State, "opening_sequence_not_started");
         WebSocketBridge.OnGameChatParticipantJoined(p0Sid);
         WebSocketBridge.OnGameChatParticipantJoined(p1Sid);
         _sessionRoom[p0Sid] = roomId;
         _sessionRoom[p1Sid] = roomId;
         WebSocketBridge.BroadcastSpectatorList(entry);
         StartActionWorker(entry);
+        EnsureStartingPlayerChoiceTimeout(entry);
         EnsureMulliganTimeout(entry);
+        EnsureHexDraftTimeout(entry);
+        accountAdmission.Commit(roomId);
 
         // 骰点对局先等待胜者选择先后手；单人测试沿用预设先后手并直接进入 mulligan。
         if (broadcastInitialState)
-            engine.BroadcastInitialState();
+            BroadcastInitialState(entry);
+        TerminalOutcomeStore.DeleteForAccounts(entry.PlayerAccounts);
         return entry;
+    }
+
+    private static void EnsureNewGameDeckPlayable(string playerLabel, string deck)
+    {
+        var validation = DeckValidator.ValidateNewGamePlayability(deck);
+        if (!validation.Ok)
+            throw new InvalidOperationException($"无法开始对局：{playerLabel}卡组{validation.Reason}");
     }
 
     private static void CopySpriteMap(
@@ -217,12 +546,55 @@ public static class GameRoomManager
             target[number] = sprite;
     }
 
+    private static AccountSeatLease ReserveAccountSeats(IEnumerable<string> accounts)
+    {
+        var normalized = accounts.Where(account => !string.IsNullOrWhiteSpace(account))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        string reservationId = "creating:" + Guid.NewGuid().ToString("N");
+        var claimed = new List<string>();
+        foreach (var account in normalized)
+        {
+            if (_accountRoom.TryAdd(account, reservationId))
+            {
+                claimed.Add(account);
+                continue;
+            }
+            foreach (var existing in claimed)
+                _accountRoom.TryRemove(new KeyValuePair<string, string>(existing, reservationId));
+            if (!TryGetAccountRoomOccupancy(account, out var occupancy))
+                occupancy = new AccountRoomOccupancy("state-changing", AccountRoomOccupancyKind.StateChanging);
+            throw new AccountRoomOccupiedException(account, occupancy);
+        }
+        return new AccountSeatLease(reservationId, claimed);
+    }
+
+    private sealed class AccountSeatLease(string reservationId, IReadOnlyList<string> accounts) : IDisposable
+    {
+        private string? _roomId;
+
+        public void Commit(string roomId)
+        {
+            foreach (var account in accounts)
+                _accountRoom.TryUpdate(account, roomId, reservationId);
+            _roomId = roomId;
+        }
+
+        public void Dispose()
+        {
+            if (_roomId is not null) return;
+            foreach (var account in accounts)
+                _accountRoom.TryRemove(new KeyValuePair<string, string>(account, reservationId));
+        }
+    }
+
     private static IDisposable ReserveRoomCreation()
     {
-        var creating = Interlocked.Increment(ref _roomsBeingCreated);
-        if (RoomCount + creating <= ServerCapacity.MaxRooms) return new RoomAdmissionLease();
-        Interlocked.Decrement(ref _roomsBeingCreated);
-        throw new InvalidOperationException("服务器暂时无法创建新对局：room_limit");
+        if (Maintenance.TryReserveRoomCreation(RoomCount, ServerCapacity.MaxRooms, out var rejectionReason))
+            return new RoomAdmissionLease();
+        if (string.Equals(rejectionReason, GameMaintenanceState.PlayerMessage, StringComparison.Ordinal))
+            throw new GameMaintenanceException(GameMaintenanceState.PlayerMessage);
+        throw new InvalidOperationException(rejectionReason ?? "服务器暂时无法创建新对局");
     }
 
     private sealed class RoomAdmissionLease : IDisposable
@@ -232,7 +604,10 @@ public static class GameRoomManager
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _released, 1) == 0)
-                Interlocked.Decrement(ref _roomsBeingCreated);
+            {
+                var snapshot = Maintenance.CompleteRoomCreation(RoomCount);
+                if (snapshot.Enabled) WebSocketBridge.BroadcastMaintenanceState();
+            }
         }
     }
 
@@ -241,6 +616,253 @@ public static class GameRoomManager
 
     public static RoomEntry? GetRoom(string roomId)
         => _rooms.TryGetValue(roomId, out var e) ? e : null;
+
+    /// <summary>
+    /// 在房间单读者队列中采集反馈证据，保证状态、动作结果和日志序号来自同一权威时点。
+    /// 队列关闭、超时或已离开房间时返回明确的不可用状态，不退化为并发读取可变 GameState。
+    /// </summary>
+    internal static async Task<JsonObject> CaptureFeedbackEvidenceAsync(string sessionId)
+    {
+        var room = GetRoomBySession(sessionId);
+        if (room is null) return BuildUnavailableFeedbackEvidence("not_in_room");
+        var viewerIndex = Array.IndexOf(room.PlayerSessionIds, sessionId);
+        if (viewerIndex is not (0 or 1)) return BuildUnavailableFeedbackEvidence("not_a_player");
+
+        var completion = new TaskCompletionSource<JsonObject>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var work = new RoomWork("CaptureFeedbackEvidence", LatencyDiagnostics.Start(), () =>
+        {
+            completion.TrySetResult(BuildFeedbackEvidence(room, viewerIndex));
+            return Task.CompletedTask;
+        });
+
+        if (!await EnqueueCriticalWorkAsync(room, work, timeout.Token))
+            return BuildUnavailableFeedbackEvidence("room_queue_unavailable");
+        try
+        {
+            return await completion.Task.WaitAsync(timeout.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return BuildUnavailableFeedbackEvidence("room_capture_timeout");
+        }
+    }
+
+    private static JsonObject BuildUnavailableFeedbackEvidence(string status) => new()
+    {
+        ["schema"] = "grandumi.feedback.authority.v1",
+        ["trust"] = "server_authoritative",
+        ["captureStatus"] = status,
+        ["server"] = new JsonObject
+        {
+            ["version"] = BuildInfo.Version,
+            ["commit"] = BuildInfo.Commit,
+        },
+    };
+
+    private static JsonObject BuildFeedbackEvidence(RoomEntry room, int viewerIndex)
+    {
+        var state = room.Engine.State;
+        JsonObject clock;
+        JsonObject connection;
+        lock (room.ClockGate)
+        {
+            var cutoff = Stopwatch.GetTimestamp();
+            ChargeOperationClockLocked(room, cutoff);
+            UpdateInactivitySnapshotLocked(room, cutoff);
+            clock = new JsonObject
+            {
+                ["enabled"] = state.OperationClockEnabled,
+                ["paused"] = state.OperationClockPaused,
+                ["active"] = RelativePlayer(state.OperationClockActivePlayer, viewerIndex),
+                ["syncUtc"] = state.OperationClockSyncUtc?.ToString("O"),
+                ["selfRemainingMs"] = state.OperationClockRemainingMs[viewerIndex],
+                ["opponentRemainingMs"] = state.OperationClockRemainingMs[1 - viewerIndex],
+                ["selfTurnRemainingMs"] = state.OperationTurnClockRemainingMs[viewerIndex],
+                ["opponentTurnRemainingMs"] = state.OperationTurnClockRemainingMs[1 - viewerIndex],
+                ["selfExtensionUsed"] = state.OperationTurnExtensionUsed[viewerIndex],
+                ["opponentExtensionUsed"] = state.OperationTurnExtensionUsed[1 - viewerIndex],
+                ["inactivityActive"] = RelativePlayer(state.InactivityActivePlayer, viewerIndex),
+                ["inactivityWarning"] = state.InactivityWarningActive,
+                ["inactivityLossRemainingMs"] = state.InactivityLossRemainingMs,
+                ["inactivitySyncUtc"] = state.InactivitySyncUtc?.ToString("O"),
+            };
+            connection = new JsonObject
+            {
+                ["self"] = BuildConnectionEvidence(room, viewerIndex, cutoff),
+                ["opponent"] = BuildConnectionEvidence(room, 1 - viewerIndex, cutoff),
+                ["restoredFromRecovery"] = room.RestoredFromRecovery,
+            };
+        }
+
+        var recent = new JsonArray();
+        lock (room.FeedbackEvidenceGate)
+        {
+            foreach (var action in room.RecentFeedbackActions)
+            {
+                // 对手被拒绝的尝试从未成为公开牌局事实，不得泄露给反馈提交者。
+                if (action.ActorIndex != viewerIndex && action.Outcome == "rejected") continue;
+                var actor = action.Source == GameActionSource.System
+                    ? "system"
+                    : RelativePlayer(action.ActorIndex, viewerIndex);
+                recent.Add(new JsonObject
+                {
+                    ["sequence"] = action.Sequence,
+                    ["atUtc"] = action.AtUtc.ToString("O"),
+                    ["actor"] = actor,
+                    ["action"] = action.Action,
+                    ["outcome"] = action.Outcome,
+                    ["requestId"] = action.ActorIndex == viewerIndex ? action.RequestId : null,
+                    ["reason"] = action.ActorIndex == viewerIndex && action.Outcome == "rejected" ? action.Reason : null,
+                    ["cardNumber"] = action.ActorIndex == viewerIndex ? action.CardNumber : null,
+                    ["promptId"] = action.ActorIndex == viewerIndex ? action.PromptId : null,
+                    ["promptKind"] = action.ActorIndex == viewerIndex ? action.PromptKind : null,
+                });
+            }
+        }
+
+        var finalOutcome = !state.IsGameOver
+            ? "ongoing"
+            : state.IsDraw ? "draw"
+            : state.WinnerIndex == viewerIndex ? "win" : "loss";
+        return new JsonObject
+        {
+            ["schema"] = "grandumi.feedback.authority.v1",
+            ["trust"] = "server_authoritative",
+            ["captureStatus"] = "captured",
+            ["capturedAtUtc"] = DateTime.UtcNow.ToString("O"),
+            ["server"] = new JsonObject
+            {
+                ["version"] = BuildInfo.Version,
+                ["commit"] = BuildInfo.Commit,
+            },
+            ["room"] = new JsonObject
+            {
+                ["roomId"] = room.RoomId,
+                ["rulesetId"] = state.RulesetId,
+                ["matchKind"] = room.MatchKind.ToString(),
+            },
+            ["viewer"] = new JsonObject { ["kind"] = "player", ["seat"] = viewerIndex },
+            ["state"] = new JsonObject
+            {
+                ["tick"] = state.Tick,
+                ["journalSequence"] = room.JournalSequence,
+                ["turnCount"] = state.TurnCount,
+                ["currentTurn"] = RelativePlayer(state.CurrentTurnPlayer, viewerIndex),
+                ["phase"] = state.Phase.ToString(),
+                ["openingStage"] = state.OpeningStage.ToString(),
+                ["pendingPrompt"] = state.PendingPrompt is null ? null : new JsonObject
+                {
+                    ["kind"] = Clip(state.PendingPrompt.Kind, 80),
+                    ["for"] = RelativePlayer(state.PendingPrompt.PlayerIndex, viewerIndex),
+                },
+                ["finalOutcome"] = finalOutcome,
+            },
+            ["clock"] = clock,
+            ["connection"] = connection,
+            ["recentActions"] = recent,
+        };
+    }
+
+    private static JsonObject BuildConnectionEvidence(RoomEntry room, int playerIndex, long cutoff)
+    {
+        var graceRemaining = room.DisconnectGraceRemainingMs[playerIndex];
+        if (room.DisconnectedPlayers[playerIndex] && room.DisconnectStartedAt[playerIndex] > 0)
+        {
+            var elapsed = Stopwatch.GetElapsedTime(room.DisconnectStartedAt[playerIndex], cutoff).TotalMilliseconds;
+            graceRemaining = Math.Max(0, graceRemaining - (long)Math.Ceiling(elapsed));
+        }
+        return new JsonObject
+        {
+            ["generation"] = room.ConnectionGenerations[playerIndex],
+            ["reconnectCount"] = room.ReconnectCounts[playerIndex],
+            ["disconnectCount"] = room.DisconnectCounts[playerIndex],
+            ["disconnected"] = room.DisconnectedPlayers[playerIndex],
+            ["graceRemainingMs"] = graceRemaining,
+        };
+    }
+
+    private static string RelativePlayer(int playerIndex, int viewerIndex)
+        => playerIndex is not (0 or 1) ? "none" : playerIndex == viewerIndex ? "self" : "opponent";
+
+    private static void RecordRecentFeedbackAction(
+        RoomEntry room,
+        int actorIndex,
+        string action,
+        string outcome,
+        string? requestId,
+        string? reason,
+        GameActionSource source = GameActionSource.Player,
+        FeedbackActionContext? feedbackContext = null)
+    {
+        lock (room.FeedbackEvidenceGate)
+        {
+            room.RecentFeedbackActions.Enqueue(new RecentFeedbackAction(
+                ++room.FeedbackActionSequence,
+                DateTime.UtcNow,
+                actorIndex,
+                SanitizeActionName(action),
+                outcome,
+                Clip(requestId, 128),
+                SanitizeActionReason(reason),
+                source,
+                feedbackContext?.CardNumber,
+                feedbackContext?.PromptId,
+                feedbackContext?.PromptKind));
+            while (room.RecentFeedbackActions.Count > 16) room.RecentFeedbackActions.Dequeue();
+        }
+    }
+
+    private static string? Clip(string? value, int maxLength)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var normalized = new string(value.Trim().Where(c => !char.IsControl(c)).ToArray());
+        return normalized.Length <= maxLength ? normalized : normalized[..maxLength];
+    }
+
+    private static string? SanitizeActionReason(string? value)
+    {
+        var clipped = Clip(value, 240);
+        if (clipped is null) return null;
+        return FeedbackGuidPattern.Replace(FeedbackCardNumberPattern.Replace(clipped, "[card]"), "[id]");
+    }
+
+    private static string SanitizeActionName(string? value)
+    {
+        var clipped = Clip(value, 80);
+        return clipped is not null && FeedbackActionNamePattern.IsMatch(clipped) ? clipped : "unknown";
+    }
+
+    /// <summary>
+    /// 从动作提交前的权威 Prompt 提取可公开诊断字段。客户端 data 中即使伪造同名字段也不会采信。
+    /// </summary>
+    internal static FeedbackActionContext? CaptureFeedbackActionContext(
+        GameState state,
+        int actorIndex,
+        string action)
+    {
+        if (!string.Equals(action, "PromptResponse", StringComparison.Ordinal)) return null;
+        var prompt = state.PendingPrompt;
+        if (prompt is null || prompt.PlayerIndex != actorIndex) return null;
+
+        string? cardNumber = null;
+        if (prompt.Extra.TryGetValue("sourceNumber", out var sourceNumber))
+            cardNumber = SanitizeCardNumber(sourceNumber?.ToString());
+        return new FeedbackActionContext(
+            cardNumber,
+            Clip(prompt.PromptId, 64),
+            SanitizeActionName(prompt.Kind));
+    }
+
+    private static string? SanitizeCardNumber(string? value)
+    {
+        var normalized = Clip(value, 16)?.ToUpperInvariant();
+        if (normalized is null) return null;
+        var match = FeedbackCardNumberPattern.Match(normalized);
+        return match.Success && match.Index == 0 && match.Length == normalized.Length
+            ? normalized
+            : null;
+    }
 
     /// <summary>客户端通过 MsgGameAction 派发的入口</summary>
     public static void HandleAction(
@@ -257,18 +879,73 @@ public static class GameRoomManager
             return;
         }
         int idx = Array.IndexOf(room.PlayerSessionIds, sessionId);
+        if (room.IsRecoveryPaused)
+        {
+            if (idx is 0 or 1)
+                RecordRecentFeedbackAction(room, idx, action, "rejected", requestId, "对局因恢复存储异常而暂停");
+            WebSocketBridge.Send(sessionId, new
+            {
+                proto = "MsgGameRecoveryPaused",
+                roomId = room.RoomId,
+                reason = room.RecoveryPauseReason,
+                message = "恢复存储暂时不可用，对局已安全暂停，请勿重复操作。",
+                requestId,
+            });
+            return;
+        }
         if (idx < 0)
         {
             // 观战者，禁止操作
             WebSocketBridge.Send(sessionId, new { proto = "MsgActionRejected", reason = "观战者不能操作", requestId });
             return;
         }
+        var tracksRequest = room.ProcessedPlayerRequests.IsTrackable(requestId);
+        if (room.Engine.State.OpeningPreparationDeadlineUtc is not null && action != "Surrender")
+        {
+            WebSocketBridge.Send(sessionId, new { proto = "MsgActionRejected", reason = "双方正在准备对局，请稍候", requestId });
+            return;
+        }
+        if (tracksRequest && !room.ProcessedPlayerRequests.TryRegister(idx, requestId))
+        {
+            // 重复包可能是客户端没有收到第一次回包后的补发。按房间队列顺序回一份带原 requestId
+            // 的权威快照，让客户端安全结束 pending，绝不再次执行动作。
+            EnqueueRecoveryWork(room, new RoomWork("DuplicateRequest", LatencyDiagnostics.Start(), () =>
+            {
+                RecordRecentFeedbackAction(room, idx, action, "duplicate", requestId, "重复 requestId，动作未再次执行");
+                WebSocketBridge.Send(sessionId, StateSnapshotBuilder.Build(
+                    room.Engine.State,
+                    idx,
+                    "DuplicateRequest",
+                    requestId: requestId,
+                    cinematic: room.Engine.CinematicSnapshotProvider?.Invoke(idx)));
+                return Task.CompletedTask;
+            }));
+            LatencyDiagnostics.RecordMetric("对局动作去重", 1, "次");
+            return;
+        }
         if (!EnqueuePlayerAction(room, idx, action, data.Clone(), requestId, receivedAt))
+        {
+            if (tracksRequest) room.ProcessedPlayerRequests.Remove(idx, requestId);
+            RecordRecentFeedbackAction(room, idx, action, "rejected", requestId, "对局正在结束，操作未执行");
             WebSocketBridge.Send(sessionId, new { proto = "MsgActionRejected", reason = "对局正在结束，操作未执行", requestId });
+        }
     }
 
-    internal static void EnqueueBotAction(RoomEntry room, int playerIndex, string action, JsonElement data)
-        => EnqueuePlayerAction(room, playerIndex, action, data.Clone());
+
+    internal static bool EnqueueBotAction(RoomEntry room, int playerIndex, string action, JsonElement data)
+        => EnqueuePlayerAction(
+            room,
+            playerIndex,
+            action,
+            data.Clone(),
+            source: GameActionSource.System);
+
+    /// <summary>把读取可变 GameState 的 AI 决策放回房间单读者队列。</summary>
+    internal static bool EnqueueBotDecision(RoomEntry room)
+        => EnqueueWork(room, new RoomWork(
+            "BotDecision",
+            LatencyDiagnostics.Start(),
+            () => BotDriver.DecideAndQueueAsync(room)));
 
     private static bool EnqueuePlayerAction(
         RoomEntry room,
@@ -276,26 +953,870 @@ public static class GameRoomManager
         string action,
         JsonElement data,
         string? requestId = null,
-        long receivedAt = 0)
+        long receivedAt = 0,
+        GameActionSource source = GameActionSource.Player)
     {
         var promptIdBefore = action == "PromptResponse" ? room.Engine.State.PendingPrompt?.PromptId : null;
         return EnqueueWork(room, new RoomWork(action, LatencyDiagnostics.Start(), async () =>
         {
-            room.Engine.RecordMatchLog("player_action_requested", playerIndex, new { action, data });
-            var accepted = room.Engine.HandleAction(playerIndex, action, data, requestId);
-            // 被拒绝的 PromptResponse 不会消费旧 Prompt，不应等待效果链稳定；
-            // 否则单读者房间队列会被卡到等待超时，后续合法响应也无法进入。
-            if (accepted)
-                await room.Engine.WaitSettledAsync(resolvingPromptId: promptIdBefore);
-            EnsureMulliganTimeout(room);
-            if (room.Engine.State.IsGameOver)
-                CleanupRoom(room.RoomId);
+            var feedbackContext = CaptureFeedbackActionContext(room.Engine.State, playerIndex, action);
+            try
+            {
+                data = CanonicalJson.NormalizeObject(data);
+            }
+            catch (InvalidDataException ex)
+            {
+                RecordRecentFeedbackAction(
+                    room, playerIndex, action, "rejected", requestId, ex.Message, source, feedbackContext);
+                WebSocketBridge.Send(room.PlayerSessionIds[playerIndex], new
+                {
+                    proto = "MsgActionRejected",
+                    reason = ex.Message,
+                    requestId,
+                });
+                return;
+            }
+            var correlationId = GameActionSourceWire.CorrelationId(requestId, source);
+            var pause = PauseOperationClockForAction(room, playerIndex, action, receivedAt);
+            if (pause.ExpiredPlayer is 0 or 1)
+            {
+                RecordRecentFeedbackAction(
+                    room, playerIndex, action, "rejected", requestId, "动作到达时权威计时已到期", source, feedbackContext);
+                var committed = pause.ExpirationKind == ClockExpirationKind.Inactivity
+                    ? FinishByInactivityTimeout(room, pause.ExpiredPlayer.Value)
+                    : FinishByOperationTimeout(room, pause.ExpiredPlayer.Value);
+                if (committed) CleanupRoomFromCoordinator(room.RoomId);
+                return;
+            }
+            if (action is "PlayerActivity" or "RequestTurnExtension")
+            {
+                try
+                {
+                    HandleClockControlAction(room, playerIndex, action, data, requestId, pause);
+                    EnsureOperationClockRunning(room);
+                }
+                catch (Exception ex)
+                {
+                    RecordRecentFeedbackAction(room, playerIndex, action, "rejected", requestId, "服务端时钟提交失败");
+                    PauseForRecoveryFailure(room, "recovery_clock_commit_failed", ex);
+                }
+                return;
+            }
+            if (!room.OutboundCommitGate.Begin())
+            {
+                RecordRecentFeedbackAction(
+                    room, playerIndex, action, "rejected", requestId, "对局提交闸门不可用", source, feedbackContext);
+                if (room.IsRecoveryPaused)
+                    WebSocketBridge.Send(room.PlayerSessionIds[playerIndex], new
+                    {
+                        proto = "MsgGameRecoveryPaused",
+                        roomId = room.RoomId,
+                        reason = room.RecoveryPauseReason,
+                    });
+                return;
+            }
+
+            try
+            {
+                room.Engine.RecordMatchLog("player_action_requested", playerIndex, new
+                {
+                    requestId = correlationId,
+                    action,
+                    data,
+                    source = GameActionSourceWire.Value(source),
+                });
+                var execution = room.Engine.HandleActionWithReceipt(
+                    playerIndex,
+                    action,
+                    data,
+                    correlationId,
+                    source,
+                    feedbackContext);
+                var accepted = execution.Accepted;
+                // 被拒绝的 PromptResponse 不会消费旧 Prompt，不应等待效果链稳定；
+                // 否则单读者房间队列会被卡到等待超时，后续合法响应也无法进入。
+                if (accepted)
+                {
+                    lock (room.ClockGate)
+                    {
+                        StopOperationClockLocked(room);
+                        CommitPlayerActivityLocked(room, playerIndex, pause.CutoffTimestamp);
+                    }
+                    room.MarkActivity();
+                    await room.Engine.WaitSettledAsync(resolvingPromptId: promptIdBefore);
+                    room.ReplayCheckpoints?.WriteAfterAction(room.Engine, execution.AcceptedLog);
+                    AppendClockState(room);
+                    MaybeCaptureRecoverySnapshot(room);
+                }
+                room.OutboundCommitGate.Commit();
+                RecordRecentFeedbackAction(
+                    room,
+                    playerIndex,
+                    action,
+                    accepted ? "accepted" : "rejected",
+                    correlationId,
+                    execution.RejectionReason,
+                    source,
+                    feedbackContext);
+                EnsureOperationClockRunning(room);
+                EnsureStartingPlayerChoiceTimeout(room);
+                EnsureMulliganTimeout(room);
+                EnsureHexDraftTimeout(room);
+                if (room.Engine.State.IsGameOver)
+                    CleanupRoomFromCoordinator(room.RoomId);
+            }
+            catch (Exception ex)
+            {
+                RecordRecentFeedbackAction(
+                    room, playerIndex, action, "rejected", requestId, "服务端提交失败", source, feedbackContext);
+                PauseForRecoveryFailure(room, "recovery_commit_failed", ex);
+            }
         }, receivedAt));
+    }
+
+    private enum ClockExpirationKind { None, Operation, Inactivity }
+
+    private readonly record struct ActionClockPause(
+        int? ExpiredPlayer,
+        ClockExpirationKind ExpirationKind,
+        long CutoffTimestamp);
+
+    private readonly record struct ClockExpiration(int? ExpiredPlayer, ClockExpirationKind Kind);
+
+    private static ActionClockPause PauseOperationClockForAction(
+        RoomEntry room,
+        int playerIndex,
+        string action,
+        long receivedAt)
+    {
+        var fallbackCutoff = receivedAt > 0 ? receivedAt : Stopwatch.GetTimestamp();
+        if (!room.Engine.State.OperationClockEnabled)
+            return new ActionClockPause(null, ClockExpirationKind.None, fallbackCutoff);
+        lock (room.ClockGate)
+        {
+            // 已在队列中等待的后续动作，其接收时间可能早于上一动作处理完成后重新开钟的时点。
+            // 此时从重新开钟时点起算 0ms，绝不能把服务端排队/结算耗时转嫁给玩家。
+            var cutoff = NormalizeClockCutoffLocked(room, fallbackCutoff);
+            var activePlayer = room.Engine.State.OperationClockActivePlayer;
+            var operationDeadline = GetOperationExpirationTimestampLocked(room, activePlayer);
+            var inactivityPlayer = room.InactivityActivePlayer;
+            var inactivityDeadline = GetInactivityExpirationTimestampLocked(room, inactivityPlayer);
+            ChargeOperationClockLocked(room, cutoff);
+            UpdateInactivitySnapshotLocked(room, cutoff);
+            var expiration = SelectExpiredClockLocked(
+                room,
+                activePlayer,
+                operationDeadline,
+                inactivityPlayer,
+                inactivityDeadline,
+                cutoff);
+            if (expiration.ExpiredPlayer is 0 or 1)
+                return new ActionClockPause(expiration.ExpiredPlayer, expiration.Kind, cutoff);
+
+            // 非当前决策者发来的非法动作不能暂停对手棋钟；投降和平局协商是例外。
+            if (action is not "Surrender" and not "RequestDraw" and not "RespondDraw"
+                && activePlayer != playerIndex)
+                return new ActionClockPause(null, ClockExpirationKind.None, cutoff);
+            PauseInactivityTrackingLocked(room, cutoff);
+            StopOperationClockLocked(room);
+            return new ActionClockPause(null, ClockExpirationKind.None, cutoff);
+        }
+    }
+
+    private static void HandleClockControlAction(
+        RoomEntry room,
+        int playerIndex,
+        string action,
+        JsonElement data,
+        string? requestId,
+        ActionClockPause pause)
+    {
+        var accepted = false;
+        var shouldBroadcast = false;
+        var rejection = "当前不是你的操作时点";
+        lock (room.ClockGate)
+        {
+            if (room.InactivityPausedPlayer != playerIndex)
+            {
+                // 非当前决策者的心跳不能替对手清除挂机计时。
+            }
+            else if (action == "PlayerActivity")
+            {
+                shouldBroadcast = room.InactivityPausedElapsedMs >= InactivityWarningThresholdMs;
+                CommitPlayerActivityLocked(room, playerIndex, pause.CutoffTimestamp);
+                accepted = true;
+            }
+            else if (room.Engine.State.OperationTurnExtensionUsed[playerIndex])
+            {
+                rejection = "本局的回合加时已经使用过";
+            }
+            else
+            {
+                var state = room.Engine.State;
+                var before = state.OperationTurnClockRemainingMs[playerIndex];
+                var extension = OperationTurnExtendedTimeLimitMs - OperationTurnTimeLimitMs;
+                state.OperationTurnClockRemainingMs[playerIndex] = Math.Min(
+                    OperationTurnExtendedTimeLimitMs,
+                    Math.Min(state.OperationClockRemainingMs[playerIndex], before + extension));
+                state.OperationTurnExtensionUsed[playerIndex] = true;
+                CommitPlayerActivityLocked(room, playerIndex, pause.CutoffTimestamp);
+                accepted = true;
+                shouldBroadcast = true;
+            }
+        }
+
+        if (!accepted)
+        {
+            RecordRecentFeedbackAction(room, playerIndex, action, "rejected", requestId, rejection);
+            // 控制动作不进入卡牌动作磁带；拒绝回包仍带请求 ID，便于未来客户端安全重试。
+            if (action != "PlayerActivity")
+                WebSocketBridge.Send(room.PlayerSessionIds[playerIndex], new
+                {
+                    proto = "MsgActionRejected",
+                    reason = rejection,
+                    requestId,
+                });
+            return;
+        }
+
+        room.MarkActivity();
+        AppendClockState(room);
+        room.Engine.RecordMatchLog("player_clock_control", playerIndex, new
+        {
+            action,
+            kind = data.ValueKind == JsonValueKind.Object && data.TryGetProperty("kind", out var kind)
+                ? kind.GetString()
+                : null,
+        });
+        if (shouldBroadcast)
+            room.Engine.Broadcast(action, new { player = playerIndex });
+        RecordRecentFeedbackAction(room, playerIndex, action, "accepted", requestId, null);
+    }
+
+    private static void AppendClockState(RoomEntry room)
+    {
+        if (room.VsBot) return;
+        RoomJournal.AppendClock(
+            room.RoomId,
+            room.Engine.State.OperationClockRemainingMs,
+            room.Engine.State.OperationTurnClockRemainingMs,
+            room.Engine.State.OperationTurnClockTurnCount,
+            room.Engine.State.OperationTurnExtensionUsed);
+    }
+
+    private static void EnsureOperationClockRunning(RoomEntry room)
+    {
+        if (room.IsRecoveryPaused) return;
+        if (!room.Engine.State.OperationClockEnabled || room.Engine.State.IsGameOver) return;
+        lock (room.ClockGate)
+        {
+            if (room.Engine.State.OperationClockActivePlayer >= 0 && room.OperationClockActiveSince > 0) return;
+            StartOperationClockLocked(room, DetermineOperationClockPlayer(room));
+        }
+    }
+
+    private static void SyncOperationClock(RoomEntry room)
+    {
+        var state = room.Engine.State;
+        if (!state.OperationClockEnabled || state.IsGameOver) return;
+        lock (room.ClockGate)
+        {
+            var cutoff = Stopwatch.GetTimestamp();
+            ChargeOperationClockLocked(room, cutoff);
+            UpdateInactivitySnapshotLocked(room, cutoff);
+            StartOperationClockLocked(room, DetermineOperationClockPlayer(room));
+        }
+    }
+
+    private static int DetermineOperationClockPlayer(RoomEntry room)
+    {
+        var state = room.Engine.State;
+        if (!state.OperationClockEnabled || state.IsGameOver || !state.MulliganBothDone) return -1;
+        if (room.DisconnectedPlayers[0] || room.DisconnectedPlayers[1]) return -1;
+        if (state.PendingDrawRequester is not null) return -1;
+        if (state.PendingPrompt is { } prompt) return prompt.PlayerIndex;
+        if (state.Phase is Phase.BattleBlock or Phase.BattleCounter)
+            return state.CurrentBattle?.DefenderPlayerIndex ?? -1;
+        return state.Phase == Phase.Main ? state.CurrentTurnPlayer : -1;
+    }
+
+    private static void ChargeOperationClockLocked(RoomEntry room, long cutoff)
+    {
+        var state = room.Engine.State;
+        var active = state.OperationClockActivePlayer;
+        if (active is not (0 or 1) || room.OperationClockActiveSince <= 0) return;
+        if (cutoff < room.OperationClockActiveSince) cutoff = room.OperationClockActiveSince;
+        var elapsed = Stopwatch.GetElapsedTime(room.OperationClockActiveSince, cutoff).TotalMilliseconds;
+        if (elapsed > 0)
+        {
+            var elapsedMs = (long)Math.Ceiling(elapsed);
+            state.OperationClockRemainingMs[active] = Math.Max(0,
+                state.OperationClockRemainingMs[active] - elapsedMs);
+            state.OperationTurnClockRemainingMs[active] = Math.Max(0,
+                state.OperationTurnClockRemainingMs[active] - elapsedMs);
+            state.OperationTurnClockRemainingMs[active] = Math.Min(
+                state.OperationTurnClockRemainingMs[active],
+                state.OperationClockRemainingMs[active]);
+        }
+        room.OperationClockActiveSince = cutoff;
+        state.OperationClockSyncUtc = DateTime.UtcNow;
+    }
+
+    private static long NormalizeClockCutoffLocked(RoomEntry room, long cutoff)
+    {
+        if (room.OperationClockActiveSince > cutoff)
+            cutoff = room.OperationClockActiveSince;
+        if (room.InactivityActiveSince > cutoff)
+            cutoff = room.InactivityActiveSince;
+        return cutoff;
+    }
+
+    private static long ElapsedMilliseconds(long startedAt, long cutoff)
+    {
+        if (startedAt <= 0 || cutoff <= startedAt) return 0;
+        return (long)Math.Ceiling(Stopwatch.GetElapsedTime(startedAt, cutoff).TotalMilliseconds);
+    }
+
+    private static long AddMillisecondsToTimestamp(long timestamp, long milliseconds)
+    {
+        if (timestamp <= 0) return long.MaxValue;
+        var ticks = (long)Math.Ceiling(Math.Max(0, milliseconds) * (double)Stopwatch.Frequency / 1000d);
+        return timestamp > long.MaxValue - ticks ? long.MaxValue : timestamp + ticks;
+    }
+
+    private static long GetOperationExpirationTimestampLocked(RoomEntry room, int playerIndex)
+    {
+        if (playerIndex is not (0 or 1) || room.OperationClockActiveSince <= 0)
+            return long.MaxValue;
+        var state = room.Engine.State;
+        var remaining = Math.Min(
+            state.OperationClockRemainingMs[playerIndex],
+            state.OperationTurnClockRemainingMs[playerIndex]);
+        return AddMillisecondsToTimestamp(room.OperationClockActiveSince, remaining);
+    }
+
+    private static long GetInactivityExpirationTimestampLocked(RoomEntry room, int playerIndex)
+    {
+        if (playerIndex is not (0 or 1)
+            || room.InactivityActivePlayer != playerIndex
+            || room.InactivityActiveSince <= 0)
+            return long.MaxValue;
+        return AddMillisecondsToTimestamp(room.InactivityActiveSince, InactivityLossLimitMs);
+    }
+
+    private static ClockExpiration SelectExpiredClockLocked(
+        RoomEntry room,
+        int operationPlayer,
+        long operationDeadline,
+        int inactivityPlayer,
+        long inactivityDeadline,
+        long cutoff)
+    {
+        var operationExpired = operationPlayer is 0 or 1
+            && IsOperationClockExpired(room.Engine.State, operationPlayer);
+        var inactivityExpired = inactivityPlayer is 0 or 1
+            && IsInactivityExpiredLocked(room, inactivityPlayer, cutoff);
+        if (!operationExpired && !inactivityExpired)
+            return new ClockExpiration(null, ClockExpirationKind.None);
+        if (inactivityExpired && (!operationExpired || inactivityDeadline < operationDeadline))
+            return new ClockExpiration(inactivityPlayer, ClockExpirationKind.Inactivity);
+        return new ClockExpiration(operationPlayer, ClockExpirationKind.Operation);
+    }
+
+    private static void UpdateInactivitySnapshotLocked(RoomEntry room, long cutoff)
+    {
+        var state = room.Engine.State;
+        var playerIndex = room.InactivityActivePlayer;
+        if (playerIndex is not (0 or 1) || room.InactivityActiveSince <= 0)
+        {
+            state.InactivityActivePlayer = -1;
+            state.InactivityWarningActive = false;
+            if (room.InactivityPausedPlayer is 0 or 1)
+            {
+                state.InactivityLossRemainingMs = Math.Max(0,
+                    InactivityLossLimitMs - room.InactivityPausedElapsedMs);
+            }
+            else
+            {
+                state.InactivityLossRemainingMs = InactivityLossLimitMs;
+            }
+            state.InactivitySyncUtc = DateTime.UtcNow;
+            return;
+        }
+
+        if (cutoff < room.InactivityActiveSince) cutoff = room.InactivityActiveSince;
+        var elapsedMs = ElapsedMilliseconds(room.InactivityActiveSince, cutoff);
+        state.InactivityActivePlayer = playerIndex;
+        state.InactivityWarningActive = elapsedMs >= InactivityWarningThresholdMs;
+        state.InactivityLossRemainingMs = Math.Max(0, InactivityLossLimitMs - elapsedMs);
+        state.InactivitySyncUtc = DateTime.UtcNow;
+    }
+
+    private static bool IsInactivityExpiredLocked(RoomEntry room, int playerIndex, long cutoff)
+    {
+        if (room.InactivityActivePlayer != playerIndex || playerIndex is not (0 or 1)) return false;
+        var elapsedMs = ElapsedMilliseconds(room.InactivityActiveSince, cutoff);
+        return elapsedMs >= InactivityLossLimitMs;
+    }
+
+    private static void PauseInactivityTrackingLocked(RoomEntry room, long cutoff)
+    {
+        var playerIndex = room.InactivityActivePlayer;
+        if (playerIndex is not (0 or 1) || room.InactivityActiveSince <= 0)
+        {
+            UpdateInactivitySnapshotLocked(room, cutoff);
+            return;
+        }
+        if (cutoff < room.InactivityActiveSince) cutoff = room.InactivityActiveSince;
+        room.InactivityPausedPlayer = playerIndex;
+        room.InactivityPausedElapsedMs = ElapsedMilliseconds(room.InactivityActiveSince, cutoff);
+        room.InactivityActivePlayer = -1;
+        room.InactivityActiveSince = 0;
+        UpdateInactivitySnapshotLocked(room, cutoff);
+    }
+
+    private static void CommitPlayerActivityLocked(RoomEntry room, int playerIndex, long cutoff)
+    {
+        if (room.InactivityActivePlayer == playerIndex)
+            PauseInactivityTrackingLocked(room, cutoff);
+        if (room.InactivityPausedPlayer == playerIndex)
+        {
+            room.InactivityPausedPlayer = -1;
+            room.InactivityPausedElapsedMs = 0;
+        }
+        room.Engine.State.InactivityActivePlayer = -1;
+        room.Engine.State.InactivityWarningActive = false;
+        room.Engine.State.InactivityLossRemainingMs = InactivityLossLimitMs;
+        room.Engine.State.InactivitySyncUtc = DateTime.UtcNow;
+    }
+
+    private static void StartInactivityTrackingLocked(RoomEntry room, int playerIndex, long startedAt)
+    {
+        if (playerIndex is not (0 or 1))
+        {
+            PauseInactivityTrackingLocked(room, startedAt);
+            return;
+        }
+        if (room.InactivityActivePlayer == playerIndex && room.InactivityActiveSince > 0)
+        {
+            UpdateInactivitySnapshotLocked(room, startedAt);
+            return;
+        }
+        if (room.InactivityActivePlayer is 0 or 1)
+        {
+            // 决策权只会在一个已接受动作后转移；结束旧决策者的等待段并归零后再切换。
+            CommitPlayerActivityLocked(room, room.InactivityActivePlayer, startedAt);
+        }
+
+        var restoredElapsedMs = room.InactivityPausedPlayer == playerIndex
+            ? room.InactivityPausedElapsedMs
+            : 0;
+        room.InactivityPausedPlayer = -1;
+        room.InactivityPausedElapsedMs = 0;
+        room.InactivityActivePlayer = playerIndex;
+        room.InactivityActiveSince = startedAt - (long)Math.Floor(
+            restoredElapsedMs * (double)Stopwatch.Frequency / 1000d);
+        UpdateInactivitySnapshotLocked(room, startedAt);
+    }
+
+    private static long GetInactivityNextBoundaryDelayLocked(RoomEntry room, long cutoff)
+    {
+        var playerIndex = room.InactivityActivePlayer;
+        if (playerIndex is not (0 or 1) || room.InactivityActiveSince <= 0)
+            return long.MaxValue;
+        var elapsedMs = ElapsedMilliseconds(room.InactivityActiveSince, cutoff);
+        if (elapsedMs < InactivityWarningThresholdMs)
+            return Math.Max(1, InactivityWarningThresholdMs - elapsedMs);
+        return Math.Max(1, InactivityLossLimitMs - elapsedMs);
+    }
+
+    private static void StartOperationClockLocked(RoomEntry room, int playerIndex)
+    {
+        var state = room.Engine.State;
+        if (state.OperationTurnClockTurnCount != state.TurnCount)
+            ResetOperationTurnClock(state);
+        CancelOperationClockTimerLocked(room);
+        state.OperationClockActivePlayer = playerIndex;
+        state.OperationClockPaused = state.MulliganBothDone
+            && (room.DisconnectedPlayers[0] || room.DisconnectedPlayers[1]);
+        state.OperationClockSyncUtc = DateTime.UtcNow;
+        var startedAt = Stopwatch.GetTimestamp();
+        room.OperationClockActiveSince = playerIndex is 0 or 1 ? startedAt : 0;
+        StartInactivityTrackingLocked(room, playerIndex, startedAt);
+        if (playerIndex is not (0 or 1)) return;
+
+        var operationRemaining = Math.Min(
+            state.OperationClockRemainingMs[playerIndex],
+            state.OperationTurnClockRemainingMs[playerIndex]);
+        var inactivityRemaining = GetInactivityNextBoundaryDelayLocked(room, startedAt);
+        var remaining = Math.Min(operationRemaining, inactivityRemaining);
+        var version = ++room.OperationClockTimerVersion;
+        var cancellation = new CancellationTokenSource();
+        room.OperationClockTimer = cancellation;
+        _ = Task.Run(async () =>
+        {
+            try { await Task.Delay(TimeSpan.FromMilliseconds(Math.Max(1, remaining)), cancellation.Token); }
+            catch (OperationCanceledException) { return; }
+            var activeRoom = GetRoom(room.RoomId);
+            if (activeRoom is null || !ReferenceEquals(activeRoom, room)) return;
+            await EnqueueCriticalWorkAsync(activeRoom,
+                new RoomWork("OperationTimeout", LatencyDiagnostics.Start(), () =>
+                {
+                    var expiration = new ClockExpiration(null, ClockExpirationKind.None);
+                    var shouldBroadcastWarning = false;
+                    lock (activeRoom.ClockGate)
+                    {
+                        if (version != activeRoom.OperationClockTimerVersion) return Task.CompletedTask;
+                        var warningBefore = activeRoom.Engine.State.InactivityWarningActive;
+                        var current = activeRoom.Engine.State.OperationClockActivePlayer;
+                        var operationDeadline = GetOperationExpirationTimestampLocked(activeRoom, current);
+                        var inactivityPlayer = activeRoom.InactivityActivePlayer;
+                        var inactivityDeadline = GetInactivityExpirationTimestampLocked(activeRoom, inactivityPlayer);
+                        var cutoff = Stopwatch.GetTimestamp();
+                        ChargeOperationClockLocked(activeRoom, cutoff);
+                        UpdateInactivitySnapshotLocked(activeRoom, cutoff);
+                        expiration = SelectExpiredClockLocked(
+                            activeRoom,
+                            current,
+                            operationDeadline,
+                            inactivityPlayer,
+                            inactivityDeadline,
+                            cutoff);
+                        if (expiration.ExpiredPlayer is not (0 or 1))
+                        {
+                            shouldBroadcastWarning = !warningBefore
+                                && activeRoom.Engine.State.InactivityWarningActive;
+                            // Task.Delay 允许因系统调度精度而比权威扣时点早醒极短时间。
+                            // 此时必须按尚余时间重新挂载任务，否则棋钟会继续在客户端归零，
+                            // 服务端却再也没有超时任务来完成判负。
+                            StartOperationClockLocked(activeRoom, DetermineOperationClockPlayer(activeRoom));
+                        }
+                    }
+                    if (expiration.ExpiredPlayer is 0 or 1)
+                    {
+                        var committed = expiration.Kind == ClockExpirationKind.Inactivity
+                            ? FinishByInactivityTimeout(activeRoom, expiration.ExpiredPlayer.Value)
+                            : FinishByOperationTimeout(activeRoom, expiration.ExpiredPlayer.Value);
+                        if (committed) CleanupRoomFromCoordinator(activeRoom.RoomId);
+                    }
+                    else if (shouldBroadcastWarning)
+                    {
+                        activeRoom.Engine.Broadcast("InactivityWarning", new
+                        {
+                            player = activeRoom.Engine.State.InactivityActivePlayer,
+                        });
+                    }
+                    return Task.CompletedTask;
+                }), CancellationToken.None);
+        });
+    }
+
+    private static void StopOperationClockLocked(RoomEntry room)
+    {
+        CancelOperationClockTimerLocked(room);
+        room.Engine.State.OperationClockActivePlayer = -1;
+        room.Engine.State.OperationClockSyncUtc = DateTime.UtcNow;
+        room.OperationClockActiveSince = 0;
+    }
+
+    private static void CancelOperationClockTimerLocked(RoomEntry room)
+    {
+        room.OperationClockTimerVersion++;
+        if (room.OperationClockTimer is null) return;
+        room.OperationClockTimer.Cancel();
+        room.OperationClockTimer.Dispose();
+        room.OperationClockTimer = null;
+    }
+
+    private static bool FinishByOperationTimeout(RoomEntry room, int expiredPlayer)
+    {
+        var reason = room.Engine.State.OperationClockRemainingMs[expiredPlayer] <= 0
+            ? "总操作时间耗尽"
+            : "本回合操作时间耗尽";
+        return CommitServerTerminal(
+            room,
+            expiredPlayer,
+            "operation_timeout",
+            $"{room.PlayerDisplayNames[expiredPlayer]} {reason}",
+            () =>
+            {
+                lock (room.ClockGate)
+                {
+                    var turnExpired = room.Engine.State.OperationTurnClockRemainingMs[expiredPlayer] <= 0;
+                    if (!turnExpired) room.Engine.State.OperationClockRemainingMs[expiredPlayer] = 0;
+                    room.Engine.State.OperationTurnClockRemainingMs[expiredPlayer] = 0;
+                    StopInactivityTrackingLocked(room);
+                    StopOperationClockLocked(room);
+                }
+            },
+            "OperationTimeout",
+            new { expiredPlayer, reason });
+    }
+
+    internal static bool FinishByInactivityTimeout(RoomEntry room, int expiredPlayer)
+    {
+        return CommitServerTerminal(
+            room,
+            expiredPlayer,
+            "inactivity_timeout",
+            $"{room.PlayerDisplayNames[expiredPlayer]} 连续 4 分钟没有操作",
+            () =>
+            {
+                lock (room.ClockGate)
+                {
+                    room.Engine.State.InactivityLossRemainingMs = 0;
+                    StopInactivityTrackingLocked(room, preserveLossRemaining: true);
+                    StopOperationClockLocked(room);
+                }
+            },
+            "InactivityTimeout",
+            new { expiredPlayer });
+    }
+
+    private static bool CommitServerTerminal(
+        RoomEntry room,
+        int expiredPlayer,
+        string terminalKind,
+        string reason,
+        Action stopClocks,
+        string broadcastKind,
+        object broadcastPayload)
+    {
+        if (expiredPlayer is not (0 or 1)) return false;
+        lock (room.CleanupGate)
+        {
+            // 重复计时任务、迟到动作与重连竞争都只能观察同一个已经提交的结果。
+            if (room.Engine.State.IsGameOver) return true;
+            var completedAtUtc = DateTime.UtcNow;
+            if (!room.VsBot)
+            {
+                var journalSequence = Volatile.Read(ref room.JournalSequence) + 1;
+                try
+                {
+                    RoomJournal.AppendTerminal(
+                        room.RoomId,
+                        journalSequence,
+                        1 - expiredPlayer,
+                        expiredPlayer,
+                        terminalKind,
+                        reason,
+                        completedAtUtc);
+                    Volatile.Write(ref room.JournalSequence, journalSequence);
+                }
+                catch (Exception ex)
+                {
+                    PauseForRecoveryFailure(room, "recovery_terminal_commit_failed", ex);
+                    return false;
+                }
+            }
+
+            stopClocks();
+            room.Engine.State.WinnerIndex = 1 - expiredPlayer;
+            room.Engine.State.IsDraw = false;
+            room.Engine.State.GameOverReason = reason;
+            room.TerminalCompletedAtUtc = completedAtUtc;
+            try
+            {
+                room.Engine.Broadcast(broadcastKind, broadcastPayload);
+            }
+            catch (Exception ex)
+            {
+                // 终局已写入恢复日志；单个连接下发失败不改变裁定，重连会读取持久化终局快照。
+                Console.Error.WriteLine($"[终局广播] 房间 {room.RoomId} 下发失败：{ex.Message}");
+            }
+            return true;
+        }
+    }
+
+    private static void StopInactivityTrackingLocked(RoomEntry room, bool preserveLossRemaining = false)
+    {
+        room.InactivityActivePlayer = -1;
+        room.InactivityActiveSince = 0;
+        room.InactivityPausedPlayer = -1;
+        room.InactivityPausedElapsedMs = 0;
+        room.Engine.State.InactivityActivePlayer = -1;
+        room.Engine.State.InactivityWarningActive = false;
+        if (!preserveLossRemaining)
+            room.Engine.State.InactivityLossRemainingMs = InactivityLossLimitMs;
+        room.Engine.State.InactivitySyncUtc = DateTime.UtcNow;
+    }
+
+    private static bool IsOperationClockExpired(GameState state, int playerIndex)
+        => state.OperationClockRemainingMs[playerIndex] <= 0
+           || state.OperationTurnClockRemainingMs[playerIndex] <= 0;
+
+    private static void ResetOperationTurnClock(GameState state)
+    {
+        state.OperationTurnClockTurnCount = state.TurnCount;
+        for (var player = 0; player < 2; player++)
+            state.OperationTurnClockRemainingMs[player] = Math.Min(
+                OperationTurnTimeLimitMs,
+                state.OperationClockRemainingMs[player]);
+    }
+
+    /// <summary>根据服务端权威截止时间创建或清除先后手选择超时任务。</summary>
+    private static void EnsureStartingPlayerChoiceTimeout(RoomEntry room, int retryAttempt = 0)
+    {
+        if (room.IsRecoveryPaused)
+        {
+            CancelStartingPlayerChoiceTimeout(room.RoomId);
+            return;
+        }
+        var deadline = room.Engine.State.StartingPlayerChoiceDeadlineUtc;
+        if (deadline is null || room.Engine.State.StartingPlayerChosen)
+        {
+            CancelStartingPlayerChoiceTimeout(room.RoomId);
+            return;
+        }
+
+        if (_startingPlayerChoiceTimeouts.TryGetValue(room.RoomId, out var current)
+            && current.DeadlineUtc == deadline.Value)
+            return;
+
+        var cancellation = new CancellationTokenSource();
+        var next = new StartingPlayerChoiceTimeout(deadline.Value, cancellation, cancellation.Token, retryAttempt);
+        while (true)
+        {
+            if (_startingPlayerChoiceTimeouts.TryGetValue(room.RoomId, out current))
+            {
+                if (current.DeadlineUtc == deadline.Value)
+                {
+                    next.Cancellation.Dispose();
+                    return;
+                }
+                if (!_startingPlayerChoiceTimeouts.TryUpdate(room.RoomId, next, current)) continue;
+                current.Cancellation.Cancel();
+                current.Cancellation.Dispose();
+            }
+            else if (!_startingPlayerChoiceTimeouts.TryAdd(room.RoomId, next))
+            {
+                continue;
+            }
+
+            StartStartingPlayerChoiceTimeoutWait(room, next);
+            return;
+        }
+    }
+
+    private static void StartStartingPlayerChoiceTimeoutWait(RoomEntry room, StartingPlayerChoiceTimeout timer)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (true)
+                {
+                    var delay = timer.DeadlineUtc - DateTime.UtcNow;
+                    if (delay <= TimeSpan.Zero) break;
+                    await Task.Delay(delay, timer.Token);
+                }
+
+                if (timer.Token.IsCancellationRequested) return;
+                var active = GetRoom(room.RoomId);
+                if (active is null || !ReferenceEquals(active, room)) return;
+
+                await EnqueueCriticalWorkAsync(active, new RoomWork("StartingPlayerChoiceTimeout", LatencyDiagnostics.Start(), async () =>
+                {
+                    if (active.Engine.State.StartingPlayerChoiceDeadlineUtc == timer.DeadlineUtc)
+                        await ResolveExpiredStartingPlayerChoiceAsync(active, DateTime.UtcNow);
+                    EnsureStartingPlayerChoiceTimeout(active);
+                    EnsureMulliganTimeout(active);
+                    EnsureHexDraftTimeout(active);
+                }), timer.Token);
+            }
+            catch (OperationCanceledException) when (timer.Token.IsCancellationRequested)
+            {
+                // 玩家已完成选择、房间已结束或权威截止时间已经更换。
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[先后手超时] 房间 {room.RoomId} 第 {timer.RetryAttempt + 1} 次计时任务异常: {ex.Message}");
+                if (!TryRemoveStartingPlayerChoiceTimeout(room.RoomId, timer)) return;
+
+                timer.Cancellation.Dispose();
+                var active = GetRoom(room.RoomId);
+                if (active is null
+                    || !ReferenceEquals(active, room)
+                    || active.Engine.State.StartingPlayerChoiceDeadlineUtc != timer.DeadlineUtc
+                    || active.Engine.State.StartingPlayerChosen)
+                    return;
+
+                if (timer.RetryAttempt >= 2) return;
+                await Task.Delay(TimeSpan.FromMilliseconds(250 * (timer.RetryAttempt + 1)));
+                var retryRoom = GetRoom(room.RoomId);
+                if (retryRoom is not null
+                    && ReferenceEquals(retryRoom, room)
+                    && retryRoom.Engine.State.StartingPlayerChoiceDeadlineUtc == timer.DeadlineUtc
+                    && !retryRoom.Engine.State.StartingPlayerChosen)
+                    EnsureStartingPlayerChoiceTimeout(retryRoom, timer.RetryAttempt + 1);
+            }
+        });
+    }
+
+    private static bool TryRemoveStartingPlayerChoiceTimeout(string roomId, StartingPlayerChoiceTimeout expected)
+        => ((ICollection<KeyValuePair<string, StartingPlayerChoiceTimeout>>)_startingPlayerChoiceTimeouts)
+            .Remove(new KeyValuePair<string, StartingPlayerChoiceTimeout>(roomId, expected));
+
+    /// <summary>补做已过期的先后手选择：骰点胜者超时后默认选择自己先手。</summary>
+    private static async Task<bool> ResolveExpiredStartingPlayerChoiceAsync(RoomEntry room, DateTime utcNow)
+    {
+        var state = room.Engine.State;
+        if (state.StartingPlayerChoiceDeadlineUtc is not { } deadline
+            || utcNow < deadline
+            || state.StartingPlayerChosen
+            || state.StartingPlayerChooser is not (0 or 1))
+            return false;
+
+        var chooser = state.StartingPlayerChooser;
+        var data = JsonSerializer.SerializeToElement(new { goFirst = true });
+        var requestId = GameActionSourceWire.CorrelationId(null, GameActionSource.System);
+        if (!room.OutboundCommitGate.Begin()) return false;
+        try
+        {
+            room.Engine.RecordMatchLog("starting_player_choice_timeout_auto_select", chooser, new { requestId, goFirst = true });
+            var execution = room.Engine.HandleActionWithReceipt(
+                chooser,
+                "ChooseFirstPlayer",
+                data,
+                requestId,
+                GameActionSource.System);
+            if (!execution.Accepted)
+            {
+                room.OutboundCommitGate.Commit();
+                return false;
+            }
+
+            await room.Engine.WaitSettledAsync();
+            room.ReplayCheckpoints?.WriteAfterAction(room.Engine, execution.AcceptedLog);
+            AppendClockState(room);
+            MaybeCaptureRecoverySnapshot(room);
+            room.OutboundCommitGate.Commit();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            PauseForRecoveryFailure(room, "recovery_timeout_commit_failed", ex);
+            return false;
+        }
+    }
+
+    private static void CancelStartingPlayerChoiceTimeout(string roomId)
+    {
+        if (_startingPlayerChoiceTimeouts.TryRemove(roomId, out var timer))
+        {
+            timer.Cancellation.Cancel();
+            timer.Cancellation.Dispose();
+        }
     }
 
     /// <summary>根据服务端权威截止时间创建或清除调度超时任务；不会因客户端断线或后台而停止。</summary>
     private static void EnsureMulliganTimeout(RoomEntry room, int retryAttempt = 0)
     {
+        if (room.IsRecoveryPaused)
+        {
+            CancelMulliganTimeout(room.RoomId);
+            return;
+        }
         var deadline = room.Engine.State.MulliganDeadlineUtc;
         if (deadline is null || room.Engine.State.MulliganBothDone)
         {
@@ -358,6 +1879,7 @@ public static class GameRoomManager
                     if (active.Engine.State.MulliganDeadlineUtc == timer.DeadlineUtc)
                         await ResolveExpiredMulliganAsync(active, DateTime.UtcNow);
                     EnsureMulliganTimeout(active);
+                    EnsureHexDraftTimeout(active);
                 }), timer.Token);
             }
             catch (OperationCanceledException) when (timer.Token.IsCancellationRequested)
@@ -397,22 +1919,231 @@ public static class GameRoomManager
     /// <summary>补做已过期的调度选择；供计时器、刷新取状态和账号重绑共同复用。</summary>
     private static async Task<IReadOnlyList<int>> ResolveExpiredMulliganAsync(RoomEntry room, DateTime utcNow)
     {
-        var autoKept = room.Engine.AutoKeepMulligans(utcNow);
-        if (autoKept.Count == 0) return autoKept;
+        var state = room.Engine.State;
+        if (state.MulliganDeadlineUtc is not { } deadline
+            || utcNow < deadline
+            || state.MulliganBothDone)
+            return Array.Empty<int>();
 
-        foreach (var playerIndex in autoKept)
+        var pendingPlayers = state.Players
+            .Select((player, index) => new { player, index })
+            .Where(entry => !entry.player.MulliganDone)
+            .Select(entry => entry.index)
+            .ToArray();
+        var autoKept = new List<int>(pendingPlayers.Length);
+        foreach (var playerIndex in pendingPlayers)
         {
             var data = JsonSerializer.SerializeToElement(new { redraw = false });
-            room.Engine.RecordMatchLog("mulligan_timeout_auto_keep", playerIndex, new { redraw = false });
-            room.Engine.OnPersistAction?.Invoke(playerIndex, "Mulligan", data);
+            var requestId = GameActionSourceWire.CorrelationId(null, GameActionSource.System);
+            if (!room.OutboundCommitGate.Begin()) break;
+            try
+            {
+                room.Engine.RecordMatchLog("mulligan_timeout_auto_keep", playerIndex, new { requestId, redraw = false });
+                var execution = room.Engine.HandleActionWithReceipt(
+                    playerIndex,
+                    "Mulligan",
+                    data,
+                    requestId,
+                    GameActionSource.System);
+                if (!execution.Accepted)
+                {
+                    room.ReplayCheckpoints?.Disable(state, "mulligan_timeout_action_rejected");
+                    room.OutboundCommitGate.Commit();
+                    continue;
+                }
+                await room.Engine.WaitSettledAsync();
+                room.ReplayCheckpoints?.WriteAfterAction(room.Engine, execution.AcceptedLog);
+                AppendClockState(room);
+                MaybeCaptureRecoverySnapshot(room);
+                room.OutboundCommitGate.Commit();
+                autoKept.Add(playerIndex);
+            }
+            catch (Exception ex)
+            {
+                PauseForRecoveryFailure(room, "recovery_timeout_commit_failed", ex);
+                break;
+            }
         }
-        await room.Engine.WaitSettledAsync();
         return autoKept;
     }
 
     private static void CancelMulliganTimeout(string roomId)
     {
         if (_mulliganTimeouts.TryRemove(roomId, out var timer))
+        {
+            timer.Cancellation.Cancel();
+            timer.Cancellation.Dispose();
+        }
+    }
+
+    /// <summary>根据当前权威选秀轮次创建或替换超时任务；重复调用不会产生重复结算。</summary>
+    private static void EnsureHexDraftTimeout(RoomEntry room, int retryAttempt = 0)
+    {
+        if (room.IsRecoveryPaused)
+        {
+            CancelHexDraftTimeout(room.RoomId);
+            return;
+        }
+
+        var round = room.Engine.State.HexState.ActiveDraft;
+        if (round is null || round.IsComplete || room.Engine.State.HexState.DraftResolving)
+        {
+            CancelHexDraftTimeout(room.RoomId);
+            return;
+        }
+
+        if (_hexDraftTimeouts.TryGetValue(room.RoomId, out var current)
+            && current.RoundId == round.RoundId
+            && current.DeadlineUtc == round.DeadlineUtc)
+            return;
+
+        var cancellation = new CancellationTokenSource();
+        var next = new HexDraftTimeout(
+            round.RoundId,
+            round.DeadlineUtc,
+            cancellation,
+            cancellation.Token,
+            retryAttempt);
+        while (true)
+        {
+            if (_hexDraftTimeouts.TryGetValue(room.RoomId, out current))
+            {
+                if (current.RoundId == round.RoundId && current.DeadlineUtc == round.DeadlineUtc)
+                {
+                    next.Cancellation.Dispose();
+                    return;
+                }
+                if (!_hexDraftTimeouts.TryUpdate(room.RoomId, next, current)) continue;
+                current.Cancellation.Cancel();
+                current.Cancellation.Dispose();
+            }
+            else if (!_hexDraftTimeouts.TryAdd(room.RoomId, next))
+            {
+                continue;
+            }
+
+            StartHexDraftTimeoutWait(room, next);
+            return;
+        }
+    }
+
+    private static void StartHexDraftTimeoutWait(RoomEntry room, HexDraftTimeout timer)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (true)
+                {
+                    var delay = timer.DeadlineUtc - DateTime.UtcNow;
+                    if (delay <= TimeSpan.Zero) break;
+                    await Task.Delay(delay, timer.Token);
+                }
+
+                if (timer.Token.IsCancellationRequested) return;
+                var active = GetRoom(room.RoomId);
+                if (active is null || !ReferenceEquals(active, room)) return;
+
+                await EnqueueCriticalWorkAsync(active, new RoomWork("HexDraftTimeout", LatencyDiagnostics.Start(), async () =>
+                {
+                    var activeRound = active.Engine.State.HexState.ActiveDraft;
+                    if (activeRound is not null
+                        && activeRound.RoundId == timer.RoundId
+                        && activeRound.DeadlineUtc == timer.DeadlineUtc)
+                        await ResolveExpiredHexDraftAsync(active, DateTime.UtcNow);
+                    EnsureHexDraftTimeout(active);
+                }), timer.Token);
+            }
+            catch (OperationCanceledException) when (timer.Token.IsCancellationRequested)
+            {
+                // 玩家已完成本轮、房间关闭或权威轮次已替换。
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[海克斯超时] 房间 {room.RoomId} 第 {timer.RetryAttempt + 1} 次计时任务异常: {ex.Message}");
+                if (!TryRemoveHexDraftTimeout(room.RoomId, timer)) return;
+
+                timer.Cancellation.Dispose();
+                var active = GetRoom(room.RoomId);
+                var activeRound = active?.Engine.State.HexState.ActiveDraft;
+                if (active is null
+                    || !ReferenceEquals(active, room)
+                    || activeRound is null
+                    || activeRound.RoundId != timer.RoundId
+                    || activeRound.DeadlineUtc != timer.DeadlineUtc
+                    || activeRound.IsComplete)
+                    return;
+
+                if (timer.RetryAttempt >= 2) return;
+                await Task.Delay(TimeSpan.FromMilliseconds(250 * (timer.RetryAttempt + 1)));
+                var retryRoom = GetRoom(room.RoomId);
+                var retryRound = retryRoom?.Engine.State.HexState.ActiveDraft;
+                if (retryRoom is not null
+                    && ReferenceEquals(retryRoom, room)
+                    && retryRound is not null
+                    && retryRound.RoundId == timer.RoundId
+                    && retryRound.DeadlineUtc == timer.DeadlineUtc
+                    && !retryRound.IsComplete)
+                    EnsureHexDraftTimeout(retryRoom, timer.RetryAttempt + 1);
+            }
+        });
+    }
+
+    private static bool TryRemoveHexDraftTimeout(string roomId, HexDraftTimeout expected)
+        => ((ICollection<KeyValuePair<string, HexDraftTimeout>>)_hexDraftTimeouts)
+            .Remove(new KeyValuePair<string, HexDraftTimeout>(roomId, expected));
+
+    /// <summary>把当前私密选秀变成可重放的系统 ChooseHex 动作。</summary>
+    private static async Task<IReadOnlyList<int>> ResolveExpiredHexDraftAsync(RoomEntry room, DateTime utcNow)
+    {
+        var round = room.Engine.State.HexState.ActiveDraft;
+        if (round is null || utcNow < round.DeadlineUtc || round.IsComplete)
+            return Array.Empty<int>();
+
+        var roundId = round.RoundId;
+        var playerIndex = round.PlayerIndex;
+        var autoSelected = new List<int>(1);
+        var current = room.Engine.State.HexState.ActiveDraft;
+        if (current is not null && current.RoundId == roundId && !current.Locked)
+        {
+
+            var data = JsonSerializer.SerializeToElement(new { roundId, auto = true });
+            var requestId = GameActionSourceWire.CorrelationId(null, GameActionSource.System);
+            if (!room.OutboundCommitGate.Begin()) return autoSelected;
+            try
+            {
+                room.Engine.RecordMatchLog("hex_draft_timeout_auto_select", playerIndex, new { requestId, roundId });
+                var execution = room.Engine.HandleActionWithReceipt(
+                    playerIndex,
+                    "ChooseHex",
+                    data,
+                    requestId,
+                    GameActionSource.System);
+                if (!execution.Accepted)
+                {
+                    room.ReplayCheckpoints?.Disable(room.Engine.State, "hex_timeout_action_rejected");
+                    room.OutboundCommitGate.Commit();
+                    return autoSelected;
+                }
+
+                await room.Engine.WaitSettledAsync();
+                room.ReplayCheckpoints?.WriteAfterAction(room.Engine, execution.AcceptedLog);
+                AppendClockState(room);
+                MaybeCaptureRecoverySnapshot(room);
+                room.OutboundCommitGate.Commit();
+                autoSelected.Add(playerIndex);
+            }
+            catch (Exception ex)
+            {
+                PauseForRecoveryFailure(room, "recovery_hex_timeout_commit_failed", ex);
+            }
+        }
+        return autoSelected;
+    }
+
+    private static void CancelHexDraftTimeout(string roomId)
+    {
+        if (_hexDraftTimeouts.TryRemove(roomId, out var timer))
         {
             timer.Cancellation.Cancel();
             timer.Cancellation.Dispose();
@@ -490,69 +2221,159 @@ public static class GameRoomManager
         var room = GetRoomBySession(sessionId);
         if (room is null)
         {
+            if (TerminalOutcomeStore.TryGetBySession(sessionId, out var terminalSnapshot))
+            {
+                WebSocketBridge.Send(sessionId, terminalSnapshot);
+                return;
+            }
             WebSocketBridge.Send(sessionId, new { proto = "MsgDuelOver", IsWin = false, Description = "对局已结束，无法恢复" });
+            return;
+        }
+        if (room.IsRecoveryPaused)
+        {
+            WebSocketBridge.Send(sessionId, new
+            {
+                proto = "MsgGameRecoveryPaused",
+                roomId = room.RoomId,
+                reason = room.RecoveryPauseReason,
+                message = "恢复存储异常，对局仍处于安全暂停，无法下发未确认状态。",
+            });
             return;
         }
         int idx = Array.IndexOf(room.PlayerSessionIds, sessionId);
         EnqueueRecoveryWork(room, new RoomWork("RequestState", LatencyDiagnostics.Start(), async () =>
         {
+            // 新客户端可能在准备快照后立即请求重同步，不能因此跳过准备阶段。
+            if (room.Engine.State.OpeningPreparationDeadlineUtc is null)
+                room.Engine.BeginOpeningSequence();
+            await ResolveExpiredStartingPlayerChoiceAsync(room, DateTime.UtcNow);
+            EnsureStartingPlayerChoiceTimeout(room);
             await ResolveExpiredMulliganAsync(room, DateTime.UtcNow);
             EnsureMulliganTimeout(room);
+            await ResolveExpiredHexDraftAsync(room, DateTime.UtcNow);
+            EnsureHexDraftTimeout(room);
             if (idx < 0)
             {
-                var viewPlayerIndex = room.Spectators.TryGetValue(sessionId, out var storedViewPlayerIndex)
-                    ? storedViewPlayerIndex
-                    : 0;
+                var spectator = room.Spectators.TryGetValue(sessionId, out var storedSpectator)
+                    ? storedSpectator
+                    : null;
                 WebSocketBridge.Send(sessionId, StateSnapshotBuilder.Build(
                     room.Engine.State,
                     -1,
                     "Resync",
-                    spectatorPlayerIndex: viewPlayerIndex));
+                    spectatorPlayerIndex: spectator?.ViewPlayerIndex ?? 0,
+                    revealSpectatorMainHand: spectator?.HandVisible == true,
+                    cinematic: room.Engine.CinematicSnapshotProvider?.Invoke(spectator?.ViewPlayerIndex ?? 0)));
                 return;
             }
-            if (_grace.TryRemove(room.RoomId + ":" + sessionId, out var cts)) cts.Cancel();
-            WebSocketBridge.Send(room.PlayerSessionIds[1 - idx], new { proto = "MsgPlayerReconnected" });
-            WebSocketBridge.Send(sessionId, StateSnapshotBuilder.Build(room.Engine.State, idx, "Resync"));
+            var wasDisconnected = CompleteDisconnectGrace(room, idx, sessionId);
+            if (wasDisconnected)
+                WebSocketBridge.Send(room.PlayerSessionIds[1 - idx], new { proto = "MsgPlayerReconnected" });
+            WebSocketBridge.Send(sessionId, StateSnapshotBuilder.Build(
+                room.Engine.State,
+                idx,
+                "Resync",
+                cinematic: room.Engine.CinematicSnapshotProvider?.Invoke(idx)));
             WebSocketBridge.BroadcastSpectatorList(room);
         }));
     }
 
-    /// <summary>玩家断线 → 启动 90s 宽限期</summary>
+    /// <summary>恢复登录未找到活跃房间时，重发最近一局的同账号终局快照。</summary>
+    internal static bool TryDeliverRecentTerminal(string sessionId, string accountName)
+    {
+        if (!TerminalOutcomeStore.TryGetByAccount(accountName, out var terminalSnapshot)) return false;
+        WebSocketBridge.Send(sessionId, terminalSnapshot);
+        return true;
+    }
+
+    /// <summary>玩家断线 → 暂停操作棋钟并启动每局累计 90s 宽限期。</summary>
     public static void OnPlayerDisconnect(string sessionId)
     {
         var room = GetRoomBySession(sessionId);
         if (room is null) return;
-        int idx = Array.IndexOf(room.PlayerSessionIds, sessionId);
-        if (idx < 0)
+        lock (room.CleanupGate)
         {
-            // 观战者直接移除
-            var removed = room.Spectators.TryRemove(sessionId, out _);
-            _sessionRoom.TryRemove(sessionId, out _);
-            if (removed) WebSocketBridge.BroadcastSpectatorList(room);
-            return;
+            if (!_rooms.TryGetValue(room.RoomId, out var active)
+                || !ReferenceEquals(active, room)
+                || room.Engine.State.IsGameOver
+                || room.IsRecoveryPaused)
+                return;
+            int idx = Array.IndexOf(room.PlayerSessionIds, sessionId);
+            if (idx < 0)
+            {
+                // 观战者直接移除
+                var removed = room.Spectators.TryRemove(sessionId, out var spectator);
+                if (spectator?.PendingRequestId is { } pendingId)
+                {
+                    lock (room.SpectatorGate) room.PendingHandRequests.Remove(pendingId);
+                }
+                _sessionRoom.TryRemove(sessionId, out _);
+                if (removed) WebSocketBridge.BroadcastSpectatorList(room);
+                return;
+            }
+
+            long graceRemaining;
+            lock (room.ClockGate)
+            {
+                if (room.DisconnectedPlayers[idx]) return;
+                var cutoff = Stopwatch.GetTimestamp();
+                ChargeOperationClockLocked(room, cutoff);
+                UpdateInactivitySnapshotLocked(room, cutoff);
+                PauseInactivityTrackingLocked(room, cutoff);
+                room.DisconnectedPlayers[idx] = true;
+                room.DisconnectCounts[idx]++;
+                room.DisconnectStartedAt[idx] = cutoff;
+                StopOperationClockLocked(room);
+                room.Engine.State.OperationClockPaused = room.Engine.State.OperationClockEnabled;
+                graceRemaining = room.DisconnectGraceRemainingMs[idx];
+            }
+
+            var oppSid = room.PlayerSessionIds[1 - idx];
+            var graceSeconds = Math.Max(0, (int)Math.Ceiling(graceRemaining / 1000d));
+            WebSocketBridge.Send(oppSid, new { proto = "MsgPlayerDisconnected", gracePeriodSeconds = graceSeconds });
+            EnqueueRecoveryWork(room, new RoomWork("PlayerDisconnected", LatencyDiagnostics.Start(), () =>
+            {
+                if (!room.Engine.State.IsGameOver)
+                    room.Engine.Broadcast("PlayerDisconnected", new { disconnected = idx });
+                return Task.CompletedTask;
+            }));
+
+            // 在 CleanupGate 内注册宽限任务；终局清理随后必能观察并取消它，不会留下孤儿判负任务。
+            StartDisconnectGraceTimer(room, idx, sessionId, graceRemaining);
         }
+    }
 
-        var oppSid = room.PlayerSessionIds[1 - idx];
-        WebSocketBridge.Send(oppSid, new { proto = "MsgPlayerDisconnected", gracePeriodSeconds = GracePeriodSeconds });
-
+    private static void StartDisconnectGraceTimer(
+        RoomEntry room,
+        int playerIndex,
+        string sessionId,
+        long graceRemaining)
+    {
         var cts = new CancellationTokenSource();
         _grace[room.RoomId + ":" + sessionId] = cts;
         _ = Task.Run(async () =>
         {
-            try { await Task.Delay(TimeSpan.FromSeconds(GracePeriodSeconds), cts.Token); }
+            try { await Task.Delay(TimeSpan.FromMilliseconds(graceRemaining), cts.Token); }
             catch (TaskCanceledException) { return; }
             // 超时 → 判负
             var r = GetRoom(room.RoomId);
-            if (r is null) return;
-            EnqueueWork(r, new RoomWork("DisconnectTimeout", LatencyDiagnostics.Start(), () =>
+            if (r is null || r.IsRecoveryPaused) return;
+            // 终局任务不能像普通玩家操作一样在队列满时静默丢弃；否则房间最终会被清理，
+            // 在线一方却收不到权威终局快照，只会一直停留在“正在结算”。
+            EnqueueRecoveryWork(r, new RoomWork("DisconnectTimeout", LatencyDiagnostics.Start(), () =>
             {
+                lock (r.ClockGate)
+                {
+                    r.DisconnectGraceRemainingMs[playerIndex] = 0;
+                    r.DisconnectStartedAt[playerIndex] = 0;
+                }
                 if (!r.Engine.State.IsGameOver)
                 {
-                    r.Engine.State.WinnerIndex = 1 - idx;
-                    r.Engine.State.GameOverReason = $"{r.PlayerAccounts[idx]} 断线超时";
-                    r.Engine.Broadcast("DisconnectTimeout", new { disconnected = idx });
+                    r.Engine.State.WinnerIndex = 1 - playerIndex;
+                    r.Engine.State.GameOverReason = $"{r.PlayerDisplayNames[playerIndex]} 断线超时";
+                    r.Engine.Broadcast("DisconnectTimeout", new { disconnected = playerIndex });
                 }
-                CleanupRoom(room.RoomId);
+                CleanupRoomFromCoordinator(room.RoomId);
                 return Task.CompletedTask;
             }));
         });
@@ -561,12 +2382,22 @@ public static class GameRoomManager
     /// <summary>
     /// 在线方在对手断线宽限期内，主动请求即时结束对局（判对手负）。
     /// 仅当对手确实处于断线宽限期中（其计时器存在）时才生效，避免对手在线/已重连时被误判。
-    /// 与 90s 超时判负复用同一套结束流程，但由玩家手动触发，规避后端计时器因重启/异常丢失导致的永久卡死。
+    /// 与 90s 超时判负复用同一套结束流程；宽限尚未用完时拒绝提前判负。
     /// </summary>
     public static void RequestEndByDisconnect(string sessionId)
     {
         var room = GetRoomBySession(sessionId);
         if (room is null) return;
+        if (room.IsRecoveryPaused)
+        {
+            WebSocketBridge.Send(sessionId, new
+            {
+                proto = "MsgGameRecoveryPaused",
+                roomId = room.RoomId,
+                reason = room.RecoveryPauseReason,
+            });
+            return;
+        }
         int idx = Array.IndexOf(room.PlayerSessionIds, sessionId);
         if (idx < 0) return; // 观战者无权
 
@@ -574,25 +2405,37 @@ public static class GameRoomManager
         var oppSid = room.PlayerSessionIds[oppIdx];
 
         // 必须确认对手确实在断线宽限期中（计时器存在），否则拒绝，避免在线方滥用判负
-        if (!_grace.TryRemove(room.RoomId + ":" + oppSid, out var cts))
+        if (!_grace.TryGetValue(room.RoomId + ":" + oppSid, out var cts))
         {
             WebSocketBridge.Send(sessionId, new { proto = "MsgActionRejected", reason = "对手已重连或不在断线状态，无法结束对局" });
             return;
         }
+        lock (room.ClockGate)
+        {
+            var elapsed = room.DisconnectStartedAt[oppIdx] <= 0
+                ? 0
+                : Stopwatch.GetElapsedTime(room.DisconnectStartedAt[oppIdx]).TotalMilliseconds;
+            if (elapsed < room.DisconnectGraceRemainingMs[oppIdx])
+            {
+                WebSocketBridge.Send(sessionId, new { proto = "MsgActionRejected", reason = "对手仍在 90 秒断线宽限期内" });
+                return;
+            }
+        }
+        _grace.TryRemove(room.RoomId + ":" + oppSid, out _);
         cts.Cancel(); // 取消对手宽限计时器，避免随后超时逻辑重复判负
 
-        if (!EnqueueWork(room, new RoomWork("EndByDisconnect", LatencyDiagnostics.Start(), () =>
+        // 与自动断线判负共用保证入队语义，避免压力下“结束对局”请求被丢弃。
+        EnqueueRecoveryWork(room, new RoomWork("EndByDisconnect", LatencyDiagnostics.Start(), () =>
         {
             if (!room.Engine.State.IsGameOver)
             {
                 room.Engine.State.WinnerIndex = idx;
-                room.Engine.State.GameOverReason = $"{room.PlayerAccounts[oppIdx]} 断线，对手确认结束对局";
+                room.Engine.State.GameOverReason = $"{room.PlayerDisplayNames[oppIdx]} 断线，对手确认结束对局";
                 room.Engine.Broadcast("DisconnectTimeout", new { disconnected = oppIdx });
             }
-            CleanupRoom(room.RoomId);
+            CleanupRoomFromCoordinator(room.RoomId);
             return Task.CompletedTask;
-        })))
-            WebSocketBridge.Send(sessionId, new { proto = "MsgActionRejected", reason = "对局正在结束，请稍候" });
+        }));
     }
 
     /// <summary>断线玩家在宽限期内重新连接（同账号新 sessionId）</summary>
@@ -606,36 +2449,165 @@ public static class GameRoomManager
             {
                 if (string.Equals(r.PlayerAccounts[i], accountName, StringComparison.OrdinalIgnoreCase))
                 {
-                    var oldSid = r.PlayerSessionIds[i];
-                    if (oldSid == newSessionId) return false; // 同 sid 不算重连
-                    // 取消宽限期
-                    if (_grace.TryRemove(r.RoomId + ":" + oldSid, out var cts)) cts.Cancel();
-                    // 替换 session
-                    _sessionRoom.TryRemove(oldSid, out _);
-                    r.PlayerSessionIds[i] = newSessionId;
-                    r.Engine.State.Players[i].CardBackId = cardBackId;
-                    _sessionRoom[newSessionId] = r.RoomId;
-                    WebSocketBridge.OnGameSessionRebound(oldSid, newSessionId, r.PlayerSessionIds[1 - i]);
-                    // 重新绑定引擎回调（PlayerIndex 编号未变，sid 已替换）
-                    r.Engine.OnSendToPlayer = (idx, payload) =>
-                        WebSocketBridge.Send(r.PlayerSessionIds[idx], payload);
-                    var playerIndex = i;
-                    EnqueueRecoveryWork(r, new RoomWork("Reclaim", LatencyDiagnostics.Start(), async () =>
+                    lock (r.CleanupGate)
                     {
-                        await ResolveExpiredMulliganAsync(r, DateTime.UtcNow);
-                        EnsureMulliganTimeout(r);
-                        WebSocketBridge.Send(r.PlayerSessionIds[1 - playerIndex], new { proto = "MsgPlayerReconnected" });
-                        WebSocketBridge.Send(newSessionId, StateSnapshotBuilder.Build(r.Engine.State, playerIndex, "Resync"));
-                        WebSocketBridge.BroadcastSpectatorList(r);
-                    }));
-                    return true;
+                        if (!_rooms.TryGetValue(r.RoomId, out var active)
+                            || !ReferenceEquals(active, r))
+                            continue;
+                        if (r.Engine.State.IsGameOver)
+                        {
+                            // 终局收尾失败而房间仍在池中时，不得重新挂断线宽限或发送重连广播；
+                            // 直接交付当前权威终局，后台扫描继续幂等收尾。
+                            WebSocketBridge.Send(
+                                newSessionId,
+                                StateSnapshotBuilder.Build(
+                                    r.Engine.State,
+                                    i,
+                                    "TerminalRecovery",
+                                    cinematic: r.Engine.CinematicSnapshotProvider?.Invoke(i)));
+                            return true;
+                        }
+                        var oldSid = r.PlayerSessionIds[i];
+                        if (oldSid == newSessionId) return false; // 同 sid 不算重连
+                        var wasDisconnected = CompleteDisconnectGrace(r, i, oldSid);
+                        if (!wasDisconnected)
+                        {
+                            lock (r.ClockGate) r.ConnectionGenerations[i]++;
+                        }
+                        r.MarkActivity();
+                        // 替换 session
+                        _sessionRoom.TryRemove(oldSid, out _);
+                        r.PlayerSessionIds[i] = newSessionId;
+                        r.Engine.State.Players[i].CardBackId = cardBackId;
+                        _sessionRoom[newSessionId] = r.RoomId;
+                        WebSocketBridge.OnGameSessionRebound(oldSid, newSessionId, r.PlayerSessionIds[1 - i]);
+                        // 重新绑定引擎回调（PlayerIndex 编号未变，sid 已替换）；云回放不能因重连中断。
+                        r.Engine.OnSendToPlayer = (idx, payload) =>
+                        {
+                            r.CloudReplay?.AppendSnapshot(idx, payload);
+                            DeliverPlayerPayload(r, idx, payload);
+                        };
+                        var playerIndex = i;
+                        EnqueueRecoveryWork(r, new RoomWork("Reclaim", LatencyDiagnostics.Start(), async () =>
+                        {
+                            if (r.IsRecoveryPaused)
+                            {
+                                WebSocketBridge.Send(newSessionId, new
+                                {
+                                    proto = "MsgGameRecoveryPaused",
+                                    roomId = r.RoomId,
+                                    reason = r.RecoveryPauseReason,
+                                    message = "恢复存储异常，对局仍处于安全暂停，未确认状态不会下发。",
+                                });
+                                return;
+                            }
+                            if (r.Engine.State.IsGameOver)
+                            {
+                                WebSocketBridge.Send(
+                                    newSessionId,
+                                    StateSnapshotBuilder.Build(
+                                        r.Engine.State,
+                                        playerIndex,
+                                        "TerminalRecovery",
+                                        cinematic: r.Engine.CinematicSnapshotProvider?.Invoke(playerIndex)));
+                                return;
+                            }
+                            await ResolveExpiredStartingPlayerChoiceAsync(r, DateTime.UtcNow);
+                            EnsureStartingPlayerChoiceTimeout(r);
+                            await ResolveExpiredMulliganAsync(r, DateTime.UtcNow);
+                            EnsureMulliganTimeout(r);
+                            await ResolveExpiredHexDraftAsync(r, DateTime.UtcNow);
+                            EnsureHexDraftTimeout(r);
+                            if (r.Engine.State.IsGameOver)
+                            {
+                                WebSocketBridge.Send(
+                                    newSessionId,
+                                    StateSnapshotBuilder.Build(
+                                        r.Engine.State,
+                                        playerIndex,
+                                        "TerminalRecovery",
+                                        cinematic: r.Engine.CinematicSnapshotProvider?.Invoke(playerIndex)));
+                                return;
+                            }
+                            if (wasDisconnected)
+                            {
+                                WebSocketBridge.Send(r.PlayerSessionIds[1 - playerIndex], new { proto = "MsgPlayerReconnected" });
+                                r.Engine.Broadcast("PlayerReconnected", new { player = playerIndex });
+                            }
+                            WebSocketBridge.Send(newSessionId, StateSnapshotBuilder.Build(
+                                r.Engine.State,
+                                playerIndex,
+                                "Resync",
+                                cinematic: r.Engine.CinematicSnapshotProvider?.Invoke(playerIndex)));
+                            SendCurrentOpponentDisconnectState(r, playerIndex, newSessionId);
+                            WebSocketBridge.BroadcastSpectatorList(r);
+                        }));
+                        return true;
+                    }
                 }
             }
         }
         return false;
     }
 
-    public static void AddSpectator(string roomId, string sessionId, int viewPlayerIndex = 0)
+    private static bool CompleteDisconnectGrace(RoomEntry room, int playerIndex, string sessionId)
+    {
+        if (_grace.TryRemove(room.RoomId + ":" + sessionId, out var cts))
+        {
+            cts.Cancel();
+            cts.Dispose();
+        }
+        lock (room.ClockGate)
+        {
+            var wasDisconnected = room.DisconnectedPlayers[playerIndex];
+            if (wasDisconnected && room.DisconnectStartedAt[playerIndex] > 0)
+            {
+                var elapsed = Stopwatch.GetElapsedTime(room.DisconnectStartedAt[playerIndex]).TotalMilliseconds;
+                room.DisconnectGraceRemainingMs[playerIndex] = Math.Max(0,
+                    room.DisconnectGraceRemainingMs[playerIndex] - (long)Math.Ceiling(elapsed));
+            }
+            room.DisconnectedPlayers[playerIndex] = false;
+            room.DisconnectStartedAt[playerIndex] = 0;
+            if (wasDisconnected)
+            {
+                room.ConnectionGenerations[playerIndex]++;
+                room.ReconnectCounts[playerIndex]++;
+            }
+            room.Engine.State.OperationClockPaused = room.DisconnectedPlayers[0] || room.DisconnectedPlayers[1];
+            if (wasDisconnected && !room.Engine.State.OperationClockPaused)
+                StartOperationClockLocked(room, DetermineOperationClockPlayer(room));
+            return wasDisconnected;
+        }
+    }
+
+    private static void SendCurrentOpponentDisconnectState(RoomEntry room, int playerIndex, string sessionId)
+    {
+        var opponentIndex = 1 - playerIndex;
+        long graceRemaining;
+        lock (room.ClockGate)
+        {
+            if (!room.DisconnectedPlayers[opponentIndex]) return;
+            var elapsed = room.DisconnectStartedAt[opponentIndex] <= 0
+                ? 0
+                : Stopwatch.GetElapsedTime(room.DisconnectStartedAt[opponentIndex]).TotalMilliseconds;
+            graceRemaining = Math.Max(0,
+                room.DisconnectGraceRemainingMs[opponentIndex] - (long)Math.Ceiling(elapsed));
+        }
+        WebSocketBridge.Send(sessionId, new
+        {
+            proto = "MsgPlayerDisconnected",
+            gracePeriodSeconds = Math.Max(0, (int)Math.Ceiling(graceRemaining / 1000d)),
+        });
+    }
+
+    public static void AddSpectator(
+        string roomId,
+        string sessionId,
+        string account,
+        string displayName,
+        int viewPlayerIndex = 0,
+        string? spectateCode = null,
+        bool isFriend = false)
     {
         if (string.IsNullOrWhiteSpace(roomId))
         {
@@ -645,6 +2617,20 @@ public static class GameRoomManager
         if (!_rooms.TryGetValue(roomId, out var r))
         {
             WebSocketBridge.Send(sessionId, new { proto = "MsgSpectateRoom", result = false, logStr = "房间不存在" });
+            return;
+        }
+
+        var normalizedViewPlayerIndex = viewPlayerIndex == 1 ? 1 : 0;
+        var mode = r.SpectateModes[normalizedViewPlayerIndex];
+        var access = SpectatingRules.CheckAccess(
+            mode,
+            isFriend,
+            r.SpectateCodes[normalizedViewPlayerIndex],
+            spectateCode,
+            r.KickedSpectatorAccounts.ContainsKey(account));
+        if (!access.Allowed)
+        {
+            WebSocketBridge.Send(sessionId, new { proto = "MsgSpectateRoom", result = false, logStr = access.Error });
             return;
         }
 
@@ -669,8 +2655,15 @@ public static class GameRoomManager
             }
         }
 
-        var normalizedViewPlayerIndex = viewPlayerIndex == 1 ? 1 : 0;
-        r.Spectators[sessionId] = normalizedViewPlayerIndex;
+        var spectator = new SpectatorConnection
+        {
+            SessionId = sessionId,
+            Account = account,
+            DisplayName = displayName,
+            ViewPlayerIndex = normalizedViewPlayerIndex,
+            HandVisible = r.SpectatorHandsPublic[normalizedViewPlayerIndex],
+        };
+        r.Spectators[sessionId] = spectator;
         _sessionRoom[sessionId] = roomId;
         if (!_rooms.TryGetValue(roomId, out var activeRoom) || !ReferenceEquals(activeRoom, r))
         {
@@ -680,18 +2673,180 @@ public static class GameRoomManager
             return;
         }
         WebSocketBridge.OnGameChatParticipantJoined(sessionId);
-        WebSocketBridge.Send(sessionId, new { proto = "MsgSpectateRoom", result = true, roomId });
+        WebSocketBridge.Send(sessionId, new
+        {
+            proto = "MsgSpectateRoom",
+            result = true,
+            roomId,
+            spectatorHandVisible = spectator.HandVisible,
+        });
         WebSocketBridge.BroadcastSpectatorList(r);
         EnqueueWork(r, new RoomWork("SpectateJoin", LatencyDiagnostics.Start(), () =>
         {
-            if (r.Spectators.TryGetValue(sessionId, out var storedViewPlayerIndex))
+            if (r.Spectators.TryGetValue(sessionId, out var storedSpectator))
                 WebSocketBridge.Send(sessionId, StateSnapshotBuilder.Build(
                     r.Engine.State,
                     -1,
                     "SpectateJoin",
-                    spectatorPlayerIndex: storedViewPlayerIndex));
+                    spectatorPlayerIndex: storedSpectator.ViewPlayerIndex,
+                    revealSpectatorMainHand: storedSpectator.HandVisible,
+                    cinematic: r.Engine.CinematicSnapshotProvider?.Invoke(storedSpectator.ViewPlayerIndex)));
             return Task.CompletedTask;
         }));
+    }
+
+    public static void RequestSpectatorHand(string sessionId)
+    {
+        var room = GetRoomBySession(sessionId);
+        if (room is null || !room.Spectators.TryGetValue(sessionId, out var spectator))
+        {
+            WebSocketBridge.Send(sessionId, new { proto = "MsgSpectatorHandStatus", status = "denied", logStr = "你当前不在观战" });
+            return;
+        }
+
+        SpectatorHandRequest? request = null;
+        string? error = null;
+        var retryAfterMs = 0;
+        lock (room.SpectatorGate)
+        {
+            if (spectator.HandVisible)
+            {
+                WebSocketBridge.Send(sessionId, new { proto = "MsgSpectatorHandStatus", status = "approved" });
+                return;
+            }
+            if (spectator.PendingRequestId is not null)
+            {
+                error = "已有申请正在等待玩家处理";
+            }
+            else
+            {
+                var elapsed = DateTime.UtcNow - spectator.LastHandRequestUtc;
+                if (elapsed < SpectatingRules.HandRequestCooldown)
+                {
+                    retryAfterMs = Math.Max(1, (int)Math.Ceiling((SpectatingRules.HandRequestCooldown - elapsed).TotalMilliseconds));
+                    error = "申请过于频繁，请稍后再试";
+                }
+                else
+                {
+                    var requestId = Guid.NewGuid().ToString("N");
+                    request = new SpectatorHandRequest(
+                        requestId,
+                        sessionId,
+                        spectator.Account,
+                        spectator.DisplayName,
+                        spectator.ViewPlayerIndex);
+                    spectator.LastHandRequestUtc = DateTime.UtcNow;
+                    spectator.PendingRequestId = requestId;
+                    room.PendingHandRequests[requestId] = request;
+                }
+            }
+        }
+
+        if (request is null)
+        {
+            WebSocketBridge.Send(sessionId, new { proto = "MsgSpectatorHandStatus", status = "denied", logStr = error, retryAfterMs });
+            return;
+        }
+
+        WebSocketBridge.Send(room.PlayerSessionIds[request.PlayerIndex], new
+        {
+            proto = "MsgSpectatorHandRequest",
+            requestId = request.RequestId,
+            spectatorAccount = request.SpectatorAccount,
+            spectatorName = request.SpectatorName,
+        });
+        WebSocketBridge.Send(sessionId, new { proto = "MsgSpectatorHandStatus", status = "pending" });
+    }
+
+    public static void RespondSpectatorHand(string playerSessionId, string requestId, bool accept)
+    {
+        var room = GetRoomBySession(playerSessionId);
+        var playerIndex = room is null ? -1 : Array.IndexOf(room.PlayerSessionIds, playerSessionId);
+        if (room is null || playerIndex < 0)
+        {
+            WebSocketBridge.Send(playerSessionId, new { proto = "MsgSpectatorHandResponse", result = false, logStr = "你当前不在对局中" });
+            return;
+        }
+
+        SpectatorHandRequest? request;
+        SpectatorConnection? spectator = null;
+        lock (room.SpectatorGate)
+        {
+            if (!room.PendingHandRequests.TryGetValue(requestId, out request) || request.PlayerIndex != playerIndex)
+            {
+                WebSocketBridge.Send(playerSessionId, new { proto = "MsgSpectatorHandResponse", result = false, logStr = "该申请已失效" });
+                return;
+            }
+            room.PendingHandRequests.Remove(requestId);
+            if (room.Spectators.TryGetValue(request.SpectatorSessionId, out spectator)
+                && spectator.PendingRequestId == requestId)
+            {
+                spectator.PendingRequestId = null;
+                if (accept) spectator.HandVisible = true;
+            }
+        }
+
+        WebSocketBridge.Send(playerSessionId, new { proto = "MsgSpectatorHandResponse", result = true, requestId, accepted = accept });
+        if (spectator is null) return;
+
+        WebSocketBridge.Send(spectator.SessionId, new
+        {
+            proto = "MsgSpectatorHandStatus",
+            status = accept ? "approved" : "denied",
+            logStr = accept ? "玩家已同意公开主视角手牌" : "玩家拒绝了手牌查看申请",
+            retryAfterMs = accept ? 0 : (int)SpectatingRules.HandRequestCooldown.TotalMilliseconds,
+        });
+        if (accept)
+        {
+            EnqueueWork(room, new RoomWork("SpectatorHandApproved", LatencyDiagnostics.Start(), () =>
+            {
+                if (room.Spectators.TryGetValue(spectator.SessionId, out var activeSpectator) && activeSpectator.HandVisible)
+                    WebSocketBridge.Send(spectator.SessionId, StateSnapshotBuilder.Build(
+                        room.Engine.State,
+                        -1,
+                        "SpectatorHandApproved",
+                        spectatorPlayerIndex: activeSpectator.ViewPlayerIndex,
+                        revealSpectatorMainHand: true,
+                        cinematic: room.Engine.CinematicSnapshotProvider?.Invoke(activeSpectator.ViewPlayerIndex)));
+                return Task.CompletedTask;
+            }));
+        }
+        WebSocketBridge.BroadcastSpectatorList(room);
+    }
+
+    public static void KickSpectator(string playerSessionId, string spectatorAccount)
+    {
+        var room = GetRoomBySession(playerSessionId);
+        if (room is null || Array.IndexOf(room.PlayerSessionIds, playerSessionId) < 0)
+        {
+            WebSocketBridge.Send(playerSessionId, new { proto = "MsgKickSpectator", result = false, logStr = "你当前不在对局中" });
+            return;
+        }
+
+        var normalizedAccount = spectatorAccount.Trim();
+        var targets = room.Spectators
+            .Where(pair => string.Equals(pair.Value.Account, normalizedAccount, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (targets.Length == 0)
+        {
+            WebSocketBridge.Send(playerSessionId, new { proto = "MsgKickSpectator", result = false, logStr = "该观战者已经离开" });
+            return;
+        }
+
+        room.KickedSpectatorAccounts[targets[0].Value.Account] = 0;
+        foreach (var (sid, target) in targets)
+        {
+            room.Spectators.TryRemove(sid, out _);
+            _sessionRoom.TryRemove(sid, out _);
+            lock (room.SpectatorGate)
+            {
+                if (target.PendingRequestId is { } pendingId)
+                    room.PendingHandRequests.Remove(pendingId);
+            }
+            WebSocketBridge.Send(sid, new { proto = "MsgSpectatorKicked", logStr = "你已被玩家移出观战，本局无法再次进入" });
+        }
+        WebSocketBridge.Send(playerSessionId, new { proto = "MsgKickSpectator", result = true, spectatorAccount = targets[0].Value.Account });
+        WebSocketBridge.BroadcastSpectatorList(room);
     }
 
     /// <summary>主动退出观战。重复退出按成功处理，保证客户端可以安全返回大厅。</summary>
@@ -710,7 +2865,11 @@ public static class GameRoomManager
                 WebSocketBridge.Send(sessionId, new { proto = "MsgLeaveSpectate", result = false, logStr = "对战玩家不能退出观战" });
                 return;
             }
-            var removed = room.Spectators.TryRemove(sessionId, out _);
+            var removed = room.Spectators.TryRemove(sessionId, out var spectator);
+            if (spectator?.PendingRequestId is { } pendingId)
+            {
+                lock (room.SpectatorGate) room.PendingHandRequests.Remove(pendingId);
+            }
             if (removed) WebSocketBridge.BroadcastSpectatorList(room);
         }
 
@@ -719,34 +2878,69 @@ public static class GameRoomManager
     }
 
     public static void CleanupRoom(string roomId)
+        => TryCleanupRoom(roomId, terminalStableInCoordinator: false);
+
+    /// <summary>仅供房间单读者任务在已完成结算的当前调用栈内收尾。</summary>
+    private static void CleanupRoomFromCoordinator(string roomId)
+        => TryCleanupRoom(roomId, terminalStableInCoordinator: true);
+
+    private static bool TryCleanupRoom(string roomId, bool terminalStableInCoordinator)
     {
-        if (_rooms.TryRemove(roomId, out var r))
+        if (!_rooms.TryGetValue(roomId, out var r)) return false;
+        lock (r.CleanupGate)
         {
+            if (!_rooms.TryGetValue(roomId, out var current) || !ReferenceEquals(current, r)) return false;
+
+            // 终局房间先完成可重试、以 matchId 幂等的核心权威收尾，再从房间池移除。
+            // 核心步骤失败会保留房间；云回放已从账号占用边界拆出，失败转入独立补偿或隔离。
+            if (r.Engine.State.IsGameOver && !TryFinalizeTerminalRoom(r, terminalStableInCoordinator))
+                return false;
+            if (!_rooms.TryRemove(new KeyValuePair<string, RoomEntry>(roomId, r))) return false;
+
+            foreach (var account in r.PlayerAccounts.Where(account => !string.IsNullOrWhiteSpace(account)))
+                _accountRoom.TryRemove(new KeyValuePair<string, string>(account, roomId));
+            r.OpeningPreparation?.Cancel();
+            lock (r.ClockGate) CancelOperationClockTimerLocked(r);
             WebSocketBridge.OnGameRoomClosed(
+                r.RoomId,
                 r.PlayerSessionIds,
+                r.PlayerAccounts,
                 r.Spectators.Keys,
-                preservePostGameChat: r.Engine.State.IsGameOver);
+                preservePostGameChat: r.Engine.State.IsGameOver,
+                matchKind: r.MatchKind,
+                turnCount: r.Engine.State.TurnCount,
+                gameOverReason: r.Engine.State.GameOverReason);
             RoomDirectory.Unregister(roomId);
+            CancelStartingPlayerChoiceTimeout(roomId);
             CancelMulliganTimeout(roomId);
+            CancelHexDraftTimeout(roomId);
+            foreach (var sid in r.PlayerSessionIds)
+                if (_grace.TryRemove(roomId + ":" + sid, out var grace)) { grace.Cancel(); grace.Dispose(); }
             r.ActionQueue.Writer.TryComplete();
             foreach (var sid in r.PlayerSessionIds) _sessionRoom.TryRemove(sid, out _);
             foreach (var sid in r.Spectators.Keys)   _sessionRoom.TryRemove(sid, out _);
-            r.Engine.RecordMatchLog("match_end", -1, new
-            {
-                winnerIndex = r.Engine.State.WinnerIndex,
-                reason = r.Engine.State.GameOverReason,
-                turnCount = r.Engine.State.TurnCount,
-                finalTick = r.Engine.State.Tick,
-                matchKind = r.MatchKind.ToString(),
-            });
+            NotifyRulesetUpdateAfterMatch(r);
 
-            TryRecordLeaderStats(r.RoomId, r.MatchKind, r.PlayerAccounts, r.Engine.State);
-            // 文件命令在各自单写 Channel 内仍然严格保序，但不让数百个房间清理线程
-            // 同步占住线程池等待磁盘关闭。正常关服的 Shutdown 仍会排空全部队列。
+            // 非终局的手动/TTL 清房没有结果可发布，只需终止回放捕获。终局云回放已经发布、
+            // 进入独立补偿队列或完整性隔离，不再持有玩家账号；只有补偿意图本身未能持久化时，
+            // 才保留 WAL/快照作为最后一道前向恢复材料。
+            var cloudReplayCleanup = r.Engine.State.IsGameOver || r.CloudReplay is null
+                ? Task.CompletedTask
+                : r.CloudReplay.AbortAsync();
+            var journalCleanup = r.PreserveRecoveryArtifactsForCloudReplay
+                ? Task.CompletedTask
+                : RoomJournal.DeleteDeferred(roomId);
+            var snapshotCleanup = r.PreserveRecoveryArtifactsForCloudReplay
+                ? Task.CompletedTask
+                : RoomRecoverySnapshotStore.DeleteDeferred(roomId);
             var persistenceCleanup = Task.WhenAll(
-                ReplayRecorder.CloseDeferred(roomId),
                 MatchLogRecorder.CloseDeferred(roomId),
-                RoomJournal.DeleteDeferred(roomId));
+                journalCleanup,
+                snapshotCleanup,
+                cloudReplayCleanup);
+            if (r.PreserveRecoveryArtifactsForCloudReplay)
+                Console.Error.WriteLine(
+                    $"[云回放补偿] 房间 {roomId} 的补偿意图未持久化；账号已释放，保留 WAL/快照供进程恢复。");
             _ = persistenceCleanup.ContinueWith(task =>
             {
                 if (task.Exception is not null)
@@ -760,10 +2954,371 @@ public static class GameRoomManager
                 string? winnerAccount = (wi is >= 0 and < 2) ? r.PlayerAccounts[wi.Value] : null;
                 WebSocketBridge.OnFriendlyGameEnd(r.FriendlyRoomId, winnerAccount);
             }
+
+            if (GetMaintenanceSnapshot().Enabled)
+                WebSocketBridge.BroadcastMaintenanceState();
+            return true;
+        }
+    }
+
+    private static bool TryFinalizeTerminalRoom(RoomEntry room, bool terminalStableInCoordinator)
+    {
+        try
+        {
+            var completedAtUtc = (room.TerminalCompletedAtUtc ?? DateTime.UtcNow).ToUniversalTime();
+            room.TerminalCompletedAtUtc = completedAtUtc;
+            var terminal = ReplayTerminalSemantics.Capture(room.Engine.State);
+
+            if (!room.TerminalOutcomePersisted)
+            {
+                TerminalOutcomeStore.Save(
+                    room.RoomId,
+                    completedAtUtc,
+                    room.MatchKind,
+                    room.PlayerAccounts,
+                    room.PlayerSessionIds,
+                    room.Engine.State,
+                    room.Engine.CinematicSnapshotProvider);
+                room.TerminalOutcomePersisted = true;
+            }
+
+            if (!room.RankedSettlementCompleted)
+            {
+                if (!TrySettleRankedMatch(room, completedAtUtc))
+                    throw new IOException("排位结算尚未完成");
+                room.RankedSettlementCompleted = true;
+            }
+
+            if (!room.LeaderStatsCompleted)
+            {
+                if (!TryRecordLeaderStats(
+                        room.RoomId,
+                        room.MatchKind,
+                        room.PlayerAccounts,
+                        room.Engine.State,
+                        completedAtUtc))
+                    throw new IOException("领袖统计结算尚未完成");
+                room.LeaderStatsCompleted = true;
+            }
+
+            if (!room.TerminalMatchLogCompleted)
+            {
+                if (!MatchLogRecorder.ContainsKind(room.RoomId, "match_end"))
+                {
+                    if (room.ReplayCheckpoints is not null)
+                    {
+                        if (terminalStableInCoordinator)
+                            room.ReplayCheckpoints.WriteTerminal(room.Engine);
+                        else
+                            room.ReplayCheckpoints.Disable(
+                                room.Engine.State,
+                                "terminal_outside_single_reader_coordinator");
+                    }
+
+                    var receipt = MatchLogRecorder.AppendDurableRequired(
+                        room.RoomId,
+                        room.Engine.State,
+                        "match_end",
+                        -1,
+                        new
+                        {
+                            winnerIndex = terminal.WinnerIndex,
+                            isDraw = terminal.IsDraw,
+                            reason = terminal.Reason,
+                            turnCount = terminal.TurnCount,
+                            finalTick = room.Engine.State.Tick,
+                            matchKind = room.MatchKind.ToString(),
+                            rulesetId = room.Engine.State.RulesetId,
+                        });
+                    if (!receipt.Queued) throw new IOException("终局日志未完成持久化提交");
+                }
+                room.TerminalMatchLogCompleted = true;
+            }
+
+            // 云回放是可补偿的赛后派生产物，不属于账号占用的核心提交边界。先确保终局快照、
+            // 排位、Leader 与 match_end 都已持久化，再尝试发布；失败只保留补偿/隔离材料，
+            // 不能继续占住玩家或阻塞下一局。
+            TryFinalizeCloudReplay(room, completedAtUtc, terminal);
+            room.TerminalFinalizationFailure = null;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            room.TerminalFinalizationFailure = ex.Message;
+            Console.Error.WriteLine($"[终局收尾] 房间 {room.RoomId} 暂未完成，将保留并重试：{ex.Message}");
+            return false;
+        }
+    }
+
+    private static void TryFinalizeCloudReplay(
+        RoomEntry room,
+        DateTime completedAtUtc,
+        ReplayTerminalSemantics terminal)
+    {
+        if (room.CloudReplayCompleted) return;
+        try
+        {
+            room.CloudReplay ??= CloudReplays?.ResumeMatch(room.RoomId);
+            if (room.CloudReplay is not null)
+            {
+                room.CloudReplay.CompleteAsync(new CloudReplayCompletion(
+                        completedAtUtc,
+                        terminal.WinnerIndex,
+                        terminal.IsDraw,
+                        terminal.Reason,
+                        terminal.TurnCount))
+                    .GetAwaiter().GetResult();
+            }
+            room.CloudReplayCompleted = true;
+            room.CloudReplayFinalizationFailure = null;
+            room.PreserveRecoveryArtifactsForCloudReplay = false;
+        }
+        catch (Exception ex)
+        {
+            room.CloudReplayFinalizationFailure = ex.Message;
+            var durableCompensation = room.CloudReplay?.HasDurableCompletionIntent == true
+                                      || CloudReplays?.HasDurableCompletionIntent(room.RoomId) == true;
+            room.PreserveRecoveryArtifactsForCloudReplay = !durableCompensation;
+            Console.Error.WriteLine(
+                $"[云回放补偿] 房间 {room.RoomId} 核心终局已提交，账号将释放；" +
+                $"云回放{(durableCompensation ? "已进入独立补偿/隔离" : "补偿意图未落盘，已保留房间恢复材料")}：{ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 周期扫描运行中的房间，兜底回收已经终局但未完成清理，或连续 30 分钟没有有效操作的死房间。
+    /// 返回本轮实际清理数量，便于测试和运维日志观察。
+    /// </summary>
+    public static int SweepExpiredRooms(DateTime utcNow)
+    {
+        var normalizedNow = utcNow.ToUniversalTime();
+        var cleaned = 0;
+        foreach (var room in _rooms.Values)
+        {
+            if (TryCleanupExpiredRoom(room.RoomId, normalizedNow)) cleaned++;
+        }
+        return cleaned;
+    }
+
+    internal static bool TryCleanupExpiredRoom(string roomId, DateTime utcNow)
+    {
+        if (!_rooms.TryGetValue(roomId, out var room)) return false;
+
+        var terminalRoom = room.Engine.State.IsGameOver;
+        var inactiveFor = utcNow.ToUniversalTime() - room.LastActivityUtc;
+        if (!terminalRoom && inactiveFor <= RoomInactivityTimeout) return false;
+
+        if (!terminalRoom)
+        {
+            const string description = "对局长时间无操作，房间已自动关闭";
+            foreach (var sessionId in room.PlayerSessionIds.Concat(room.Spectators.Keys))
+                WebSocketBridge.Send(sessionId, new { proto = "MsgDuelOver", IsWin = false, Description = description });
+        }
+
+        if (!TryCleanupRoom(roomId, terminalStableInCoordinator: false)) return false;
+
+        var reason = terminalRoom
+            ? "终局后残留"
+            : $"连续无操作 {Math.Max(0, (int)inactiveFor.TotalMinutes)} 分钟";
+        Console.WriteLine($"[房间超时清理] 已回收 {roomId}（{reason}）。");
+        return true;
+    }
+
+    public static async Task RunExpirationMonitorAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(RoomExpirationSweepInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cancellationToken))
+                SweepExpiredRooms(DateTime.UtcNow);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // 正常关服：由调用方取消周期扫描。
+        }
+    }
+
+    private static bool TrySettleRankedMatch(RoomEntry room, DateTime endedAtUtc)
+    {
+        if (!IsRankedSettlementEligible(room.MatchKind, room.Engine.State)) return true;
+        try
+        {
+            var mode = RankedModeForMatch(room.MatchKind);
+            var store = RankedStore.ForMode(mode);
+            // 更新前创建或恢复的 S1 对局仍然完成胜负记录，但不能计入四海人头。
+            // 玩家在旧对局中尚未选择海域，直接使用 S2 结算会一直报错并阻塞房间收尾。
+            if (store.IsHunterSeason && room.Engine.State.Players.Any(p => IsBountySeasonRankIdentity(p.RankIdentity)))
+            {
+                Console.WriteLine($"[排位] 对局 {room.RoomId} 属于已存档的赏金赛季，不计入 S2 猎人人头。");
+                return true;
+            }
+            var settlement = store.RecordMatch(
+                room.RoomId,
+                endedAtUtc,
+                room.PlayerAccounts[0],
+                room.PlayerDisplayNames[0],
+                room.PlayerAccounts[1],
+                room.PlayerDisplayNames[1],
+                room.Engine.State.WinnerIndex.GetValueOrDefault());
+            if (settlement is null) return true;
+            var players = new[] { settlement.Player0, settlement.Player1 };
+            for (var i = 0; i < 2; i++)
+            {
+                try
+                {
+                    var snapshot = store.GetSnapshot(room.PlayerAccounts[i], room.PlayerDisplayNames[i]);
+                    WebSocketBridge.Send(room.PlayerSessionIds[i], new
+                    {
+                        proto = "MsgRankResult",
+                        mode = RankedModeWire.Value(mode),
+                        result = RankWire.Settlement(players[i]),
+                        profile = RankWire.Profile(snapshot.Profile),
+                        leaderboard = RankWire.Leaderboard(snapshot.Leaderboard),
+                        factionStandings = RankWire.FactionStandings(snapshot.FactionStandings),
+                        snapshotVersion = snapshot.SnapshotVersion,
+                        generatedAtUtc = snapshot.GeneratedAtUtc,
+                    });
+                }
+                catch (RankLeaderboardUnavailableException ex)
+                {
+                    // 结算已权威落库；公共榜单不可用时仍立即回传实时个人积分和结算。
+                    var profile = store.GetProfileSnapshot(room.PlayerAccounts[i], room.PlayerDisplayNames[i]);
+                    WebSocketBridge.Send(room.PlayerSessionIds[i], new
+                    {
+                        proto = "MsgRankResult",
+                        mode = RankedModeWire.Value(mode),
+                        result = RankWire.Settlement(players[i]),
+                        profile = RankWire.Profile(profile),
+                        leaderboardError = "排位榜暂时未更新，个人积分已实时结算",
+                    });
+                    Console.Error.WriteLine($"[排位榜] 对局 {room.RoomId} 返回上一版失败：{ex.Message}");
+                }
+            }
+
+            var winnerIndex = room.Engine.State.WinnerIndex.GetValueOrDefault();
+            var loserIndex = 1 - winnerIndex;
+            WebSocketBridge.BroadcastRankedWinStreakEnded(
+                room.PlayerDisplayNames[loserIndex],
+                players[loserIndex].WinStreakBefore,
+                players[winnerIndex].Faction,
+                room.PlayerDisplayNames[winnerIndex]);
+            WebSocketBridge.BroadcastRankedWinStreak(
+                room.PlayerDisplayNames[winnerIndex],
+                players[loserIndex].Faction,
+                players[loserIndex].Tier,
+                players[winnerIndex].WinStreak);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[排位] 对局 {room.RoomId} 结算失败：{ex.Message}");
+            foreach (var sessionId in room.PlayerSessionIds)
+                WebSocketBridge.Send(sessionId, new { proto = "MsgRankResult", error = "排位结算暂时失败，服务端将保留对局记录" });
+            return false;
+        }
+    }
+
+    internal static bool IsBountySeasonRankIdentity(PlayerRankIdentity? identity)
+        => identity?.Faction is RankedStore.PirateFaction or RankedStore.MarineFaction or RankedStore.GovernmentFaction;
+
+    internal static bool IsRankedSettlementEligible(MatchKind matchKind, GameState state)
+        => matchKind is MatchKind.Ranked or MatchKind.RankedWild
+           && state.WinnerIndex is 0 or 1
+           && state.MulliganBothDone;
+
+    private static void NotifyRulesetUpdateAfterMatch(RoomEntry room)
+    {
+        var notice = CardRulesetManager.BuildUpdateNotice(room.Engine.State.RulesetId);
+        if (notice is null) return;
+        foreach (var sessionId in room.PlayerSessionIds)
+        {
+            WebSocketBridge.Send(sessionId, new
+            {
+                proto = "MsgRulesetUpdated",
+                previousRulesetId = notice.PreviousRulesetId,
+                currentRulesetId = notice.CurrentRulesetId,
+                description = notice.Description,
+                changedCards = notice.ChangedCards,
+                logStr = "卡牌效果已更新，将从下一局开始生效",
+            });
         }
     }
 
     // ── 重启恢复 ──────────────────────────────────────────────────────────
+
+    private static void PersistAcceptedAction(
+        RoomEntry room,
+        int playerIndex,
+        string action,
+        JsonElement data,
+        string? requestId,
+        GameActionSource source,
+        FeedbackActionContext? feedbackContext)
+    {
+        var journalSequence = Volatile.Read(ref room.JournalSequence) + 1;
+        try
+        {
+            var activeDraft = room.Engine.State.HexState.ActiveDraft;
+            RoomJournal.Append(
+                room.RoomId,
+                journalSequence,
+                playerIndex,
+                action,
+                data,
+                requestId,
+                journalSequence,
+                source,
+                activeDraft?.RoundId,
+                activeDraft?.DeadlineUtc,
+                feedbackContext);
+        }
+        catch (Exception ex)
+        {
+            throw new RecoveryPersistenceException(
+                $"动作 {journalSequence} 未能提交恢复日志",
+                ex);
+        }
+        Volatile.Write(ref room.JournalSequence, journalSequence);
+        Volatile.Write(ref room.LastOperationSequences[playerIndex], journalSequence);
+        Interlocked.Increment(ref room.AcceptedActionsSinceSnapshot);
+    }
+
+    private static void MaybeCaptureRecoverySnapshot(RoomEntry room)
+    {
+        if (Volatile.Read(ref room.AcceptedActionsSinceSnapshot)
+            < RoomRecoverySnapshotStore.CaptureEveryAcceptedActions)
+            return;
+        CaptureRecoverySnapshot(room);
+    }
+
+    private static void CaptureRecoverySnapshot(RoomEntry room)
+    {
+        if (room.VsBot || room.Engine.State.OpeningPreparationDeadlineUtc is not null) return;
+        Interlocked.Exchange(ref room.AcceptedActionsSinceSnapshot, 0);
+        var privateState = JsonSerializer.SerializeToElement(PrivateStateSnapshotBuilder.Build(room.Engine.State));
+        RoomRecoverySnapshotStore.Capture(new RoomRecoverySnapshot(
+            RoomRecoverySnapshotStore.SchemaVersion,
+            room.RoomId,
+            Volatile.Read(ref room.JournalSequence),
+            DateTime.UtcNow,
+            room.LastOperationSequences.ToArray(),
+            room.Engine.State.OperationClockRemainingMs.ToArray(),
+            room.ProcessedPlayerRequests.Snapshot().ToArray(),
+            RoomRecoverySnapshotStore.ComputeStateSha256(privateState),
+            privateState));
+    }
+
+    public static void CaptureAllRecoverySnapshots()
+    {
+        foreach (var room in _rooms.Values)
+        {
+            try { CaptureRecoverySnapshot(room); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[恢复快照] 捕获 {room.RoomId} 失败：{ex.Message}");
+            }
+        }
+    }
 
     /// <summary>
     /// 服务器启动时调用：扫描 Persist/*.jsonl，把 TTL 内未结束的 PvP 对局重放重建回 _rooms。
@@ -788,7 +3343,7 @@ public static class GameRoomManager
             {
                 skipped++;
                 Console.WriteLine($"[Restore] 跳过 {Path.GetFileName(file)}（重建失败）：{ex.Message}");
-                try { File.Delete(file); } catch { }
+                Quarantine(file, ex.Message);
             }
         }
         if (files.Length > 0)
@@ -798,44 +3353,118 @@ public static class GameRoomManager
     /// <summary>恢复单个房间。成功放回 _rooms 返回 true；弃局（删文件）返回 false。</summary>
     private static async Task<bool> RestoreOne(string file)
     {
-        var lines = await File.ReadAllLinesAsync(file);
-        if (lines.Length == 0) { TryDelete(file); return false; }
+        var committed = await RoomJournal.ReadCommittedLinesAsync(file);
+        var lines = committed.Lines.ToArray();
+        if (committed.HadIncompleteTail)
+            Console.WriteLine($"[Restore] {Path.GetFileName(file)} 已截断进程终止留下的未确认尾记录。");
+        if (lines.Length == 0) { Quarantine(file, "日志为空"); return false; }
 
         // 首行 header
         using var headerDoc = JsonDocument.Parse(lines[0]);
         var h = headerDoc.RootElement;
-        if (h.GetProperty("kind").GetString() != "create") { TryDelete(file); return false; }
+        if (h.GetProperty("kind").GetString() != "create")
+        {
+            Quarantine(file, "首行不是建房记录");
+            return false;
+        }
 
         var roomId      = h.GetProperty("roomId").GetString()!;
         var seed        = h.GetProperty("seed").GetInt32();
         var firstPlayer = h.GetProperty("firstPlayer").GetInt32();
+        var rulesetId = h.TryGetProperty("rulesetId", out var storedRulesetId)
+            ? storedRulesetId.GetString() ?? CardRulesetManager.BuiltIn.Id
+            : CardRulesetManager.BuiltIn.Id;
+        var ruleset = CardRulesetManager.GetRequired(rulesetId);
         var vsBot       = h.TryGetProperty("vsBot", out var vb) && vb.GetBoolean();
         var matchKind = MatchKind.UnknownHuman;
         if (h.TryGetProperty("matchKind", out var mk)
             && Enum.TryParse<MatchKind>(mk.GetString(), ignoreCase: true, out var parsedMatchKind))
             matchKind = parsedMatchKind;
         if (vsBot) matchKind = MatchKind.Bot;
+        // 新日志显式保存独立玩法开关；旧公开海克斯日志由 MatchKind 兼容推导，
+        // 旧好友房/房间码日志则保持升级前的普通玩法。
+        var hexMode = matchKind == MatchKind.Hex;
+        if (h.TryGetProperty("hexMode", out var storedHexMode))
+        {
+            if (storedHexMode.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                throw new InvalidDataException("建房日志包含无效的海克斯玩法开关。");
+            hexMode = storedHexMode.GetBoolean() || matchKind == MatchKind.Hex;
+        }
+        // 海克斯规则版本字段在 v2 池调整前不存在；缺失即锁定旧版语义，确保旧房间可重放恢复。
+        var hexRulesRevision = h.TryGetProperty("hexRulesRevision", out var storedHexRulesRevision)
+            ? storedHexRulesRevision.GetInt32()
+            : Hex.HexRules.LegacyRulesRevision;
+        Hex.HexCatalogConfiguration? hexCatalogConfiguration = null;
+        if (hexMode
+            && hexRulesRevision >= Hex.HexRules.CatalogConfigurationRulesRevision)
+        {
+            if (!h.TryGetProperty("hexCatalogRevision", out var catalogRevisionElement)
+                || !catalogRevisionElement.TryGetInt64(out var catalogRevision)
+                || !h.TryGetProperty("hexCatalogDigest", out var catalogDigestElement)
+                || catalogDigestElement.ValueKind != JsonValueKind.String
+                || !h.TryGetProperty("hexCatalogTiers", out var catalogTiersElement)
+                || catalogTiersElement.ValueKind != JsonValueKind.Array)
+                throw new InvalidDataException("新版海克斯房间日志缺少建局时锁定的目录配置。");
+            var catalogAssignments = new List<Hex.HexCatalogTierAssignment>();
+            foreach (var item in catalogTiersElement.EnumerateArray())
+            {
+                if (!item.TryGetProperty("id", out var idElement)
+                    || !idElement.TryGetInt32(out var id)
+                    || !item.TryGetProperty("tier", out var tierElement)
+                    || tierElement.ValueKind != JsonValueKind.String
+                    || !Enum.TryParse<Hex.HexTier>(tierElement.GetString(), ignoreCase: false, out var tier))
+                    throw new InvalidDataException("海克斯房间日志包含无效的目录品质项。");
+                catalogAssignments.Add(new Hex.HexCatalogTierAssignment(id, tier));
+            }
+            hexCatalogConfiguration = Hex.HexCatalogConfiguration.CreateForRulesRevision(
+                hexRulesRevision,
+                catalogRevision,
+                catalogAssignments,
+                catalogDigestElement.GetString());
+        }
         var p0          = h.GetProperty("p0");
         var p1          = h.GetProperty("p1");
         var p0Account   = p0.GetProperty("account").GetString()!;
         var p1Account   = p1.GetProperty("account").GetString()!;
+        var p0DisplayName = p0.TryGetProperty("displayName", out var dn0)
+            ? dn0.GetString() ?? p0Account
+            : p0Account;
+        var p1DisplayName = p1.TryGetProperty("displayName", out var dn1)
+            ? dn1.GetString() ?? p1Account
+            : p1Account;
         var p0Deck      = p0.GetProperty("deckRaw").GetString()!;
         var p1Deck      = p1.GetProperty("deckRaw").GetString()!;
         var p0Always    = p0.TryGetProperty("alwaysPrompt", out var a0) && a0.GetBoolean();
         var p1Always    = p1.TryGetProperty("alwaysPrompt", out var a1) && a1.GetBoolean();
         var p0CardBackId = p0.TryGetProperty("cardBackId", out var cb0) ? cb0.GetString() ?? "classic" : "classic";
         var p1CardBackId = p1.TryGetProperty("cardBackId", out var cb1) ? cb1.GetString() ?? "classic" : "classic";
+        var p0SpectateMode = p0.TryGetProperty("spectateMode", out var sm0) ? SpectatingRules.NormalizeMode(sm0.GetString()) : SpectatingRules.Open;
+        var p1SpectateMode = p1.TryGetProperty("spectateMode", out var sm1) ? SpectatingRules.NormalizeMode(sm1.GetString()) : SpectatingRules.Open;
+        var p0SpectatorHandsPublic = p0.TryGetProperty("spectatorHandsPublic", out var shp0) && shp0.GetBoolean();
+        var p1SpectatorHandsPublic = p1.TryGetProperty("spectatorHandsPublic", out var shp1) && shp1.GetBoolean();
+        var p0SpectateCode = p0.TryGetProperty("spectateCode", out var sc0) ? sc0.GetString() : null;
+        var p1SpectateCode = p1.TryGetProperty("spectateCode", out var sc1) ? sc1.GetString() : null;
         var p0SpriteMap = ReadSpriteMap(p0);
         var p1SpriteMap = ReadSpriteMap(p1);
         // 旧日志没有此字段，默认 false，保持升级前“构造时发牌”的随机序列以便正确恢复。
         var openingSetupAfterFirstPlayerChoice =
             h.TryGetProperty("openingSetupAfterFirstPlayerChoice", out var deferredSetup)
             && deferredSetup.GetBoolean();
+        var restoredChatDecorationLoadout = ReadChatDecorationJournalLoadout(h);
 
         if (vsBot) { TryDelete(file); return false; } // 范围=仅 PvP
 
         // 解析动作磁带 + 记录"最后一次操作时间"
         var actions = new List<MatchReplay.ActionEntry>();
+        var processedRequests = new List<RequestDedupeEntry>();
+        var restoredRecentActions = new Queue<RecentFeedbackAction>();
+        var lastOperationSequences = new long[] { -1, -1 };
+        long journalSequence = 0;
+        var restoredClockMs = new long[] { OperationTimeLimitMs, OperationTimeLimitMs };
+        var restoredTurnClockMs = new long[] { OperationTurnTimeLimitMs, OperationTurnTimeLimitMs };
+        var restoredTurnClockTurnCount = 0;
+        var restoredTurnExtensionUsed = new bool[2];
+        RecoveredServerTerminal? recoveredTerminal = null;
         DateTime lastActivity = h.TryGetProperty("createdAtUtc", out var ca)
             ? ca.GetDateTime() : DateTime.UtcNow;
         for (int i = 1; i < lines.Length; i++)
@@ -843,17 +3472,146 @@ public static class GameRoomManager
             if (string.IsNullOrWhiteSpace(lines[i])) continue;
             using var doc = JsonDocument.Parse(lines[i]);
             var e = doc.RootElement;
-            if (e.GetProperty("kind").GetString() != "action") continue;
+            var kind = e.GetProperty("kind").GetString();
+            if (kind == "clock")
+            {
+                if (e.TryGetProperty("player0RemainingMs", out var c0)) restoredClockMs[0] = Math.Max(0, c0.GetInt64());
+                if (e.TryGetProperty("player1RemainingMs", out var c1)) restoredClockMs[1] = Math.Max(0, c1.GetInt64());
+                if (e.TryGetProperty("player0TurnRemainingMs", out var tc0)) restoredTurnClockMs[0] = Math.Max(0, tc0.GetInt64());
+                if (e.TryGetProperty("player1TurnRemainingMs", out var tc1)) restoredTurnClockMs[1] = Math.Max(0, tc1.GetInt64());
+                if (e.TryGetProperty("turnCount", out var turnCount)) restoredTurnClockTurnCount = Math.Max(0, turnCount.GetInt32());
+                if (e.TryGetProperty("player0TurnExtensionUsed", out var te0)) restoredTurnExtensionUsed[0] = te0.GetBoolean();
+                if (e.TryGetProperty("player1TurnExtensionUsed", out var te1)) restoredTurnExtensionUsed[1] = te1.GetBoolean();
+                if (e.TryGetProperty("tsUtc", out var clockTs)) lastActivity = clockTs.GetDateTime();
+                continue;
+            }
+            if (kind == "terminal")
+            {
+                if (recoveredTerminal is not null)
+                    throw new InvalidDataException("恢复日志包含多个服务端终局记录");
+                var terminalNextSequence = e.TryGetProperty("journalSequence", out var terminalSequenceElement)
+                    ? terminalSequenceElement.GetInt64()
+                    : journalSequence + 1;
+                if (terminalNextSequence != journalSequence + 1)
+                    throw new InvalidDataException(
+                        $"恢复日志终局序号不连续：期望 {journalSequence + 1}，实际 {terminalNextSequence}");
+                var winnerIndex = e.GetProperty("winnerIndex").GetInt32();
+                var expiredPlayer = e.GetProperty("expiredPlayer").GetInt32();
+                if (winnerIndex is not (0 or 1)
+                    || expiredPlayer is not (0 or 1)
+                    || winnerIndex == expiredPlayer)
+                    throw new InvalidDataException("恢复日志终局玩家编号非法");
+                var completedAtUtc = e.TryGetProperty("completedAtUtc", out var completed)
+                    ? completed.GetDateTime().ToUniversalTime()
+                    : e.GetProperty("tsUtc").GetDateTime().ToUniversalTime();
+                recoveredTerminal = new RecoveredServerTerminal(
+                    terminalNextSequence,
+                    winnerIndex,
+                    expiredPlayer,
+                    e.GetProperty("terminalKind").GetString() ?? "server_terminal",
+                    e.GetProperty("reason").GetString() ?? "服务端裁定对局结束",
+                    completedAtUtc);
+                journalSequence = terminalNextSequence;
+                lastActivity = completedAtUtc;
+                continue;
+            }
+            if (kind != "action") continue;
+            if (recoveredTerminal is not null)
+                throw new InvalidDataException("恢复日志在终局记录之后仍包含动作");
             var pi   = e.GetProperty("playerIndex").GetInt32();
+            if (pi is not (0 or 1))
+                throw new InvalidDataException($"动作 {i} 的玩家编号非法");
             var act  = e.GetProperty("action").GetString()!;
             var data = e.GetProperty("data").Clone();
-            actions.Add(new MatchReplay.ActionEntry(pi, act, data));
-            if (e.TryGetProperty("tsUtc", out var ts)) lastActivity = ts.GetDateTime();
+            var nextSequence = e.TryGetProperty("journalSequence", out var sequenceElement)
+                ? sequenceElement.GetInt64()
+                : journalSequence + 1;
+            if (nextSequence != journalSequence + 1)
+                throw new InvalidDataException($"恢复日志动作序号不连续：期望 {journalSequence + 1}，实际 {nextSequence}");
+            journalSequence = nextSequence;
+            var source = e.TryGetProperty("source", out var sourceElement)
+                && string.Equals(sourceElement.GetString(), "system", StringComparison.OrdinalIgnoreCase)
+                    ? GameActionSource.System
+                    : GameActionSource.Player;
+            var hexDraftRoundId = e.TryGetProperty("hexDraftRoundId", out var hexRoundElement)
+                && hexRoundElement.ValueKind == JsonValueKind.String
+                    ? hexRoundElement.GetString()
+                    : null;
+            DateTime? hexDraftDeadlineUtc = e.TryGetProperty("hexDraftDeadlineUtc", out var hexDeadlineElement)
+                && hexDeadlineElement.ValueKind == JsonValueKind.String
+                    ? hexDeadlineElement.GetDateTime().ToUniversalTime()
+                    : null;
+            actions.Add(new MatchReplay.ActionEntry(
+                pi,
+                act,
+                data,
+                source,
+                hexDraftRoundId,
+                hexDraftDeadlineUtc));
+            lastOperationSequences[pi] = e.TryGetProperty("operationSequence", out var operationElement)
+                && operationElement.ValueKind == JsonValueKind.Number
+                    ? Math.Max(lastOperationSequences[pi], operationElement.GetInt64())
+                    : journalSequence;
+            var actionAtUtc = e.TryGetProperty("tsUtc", out var ts) ? ts.GetDateTime() : lastActivity;
+            lastActivity = actionAtUtc;
+            string? restoredRequestId = null;
+            if (e.TryGetProperty("requestId", out var requestElement)
+                && requestElement.ValueKind == JsonValueKind.String
+                && requestElement.GetString() is { Length: > 0 } requestIdFromLog)
+            {
+                restoredRequestId = requestIdFromLog;
+                processedRequests.Add(new RequestDedupeEntry(pi, restoredRequestId, lastActivity));
+            }
+            restoredRecentActions.Enqueue(new RecentFeedbackAction(
+                journalSequence,
+                actionAtUtc.ToUniversalTime(),
+                pi,
+                SanitizeActionName(act),
+                "accepted",
+                Clip(restoredRequestId, 128),
+                null,
+                source,
+                e.TryGetProperty("feedbackCardNumber", out var feedbackCardNumber)
+                    && feedbackCardNumber.ValueKind == JsonValueKind.String
+                        ? SanitizeCardNumber(feedbackCardNumber.GetString())
+                        : null,
+                e.TryGetProperty("feedbackPromptId", out var feedbackPromptId)
+                    && feedbackPromptId.ValueKind == JsonValueKind.String
+                        ? Clip(feedbackPromptId.GetString(), 64)
+                        : null,
+                e.TryGetProperty("feedbackPromptKind", out var feedbackPromptKind)
+                    && feedbackPromptKind.ValueKind == JsonValueKind.String
+                        ? SanitizeActionName(feedbackPromptKind.GetString())
+                        : null));
+            while (restoredRecentActions.Count > 16) restoredRecentActions.Dequeue();
         }
 
-        // TTL：自最后一次操作起超过 30 分钟 → 弃局
-        if (DateTime.UtcNow - lastActivity > RestoreTtl)
+        // 终局快照是已经提交的权威结果。快照按保留期清理后，云回放首个终局玩家帧仍是
+        // 服务端已经产生终局的持久化证据；两者任一存在都必须先重放并完成幂等收尾。
+        var hasPersistedTerminalOutcome = TerminalOutcomeStore.ContainsRequired(roomId);
+        CloudReplayPendingRecoveryState? pendingCloudReplay = null;
+        Exception? pendingCloudInspectionError = null;
+        try
         {
+            pendingCloudReplay = CloudReplays?.InspectPendingMatch(roomId);
+        }
+        catch (Exception ex)
+        {
+            // 磁带损坏时不能用“没有终局证据”解释并删除日志；TTL 内继续重放后进入安全暂停，
+            // TTL 外则直接隔离日志，保留 pending 原件供人工审计。
+            pendingCloudInspectionError = ex;
+        }
+        var hasPersistedTerminalEvidence = hasPersistedTerminalOutcome
+                                             || pendingCloudReplay?.HasTerminalFrame == true;
+        // TTL：自最后一次操作起超过 30 分钟且没有任何已提交终局 → 弃局
+        if (recoveredTerminal is null
+            && !hasPersistedTerminalEvidence
+            && DateTime.UtcNow - lastActivity > RoomInactivityTimeout)
+        {
+            if (pendingCloudInspectionError is not null)
+                throw new InvalidDataException(
+                    $"房间 {roomId} 的云回放证据损坏，无法安全判定为普通超时房间",
+                    pendingCloudInspectionError);
             Console.WriteLine($"[Restore] 弃局 {roomId}（超 TTL，最后操作 {lastActivity:u}）。");
             TryDelete(file);
             return false;
@@ -867,20 +3625,35 @@ public static class GameRoomManager
             leaderKeywordWildcard: false,
             p0AlwaysPrompt: p0Always,
             p1AlwaysPrompt: p1Always,
-            openingSetupAfterFirstPlayerChoice: openingSetupAfterFirstPlayerChoice);
+            openingSetupAfterFirstPlayerChoice: openingSetupAfterFirstPlayerChoice,
+            ruleset: ruleset,
+            matchKind: matchKind,
+            hexMode: hexMode,
+            hexRulesRevision: hexRulesRevision,
+            hexCatalogConfiguration: hexCatalogConfiguration,
+            p0DisplayName: p0DisplayName,
+            p1DisplayName: p1DisplayName);
+        if (hasPersistedTerminalEvidence
+            && recoveredTerminal is null
+            && !engine.State.IsGameOver)
+            throw new InvalidDataException($"房间 {roomId} 已有权威终局证据，但动作日志重放未得到终局");
+        if (engine.State.HexState.ActiveDraft is { } restoredHexDraft
+            && actions.All(action => action.HexDraftRoundId != restoredHexDraft.RoundId))
+        {
+            // 没有任何后续动作携带本轮截止时间，说明本轮由最后一条已提交动作刚刚触发。
+            restoredHexDraft.DeadlineUtc = lastActivity.ToUniversalTime()
+                .AddSeconds(Hex.HexRules.DraftTimeoutSeconds);
+        }
+        if (!engine.State.StartingPlayerChosen
+            && engine.State.OpeningStage == OpeningStage.WaitingFirstPlayerChoice)
+            engine.State.StartingPlayerChoiceDeadlineUtc = lastActivity.AddSeconds(GameEngine.StartingPlayerChoiceTimeoutSeconds);
         engine.EnablePrivateSnapshotLog = PrivateSnapshotLogEnabled;
+        engine.State.Players[0].DisplayName = p0DisplayName;
+        engine.State.Players[1].DisplayName = p1DisplayName;
         engine.State.Players[0].CardBackId = p0CardBackId;
         engine.State.Players[1].CardBackId = p1CardBackId;
         CopySpriteMap(p0SpriteMap, engine.State.Players[0].SpriteMap);
         CopySpriteMap(p1SpriteMap, engine.State.Players[1].SpriteMap);
-
-        if (engine.State.IsGameOver)
-        {
-            // 服务进程可能在胜负已产生、正常 CleanupRoom 尚未落盘时退出；恢复时补做幂等结算。
-            TryRecordLeaderStats(roomId, matchKind, new[] { p0Account, p1Account }, engine.State, lastActivity);
-            TryDelete(file);
-            return false;
-        }
 
         // 构造房间放回池：sid 用占位（真实 sid 由玩家重登时 TryReclaim 替换）
         var entry = new RoomEntry
@@ -889,43 +3662,324 @@ public static class GameRoomManager
             Engine = engine,
             PlayerSessionIds = new[] { "offline-0", "offline-1" },
             PlayerAccounts   = new[] { p0Account, p1Account },
+            PlayerDisplayNames = new[] { p0DisplayName, p1DisplayName },
+            SpectateModes = [p0SpectateMode, p1SpectateMode],
+            SpectatorHandsPublic = [p0SpectatorHandsPublic, p1SpectatorHandsPublic],
+            SpectateCodes = [p0SpectateCode, p1SpectateCode],
             VsBot = false,
             MatchKind = matchKind,
+            RestoredFromRecovery = true,
+            TerminalCompletedAtUtc = recoveredTerminal?.CompletedAtUtc
+                ?? (engine.State.IsGameOver ? lastActivity.ToUniversalTime() : null),
+            CreatedAt = h.TryGetProperty("createdAtUtc", out var createdAt)
+                ? createdAt.GetDateTime().ToUniversalTime()
+                : lastActivity,
         };
+        entry.MarkActivity(lastActivity > DateTime.UtcNow ? DateTime.UtcNow : lastActivity);
+        entry.JournalSequence = journalSequence;
+        entry.FeedbackActionSequence = journalSequence;
+        foreach (var restoredAction in restoredRecentActions)
+            entry.RecentFeedbackActions.Enqueue(restoredAction);
+        entry.LastOperationSequences[0] = lastOperationSequences[0];
+        entry.LastOperationSequences[1] = lastOperationSequences[1];
+        entry.ProcessedPlayerRequests.Restore(processedRequests);
+        engine.State.MatchKind = matchKind;
+        AttachRankIdentities(engine.State, matchKind, entry.PlayerAccounts, entry.PlayerDisplayNames);
+        engine.State.OperationClockEnabled = UsesPublicMatchClock(matchKind);
+        engine.State.OperationClockRemainingMs[0] = restoredClockMs[0];
+        engine.State.OperationClockRemainingMs[1] = restoredClockMs[1];
+        engine.State.OperationTurnClockRemainingMs[0] = Math.Min(
+            OperationTurnExtendedTimeLimitMs,
+            Math.Min(restoredTurnClockMs[0], restoredClockMs[0]));
+        engine.State.OperationTurnClockRemainingMs[1] = Math.Min(
+            OperationTurnExtendedTimeLimitMs,
+            Math.Min(restoredTurnClockMs[1], restoredClockMs[1]));
+        engine.State.OperationTurnClockTurnCount = restoredTurnClockTurnCount;
+        engine.State.OperationTurnExtensionUsed[0] = restoredTurnExtensionUsed[0];
+        engine.State.OperationTurnExtensionUsed[1] = restoredTurnExtensionUsed[1];
+        if (recoveredTerminal is not null)
+        {
+            engine.State.WinnerIndex = recoveredTerminal.WinnerIndex;
+            engine.State.IsDraw = false;
+            engine.State.GameOverReason = recoveredTerminal.Reason;
+            // 服务端终局 WAL 在 Broadcast 之前提交。恢复重放本身不会经过这次广播，
+            // 因此补上且只补上一次终局 Tick；已有云磁带若记录了更晚的兼容终局帧会在下方对齐。
+            engine.State.Tick++;
+            engine.State.InactivityActivePlayer = -1;
+            engine.State.InactivityWarningActive = false;
+            engine.State.InactivityLossRemainingMs = 0;
+            engine.State.OperationClockActivePlayer = -1;
+            engine.State.OperationClockPaused = true;
+        }
+        ConfigureChatDecorationCinematics(entry, restoredChatDecorationLoadout);
+        entry.DisconnectedPlayers[0] = true;
+        entry.DisconnectedPlayers[1] = true;
+        var restoredDisconnectStartedAt = Stopwatch.GetTimestamp();
+        entry.DisconnectStartedAt[0] = restoredDisconnectStartedAt;
+        entry.DisconnectStartedAt[1] = restoredDisconnectStartedAt;
+        engine.State.OperationClockPaused = engine.State.OperationClockEnabled;
+        engine.BeforeSnapshot = () => SyncOperationClock(entry);
+        var recoverySnapshot = ValidateRecoverySnapshot(entry);
+        AlignRecoveredTick(entry, recoverySnapshot, pendingCloudReplay);
+        CaptureRecoverySnapshot(entry);
 
-        // 重新挂回回调（按当前 sid 发；日志/录像/动作日志均"续写"而非覆盖）
+        Exception? cloudReplayResumeError = pendingCloudInspectionError;
+        try
+        {
+            entry.CloudReplay = CloudReplays?.ResumeMatch(roomId);
+        }
+        catch (Exception ex)
+        {
+            cloudReplayResumeError ??= ex;
+        }
+
+        // 重新挂回回调（按当前 sid 发；日志/动作日志与云回放均"续写"而非覆盖）
         engine.OnSendToPlayer = (idx, payload) =>
-            WebSocketBridge.Send(entry.PlayerSessionIds[idx], payload);
-        engine.OnSendToSpectators = (viewPlayerIndex, payload) =>
+        {
+            entry.CloudReplay?.AppendSnapshot(idx, payload);
+            DeliverPlayerPayload(entry, idx, payload);
+        };
+        engine.OnSendToSpectators = (viewPlayerIndex, payload, handPayload) =>
         {
             foreach (var spectator in entry.Spectators)
             {
-                if (spectator.Value == viewPlayerIndex)
-                    WebSocketBridge.Send(spectator.Key, payload);
+                if (spectator.Value.ViewPlayerIndex == viewPlayerIndex)
+                    DeliverSpectatorPayload(entry, spectator.Key,
+                        spectator.Value.HandVisible && handPayload is not null ? handPayload : payload);
             }
         };
         engine.HasSpectators = () => !entry.Spectators.IsEmpty;
         engine.HasSpectatorsForPerspective = viewPlayerIndex =>
-            entry.Spectators.Values.Any(value => value == viewPlayerIndex);
-        entry.ReplayPath   = ReplayRecorder.OpenAppend(roomId);
-        entry.MatchLogPath = MatchLogRecorder.OpenAppend(roomId);
-        engine.OnReplay        = (entryObj) => ReplayRecorder.Append(roomId, entryObj);
-        engine.OnMatchLog      = (kind, actor, payload) => MatchLogRecorder.Append(roomId, engine.State, kind, actor, payload);
-        engine.OnPersistAction = (pi, act, data) => RoomJournal.Append(roomId, pi, act, data);
-        RoomJournal.Reopen(roomId); // 续写新动作到同一文件（不重写 header）
+            entry.Spectators.Values.Any(value => value.ViewPlayerIndex == viewPlayerIndex);
+        engine.HasSpectatorsWithHandForPerspective = viewPlayerIndex =>
+            entry.Spectators.Values.Any(value => value.ViewPlayerIndex == viewPlayerIndex && value.HandVisible);
+        if (engine.State.IsGameOver && entry.CloudReplay is not null)
+        {
+            try
+            {
+                RepairRecoveredTerminalReplay(entry, recoveredTerminal);
+            }
+            catch (Exception ex)
+            {
+                cloudReplayResumeError ??= ex;
+            }
+        }
+        entry.TerminalMatchLogCompleted = MatchLogRecorder.ContainsKind(roomId, "match_end");
+        if (!entry.TerminalMatchLogCompleted)
+        {
+            entry.MatchLogPath = MatchLogRecorder.OpenAppend(roomId);
+            engine.OnMatchLogWithReceipt = (kind, actor, payload) =>
+                MatchLogRecorder.Append(roomId, engine.State, kind, actor, payload);
+        }
+        if (ReplayCheckpointFeature.IsEnabled())
+            new ReplayCheckpointLogCoordinator(roomId).Disable(
+                engine.State,
+                "process_recovery_random_trace_not_restored");
+        if (!engine.State.IsGameOver)
+        {
+            engine.OnPersistActionWithSource = (pi, act, data, requestId, source, feedbackContext) =>
+                PersistAcceptedAction(entry, pi, act, data, requestId, source, feedbackContext);
+            RoomJournal.Reopen(roomId); // 续写新动作到同一文件（不重写 header）
+        }
 
         _rooms[roomId] = entry;
+        // 已终局房间只为完成幂等收尾而短暂进入房间池，不能覆盖故障窗口内同账号
+        // 新建正常房间的占用映射；正常房间仍需登记，供建房准入检查使用。
+        if (!engine.State.IsGameOver)
+        {
+            foreach (var account in entry.PlayerAccounts.Where(account => !string.IsNullOrWhiteSpace(account)))
+                _accountRoom[account] = roomId;
+        }
         RoomDirectory.RegisterLocal(roomId);
         StartActionWorker(entry);
+        if (cloudReplayResumeError is not null)
+            PauseForRecoveryFailure(entry, "cloud_replay_resume_failed", cloudReplayResumeError);
+        if (engine.State.IsGameOver)
+        {
+            // 服务端终局、投降或平局动作都从同一幂等收尾路径继续；失败则保留终局房间供扫描重试。
+            var cleaned = TryCleanupRoom(roomId, terminalStableInCoordinator: false);
+            if (!cleaned)
+                Console.Error.WriteLine($"[Restore] 终局房间 {roomId} 收尾暂未完成，已保留等待重试。");
+            return !cleaned;
+        }
+        StartDisconnectGraceTimer(entry, 0, entry.PlayerSessionIds[0], entry.DisconnectGraceRemainingMs[0]);
+        StartDisconnectGraceTimer(entry, 1, entry.PlayerSessionIds[1], entry.DisconnectGraceRemainingMs[1]);
+        EnsureStartingPlayerChoiceTimeout(entry);
         EnsureMulliganTimeout(entry);
+        EnsureHexDraftTimeout(entry);
         // 不加 _sessionRoom（占位 sid 无意义）；不调 BroadcastInitialState（无人在线，静默重建）
         Console.WriteLine($"[Restore] 已恢复对局 {roomId}（{p0Account} vs {p1Account}，回放 {actions.Count} 个动作）。");
         return true;
     }
 
+    /// <summary>
+    /// 进程可能在终局广播给 P0 与 P1 之间退出。恢复时以各自磁带的最后一帧为准，只给缺失的
+    /// 视角补同一个权威终局 Tick；已经存在的终局帧绝不重复追加。
+    /// </summary>
+    private static void RepairRecoveredTerminalReplay(
+        RoomEntry room,
+        RecoveredServerTerminal? recoveredTerminal)
+    {
+        var capture = room.CloudReplay;
+        if (capture is null || !room.Engine.State.IsGameOver) return;
+
+        var states = new[]
+        {
+            capture.GetRecoveryFrameState(0),
+            capture.GetRecoveryFrameState(1),
+        };
+        var latestPersistedTick = states
+            .Where(state => state.Recorded)
+            .Select(state => state.LastTick)
+            .DefaultIfEmpty(room.Engine.State.Tick)
+            .Max();
+        room.Engine.State.Tick = Math.Max(room.Engine.State.Tick, latestPersistedTick);
+        var missingTerminalStates = states
+            .Where(state => state.Recorded && !state.HasTerminalFrame)
+            .ToArray();
+        if (missingTerminalStates.Length != 0)
+        {
+            var minimumRepairTick = missingTerminalStates.Max(state => state.LastTick) + 1;
+            room.Engine.State.Tick = Math.Max(room.Engine.State.Tick, minimumRepairTick);
+        }
+
+        var action = recoveredTerminal?.TerminalKind ?? "TerminalRecovery";
+        object payload = recoveredTerminal is null
+            ? new { recovered = true }
+            : new { expiredPlayer = recoveredTerminal.ExpiredPlayer, recovered = true };
+        for (var playerIndex = 0; playerIndex < 2; playerIndex++)
+        {
+            var frame = capture.GetRecoveryFrameState(playerIndex);
+            if (!frame.Recorded) continue;
+            if (frame.HasTerminalFrame)
+            {
+                if (frame.LastTick > room.Engine.State.Tick)
+                    throw new InvalidDataException(
+                        $"云回放 {room.RoomId}/P{playerIndex} 的终局 Tick 超前于权威状态");
+                var identity = capture.GetRecoveryTerminalIdentity(playerIndex)
+                    ?? throw new InvalidDataException(
+                        $"云回放 {room.RoomId}/P{playerIndex} 缺少终局语义");
+                ValidateRecoveredTerminalIdentity(room, playerIndex, identity);
+                continue;
+            }
+            if (frame.LastTick >= room.Engine.State.Tick)
+                throw new InvalidDataException(
+                    $"云回放 {room.RoomId}/P{playerIndex} 缺少终局帧且 Tick 无法安全续写");
+
+            capture.AppendSnapshot(
+                playerIndex,
+                StateSnapshotBuilder.Build(
+                    room.Engine.State,
+                    playerIndex,
+                    action,
+                    payload,
+                    cinematic: room.Engine.CinematicSnapshotProvider?.Invoke(playerIndex)));
+            var repaired = capture.GetRecoveryFrameState(playerIndex);
+            if (!repaired.HasTerminalFrame || repaired.LastTick != room.Engine.State.Tick)
+                throw new IOException($"云回放 {room.RoomId}/P{playerIndex} 终局帧补写失败");
+        }
+    }
+
+    private static void ValidateRecoveredTerminalIdentity(
+        RoomEntry room,
+        int playerIndex,
+        CloudReplayTerminalIdentity identity)
+    {
+        var state = room.Engine.State;
+        var winnerIsPlayer = !state.IsDraw && state.WinnerIndex == playerIndex;
+        var differences = new List<string>(4);
+        if (identity.IsDraw != state.IsDraw) differences.Add("平局标记");
+        if (identity.WinnerIsMe != winnerIsPlayer) differences.Add("胜负标记");
+        if (identity.TurnCount != state.TurnCount) differences.Add("回合数");
+        if (!string.Equals(identity.Reason, state.GameOverReason ?? "", StringComparison.Ordinal))
+            differences.Add("终局原因");
+        if (differences.Count != 0)
+            throw new InvalidDataException(
+                $"云回放 {room.RoomId}/P{playerIndex} 的终局语义与权威状态不一致：" +
+                string.Join("、", differences));
+    }
+
     private static void TryDelete(string file)
     {
         try { File.Delete(file); } catch { }
+        _ = RoomRecoverySnapshotStore.DeleteDeferred(Path.GetFileNameWithoutExtension(file));
+    }
+
+    private static RoomRecoverySnapshot? ValidateRecoverySnapshot(RoomEntry room)
+    {
+        var snapshot = RoomRecoverySnapshotStore.ReadRequiredIfExists(room.RoomId);
+        if (snapshot is not null)
+        {
+            room.ProcessedPlayerRequests.Restore(snapshot.ProcessedRequests);
+            if (snapshot.JournalSequence > room.JournalSequence)
+                throw new InvalidDataException(
+                    $"恢复快照序号 {snapshot.JournalSequence} 超前于动作日志 {room.JournalSequence}");
+            // 旧结构中的私有状态没有当前新增字段，哈希必然不同；但请求去重窗口仍然有效，
+            // 必须先恢复它，再由下方 CaptureRecoverySnapshot 写出当前结构的完整检查点。
+            if (snapshot.SchemaVersion == RoomRecoverySnapshotStore.SchemaVersion
+                && snapshot.JournalSequence == room.JournalSequence)
+            {
+                var current = JsonSerializer.SerializeToElement(PrivateStateSnapshotBuilder.Build(room.Engine.State));
+                var expectedHash = RoomRecoverySnapshotStore.ComputeRecoveryComparableStateSha256(
+                    snapshot.PrivateState);
+                var currentHash = RoomRecoverySnapshotStore.ComputeRecoveryComparableStateSha256(current);
+                if (!string.Equals(currentHash, expectedHash, StringComparison.Ordinal))
+                    throw new InvalidDataException(
+                        $"恢复快照确定性状态与动作重放结果不一致：{expectedHash} != {currentHash}");
+            }
+        }
+        return snapshot;
+    }
+
+    private static void AlignRecoveredTick(
+        RoomEntry room,
+        RoomRecoverySnapshot? snapshot,
+        CloudReplayPendingRecoveryState? pendingCloudReplay)
+    {
+        var highWatermark = pendingCloudReplay?.LastTick ?? -1;
+        if (snapshot is not null)
+        {
+            if (snapshot.PrivateState.TryGetProperty("tick", out var tickElement))
+            {
+                if (!tickElement.TryGetInt32(out var snapshotTick) || snapshotTick < 0)
+                    throw new InvalidDataException("恢复快照包含无效的广播 Tick");
+                highWatermark = Math.Max(highWatermark, snapshotTick);
+            }
+            else if (snapshot.SchemaVersion == RoomRecoverySnapshotStore.SchemaVersion)
+            {
+                throw new InvalidDataException("当前版本恢复快照缺少广播 Tick");
+            }
+        }
+        room.Engine.State.Tick = Math.Max(room.Engine.State.Tick, highWatermark);
+    }
+
+    private static void Quarantine(string file, string reason)
+    {
+        try
+        {
+            var quarantineDirectory = Path.Combine(Path.GetDirectoryName(file)!, "quarantine");
+            Directory.CreateDirectory(quarantineDirectory);
+            var target = Path.Combine(
+                quarantineDirectory,
+                $"{Path.GetFileNameWithoutExtension(file)}-{DateTime.UtcNow:yyyyMMddHHmmss}.jsonl");
+            File.Move(file, target, overwrite: true);
+            var snapshot = Path.Combine(
+                Path.GetDirectoryName(file)!,
+                $"{Path.GetFileNameWithoutExtension(file)}.snapshot.json");
+            if (File.Exists(snapshot))
+            {
+                var snapshotTarget = Path.Combine(
+                    quarantineDirectory,
+                    $"{Path.GetFileNameWithoutExtension(file)}-{DateTime.UtcNow:yyyyMMddHHmmss}.snapshot.json");
+                File.Move(snapshot, snapshotTarget, overwrite: true);
+            }
+            RecoveryReliabilityHealth.RecordQuarantined();
+            Console.Error.WriteLine($"[Restore] 已隔离损坏日志 {target}：{reason}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Restore] 隔离日志失败 {file}：{ex.Message}");
+        }
     }
 
     private static IReadOnlyDictionary<string, string> ReadSpriteMap(JsonElement player)
@@ -936,7 +3990,50 @@ public static class GameRoomManager
                ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     }
 
-    private static void TryRecordLeaderStats(
+    private static void AttachRankIdentities(
+        GameState state,
+        MatchKind matchKind,
+        IReadOnlyList<string> playerAccounts,
+        IReadOnlyList<string> playerDisplayNames)
+    {
+        var store = RankedStore.ForMode(RankedModeForMatch(matchKind));
+
+        for (var i = 0; i < state.Players.Length; i++)
+        {
+            try
+            {
+                state.Players[i].EquippedSeasonTitle = store.GetPublicEquippedSeasonTitle(playerAccounts[i]);
+                if (matchKind is not (MatchKind.Ranked or MatchKind.RankedWild)) continue;
+                var profile = store.GetSnapshot(playerAccounts[i], playerDisplayNames[i]).Profile;
+                if (profile.Faction is null) continue;
+                state.Players[i].RankIdentity = new PlayerRankIdentity(
+                    profile.Faction,
+                    profile.Tier,
+                    profile.Division,
+                    profile.PlacementGames,
+                    profile.PlacementRequired) { SeasonTitles = profile.SeasonTitles, EquippedSeasonTitle = profile.EquippedSeasonTitle };
+            }
+            catch (Exception ex)
+            {
+                // 排位身份展示失败不能阻止对局创建；保留日志供排查，客户端安全回退为只显示昵称。
+                Console.Error.WriteLine($"[排位] 玩家 {playerAccounts[i]} 的对局身份读取失败：{ex.Message}");
+            }
+        }
+    }
+
+    private static RankedMode RankedModeForMatch(MatchKind matchKind)
+        => matchKind == MatchKind.RankedWild ? RankedMode.Wild : RankedMode.Standard;
+
+    private static bool UsesPublicMatchClock(MatchKind matchKind)
+        => matchKind is MatchKind.Ranked
+            or MatchKind.RankedWild
+            or MatchKind.Casual
+            or MatchKind.CasualStandard
+            or MatchKind.CasualWild
+            or MatchKind.Hex
+            or MatchKind.Matchmaking;
+
+    private static bool TryRecordLeaderStats(
         string roomId,
         MatchKind matchKind,
         IReadOnlyList<string> playerAccounts,
@@ -944,11 +4041,11 @@ public static class GameRoomManager
         DateTime? endedAtUtc = null)
     {
         // 未分胜负的手动清理、超 TTL 弃局不属于已完成对局，不进入事实表。
-        if (state.WinnerIndex is not (0 or 1)) return;
+        if (state.WinnerIndex is not (0 or 1)) return true;
 
         try
         {
-            LeaderStatsStore.Default.RecordMatch(new LeaderMatchResult(
+            var result = new LeaderMatchResult(
                 roomId,
                 endedAtUtc ?? DateTime.UtcNow,
                 matchKind,
@@ -959,12 +4056,18 @@ public static class GameRoomManager
                 state.WinnerIndex,
                 state.FirstPlayer,
                 state.TurnCount,
-                state.GameOverReason ?? ""));
+                state.GameOverReason ?? "",
+                state.StartingHandCardNumbers[0],
+                state.StartingHandCardNumbers[1]);
+            LeaderStatsStore.Default.RecordMatch(result);
+            LeaderChampionStore.Default.RecordMatch(result);
+            return true;
         }
         catch (Exception ex)
         {
-            // 排行榜落盘失败不能阻塞正常对局清理；保留明确日志供运维补录。
+            // 两个事实表均以 matchId 幂等；保留终局房间与恢复日志后可安全重试部分成功。
             Console.Error.WriteLine($"[LeaderStats] 对局 {roomId} 写入失败：{ex.Message}");
+            return false;
         }
     }
 }

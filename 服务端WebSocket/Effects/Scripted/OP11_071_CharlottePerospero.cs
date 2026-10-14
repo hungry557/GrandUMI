@@ -54,10 +54,11 @@ public class OP11_071_CharlottePerospero : IScriptedEffect
         // 公开对方卡组最上方 1 张
         if (opp.Deck.Count == 0) return;
         var revealed = opp.Deck[0];
+        ctx.Engine?.BroadcastReveal(ctx.OwnerIndex, new[] { revealed.Info.Number });
         if (revealed.Info.Cost != declared) return; // 未命中
 
         // 命中：抽 1 张 + 追加 1 张活跃咚
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
         AtomicOps.RefreshDonFromDeck(me, 1, DonState.Active);
     }
 }

@@ -6,6 +6,8 @@ import { useResponsive } from "@/hooks/useResponsive";
 import CardItem from "@/components/ui/CardItem";
 import { getGameCard } from "@/data/CardLoader";
 import { GameRequest } from "@/net/GameRequest";
+import BattleTargetBadge from "@/components/game/BattleTargetBadge";
+import { getBattleCardPowerBonus } from "@/lib/battleCardPower";
 
 interface Props {
   side: "my" | "opponent";
@@ -37,6 +39,7 @@ export default function LeaderCard({ side }: Props) {
   const isSelectingTarget = useBattleStore((s) => s.isSelectingTarget);
   const confirmAttackTarget = useBattleStore((s) => s.confirmAttackTarget);
   const battle = useGameStore((s) => s.battle);
+  const phase = useGameStore((s) => s.phase);
   const currentTurn = useGameStore((s) => s.currentTurn);
   const { cardSize } = useResponsive();
   const dimensions = slotSizes[cardSize];
@@ -57,6 +60,7 @@ export default function LeaderCard({ side }: Props) {
     !battle.blockerCardId &&
     battle.targetIsLeader &&
     attackerBelongsToOpposingPlayer;
+  const battlePowerBonus = getBattleCardPowerBonus(battle, player.leaderId, "leader");
 
   const isTargetable = isSelectingTarget && side === "opponent" && !isPending;
 
@@ -101,11 +105,11 @@ export default function LeaderCard({ side }: Props) {
           攻击
         </span>
       )}
-      {isBattleTarget && (
-        <span className="pointer-events-none absolute -top-3 left-1/2 z-30 -translate-x-1/2 rounded bg-amber-500 px-1.5 text-[10px] font-black text-black shadow">
-          目标
-        </span>
-      )}
+      <BattleTargetBadge
+        phase={phase}
+        isBattleTarget={isBattleTarget}
+        isBlocker={false}
+      />
       <CardItem
         card={leader}
         size={cardSize}
@@ -113,7 +117,7 @@ export default function LeaderCard({ side }: Props) {
         isTapped={player.leaderTapped}
         battleHighlight={isAttacker ? "attacker" : isBattleTarget ? "target" : undefined}
         attachedDonCount={player.leaderAttachedDon}
-        powerBuff={player.leaderPower - (leader.power ?? 0) - player.leaderAttachedDon * 1000}
+        powerBuff={player.leaderPower + battlePowerBonus - (leader.power ?? 0) - player.leaderAttachedDon * 1000}
         hideCost
         showKeywordFx
         gainedKeywords={player.leaderGainedKeywords}
@@ -124,8 +128,17 @@ export default function LeaderCard({ side }: Props) {
               ? "can"
               : "none"
         }
+        oncePerTurnEffectAvailable={player.leaderOncePerTurnEffectAvailable}
         onClick={handleClick}
       />
+      {player.leaderEnterEffectNullified && (
+        <div
+          title="【登场时】效果无效"
+          className="pointer-events-none absolute -bottom-2 -right-2 z-40 flex h-6 w-6 items-center justify-center rounded-full bg-slate-900/90 text-rose-300 shadow-lg ring-2 ring-rose-400/70"
+        >
+          <span className="text-[13px] leading-none">🚫</span>
+        </div>
+      )}
       {isTargetable && (
         <div className="pointer-events-none absolute -right-2 -top-2 h-5 w-5 animate-pulse rounded-full bg-red-500 shadow-lg shadow-red-500/50" />
       )}

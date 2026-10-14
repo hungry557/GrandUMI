@@ -1,17 +1,29 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { useGameStore } from "@/store/gameStore";
 import { useBattleStore } from "@/store/battleStore";
 import { useIsDefender } from "@/hooks/useIsDefender";
 import { GameRequest } from "@/net/GameRequest";
 import { getCard } from "@/data/CardLoader";
+import CounterEventConfirmModal, {
+  type PendingCounterEvent,
+} from "@/components/game/CounterEventConfirmModal";
+import { useLayoutQuarterTurn } from "@/components/ui/ResponsiveScope";
 
 /**
  * 上下文操作按钮区：根据当前阶段/选中状态展示可用动作。
  * 放在右侧栏"操作"小区，与"操作日志"区分隔。
  */
 export default function GameActions() {
+  const [isEndTurnConfirming, setIsEndTurnConfirming] = useState(false);
+  const [pendingMainEvent, setPendingMainEvent] = useState<PendingCounterEvent | null>(null);
+  const rotateQuarterTurn = useLayoutQuarterTurn();
   const currentTurn = useGameStore((s) => s.currentTurn);
+  const canUndoAttachDon = useGameStore((s) => s.canUndoAttachDon);
+  const undoAttachDonOperationId = useGameStore((s) => s.undoAttachDonOperationId);
+  const undoAttachDonCount = useGameStore((s) => s.undoAttachDonCount);
+  const undoAttachDonDepth = useGameStore((s) => s.undoAttachDonDepth);
   const phase = useGameStore((s) => s.phase);
   const isPending = useGameStore((s) => s.isPending);
   const selectedHandIndex = useGameStore((s) => s.selectedHandIndex);
@@ -28,48 +40,52 @@ export default function GameActions() {
   const cancelAttack = useBattleStore((s) => s.cancelAttack);
   const isSelectingTarget = useBattleStore((s) => s.isSelectingTarget);
 
-  // 选中的攻击者（领袖或己方角色）的横置状态；非攻击者返回 null
-  const attackerTapped =
+  // 攻击机会以后端权威字段为准，避免仅凭“活跃状态”展示实际不可发动的攻击按钮。
+  const selectedAttackerCanAttack =
     my && selectedFieldId !== null
       ? my.leaderId === selectedFieldId
-        ? my.leaderTapped
-        : (my.fieldCards.find((c) => c.id === selectedFieldId)?.isTapped ?? null)
-      : null;
-  // 攻击者未横置才可宣言攻击
+        ? my.leaderCanAttack
+        : (my.fieldCards.find((c) => c.id === selectedFieldId)?.canAttack ?? false)
+      : false;
   const canAttack =
-    currentTurn && turnCount > 1 && !battle && !isSelectingTarget && attackerTapped === false;
-  const canPlay = currentTurn && selectedHandIndex !== null;
-  const canPassCounter = isDefender && phase === "Counter";
-
-  // 选中场上卡（领袖/领航、角色或舞台）含【启动主要】时，主要阶段可发动启动效果
-  const selectedNumber =
-    my && selectedFieldId !== null
-      ? selectedFieldId === my.leaderId
-        ? my.leaderNumber
-        : selectedFieldId === my.stageId
-          ? my.stageNumber
-          : (my.fieldCards.find((c) => c.id === selectedFieldId)?.number ?? null)
+    currentTurn && turnCount > 1 && !battle && !isSelectingTarget && selectedAttackerCanAttack;
+  const selectedHandCard =
+    my && selectedHandIndex !== null
+      ? getCard(my.handCardNumbers[selectedHandIndex] ?? "")
       : null;
-  const selectedHasActivated = selectedNumber
-    ? (getCard(selectedNumber)?.effectTags?.includes("ActivatedMain") ?? false)
-    : false;
-  // 该启动效果若为【每回合1次】且本回合已发动过，则后端权威下发已用标记 → 隐藏按钮
-  const selectedActivatedUsed =
+  const selectedIsCounterOnlyEvent =
+    selectedHandCard?.type === "Event" && !selectedHandCard.effectTags.includes("EventMain");
+  const selectedCanPlay = selectedHandIndex === null
+    ? false
+    : my?.handCardCanPlay?.[selectedHandIndex] ?? !selectedIsCounterOnlyEvent;
+  const canPlay = currentTurn && selectedHandIndex !== null && selectedCanPlay;
+  const canPassCounter = isDefender && phase === "Counter";
+  const selectedFieldCard =
+    my && selectedFieldId !== null
+      ? my.fieldCards.find((card) => card.id === selectedFieldId)
+      : undefined;
+  const selectedStage =
+    my && selectedFieldId !== null
+      ? my.stages.find((stage) => stage.id === selectedFieldId)
+      : undefined;
+
+  // 启动效果以服务端权威合法性为准。服务端统一考虑阶段、整卡无效、卡牌专属条件与成本，
+  // 客户端不再根据卡面标签推测，避免展示点击后只会静默失败的按钮。
+  const selectedCanActivateEffect =
     my && selectedFieldId !== null
       ? selectedFieldId === my.leaderId
-        ? my.leaderActivatedUsedThisTurn
-        : selectedFieldId === my.stageId
-          ? my.stageActivatedUsedThisTurn
-          : (my.fieldCards.find((c) => c.id === selectedFieldId)?.activatedUsedThisTurn ?? false)
+          ? my.leaderCanActivateEffect
+          : selectedStage
+            ? selectedStage.canActivateEffect
+            : (selectedFieldCard?.canActivateEffect ?? false)
       : false;
   const canActivate =
-    currentTurn &&
-    phase === "Main" &&
-    !battle &&
     !isSelectingTarget &&
     selectedFieldId !== null &&
-    selectedHasActivated &&
-    !selectedActivatedUsed;
+    selectedCanActivateEffect;
+  const canDetachAllDon =
+    !isSelectingTarget &&
+    (selectedFieldCard?.canDetachAllDon ?? false);
 
   // 贴咚采用“目标优先”操作：先选中领袖/角色，再直接选择要赋予的张数。
   // 领袖在协议中使用固定标识 "leader"；角色沿用场上实例 ID，舞台不可贴咚。
@@ -89,12 +105,25 @@ export default function GameActions() {
     attachTargetId !== null &&
     (my?.costActive ?? 0) > 0;
   const attachDonCounts = Array.from({ length: my?.costActive ?? 0 }, (_, index) => index + 1);
+  useEffect(() => {
+    if (!isEndTurnConfirming) return;
+    const timer = window.setTimeout(() => setIsEndTurnConfirming(false), 3_000);
+    return () => window.clearTimeout(timer);
+  }, [isEndTurnConfirming]);
 
-  const btn =
-    "w-full rounded-md px-3 py-2 text-sm font-bold text-white shadow transition-colors disabled:cursor-not-allowed disabled:bg-gray-600";
+  useEffect(() => {
+    setIsEndTurnConfirming(false);
+  }, [currentTurn, phase, turnCount, selectedHandIndex, selectedFieldId, isSelectingTarget]);
 
-  const hasAny =
-    canAttack || isSelectingTarget || canPlay || canActivate || canPassCounter || currentTurn;
+  useEffect(() => {
+    if (!currentTurn || phase !== "Main" || battle || isPending) setPendingMainEvent(null);
+  }, [battle, currentTurn, isPending, phase]);
+
+  // 竖屏设备会把 1280×720 牌桌缩放后再旋转；92px 在 360×780 的最小组合缩放下仍有 46px，
+  // 保证本区所有整行主要操作（含屠宰场）保留至少 44px 的实际触控短边。
+  const btn = `${rotateQuarterTurn ? "min-h-[5.75rem]" : "min-h-12"} w-full rounded-md px-3 py-2 text-sm font-bold text-white shadow transition-colors disabled:cursor-not-allowed disabled:bg-gray-600`;
+
+  const hasAny = canUndoAttachDon || canAttack || isSelectingTarget || canPlay || canActivate || canDetachAllDon || canPassCounter || currentTurn;
 
   const activateEffect = () => {
     if (!selectedFieldId) return;
@@ -104,7 +133,18 @@ export default function GameActions() {
 
   const playSelectedCard = () => {
     if (selectedHandIndex === null || !my) return;
-    const selected = getCard(my.handCardNumbers[selectedHandIndex] ?? "");
+    const selected = selectedHandCard;
+    if (selected?.type === "Event"
+        && selected.effectTags.includes("EventMain")
+        && selected.effectTags.includes("EventCounter")) {
+      setPendingMainEvent({
+        handIndex: selectedHandIndex,
+        cardNumber: selected.number,
+        cardName: selected.name,
+        cost: my.handCardCosts?.[selectedHandIndex] ?? selected.cost,
+      });
+      return;
+    }
     if (selected?.type === "Character" && my.fieldCards.length >= 5) {
       openLocalOverflow(selectedHandIndex);
       return;
@@ -118,8 +158,44 @@ export default function GameActions() {
     setSelectedField(null);
   };
 
+  const detachAllDon = () => {
+    if (!selectedFieldCard) return;
+    GameRequest.detachAllDon(selectedFieldCard.id);
+    setSelectedField(null);
+  };
+
+  const requestEndTurn = () => {
+    setIsEndTurnConfirming(true);
+  };
+
+  const confirmEndTurn = () => {
+    setIsEndTurnConfirming(false);
+    endTurn();
+  };
+
   return (
     <div className="flex flex-col gap-2">
+      {canUndoAttachDon && undoAttachDonOperationId && (
+        <div
+          className="rounded-md border border-amber-300/40 bg-amber-950/45 p-2 shadow-inner shadow-black/20"
+          role="status"
+        >
+          <p className="mb-2 text-center text-[11px] font-bold leading-4 text-amber-50">
+            最近贴了 {undoAttachDonCount} 咚
+            {undoAttachDonDepth > 1 ? `（还有 ${undoAttachDonDepth - 1} 次可逐次撤回）` : ""}
+            ；执行其他对局操作后将无法撤回
+          </p>
+          <button
+            type="button"
+            onClick={() => GameRequest.undoAttachDon(undoAttachDonOperationId)}
+            disabled={isPending}
+            className={`${rotateQuarterTurn ? "min-h-[5.75rem]" : "min-h-12"} w-full rounded-md border border-amber-200/60 bg-amber-400 px-3 py-2 text-sm font-black text-slate-950 shadow transition-colors hover:bg-amber-300 disabled:cursor-not-allowed disabled:bg-gray-600 disabled:text-gray-300`}
+          >
+            撤回贴咚
+          </button>
+        </div>
+      )}
+
       {canAttack && (
         <button
           onClick={() => selectedFieldId && startAttack(selectedFieldId)}
@@ -160,6 +236,17 @@ export default function GameActions() {
         </button>
       )}
 
+      {canDetachAllDon && (
+        <button
+          type="button"
+          onClick={detachAllDon}
+          disabled={isPending}
+          className={`${btn} border border-orange-300/50 bg-orange-700 hover:bg-orange-600`}
+        >
+          屠宰场：移除全部咚
+        </button>
+      )}
+
       {canAttachDon && (
         <div className="rounded-md border border-amber-300/25 bg-amber-950/25 p-2 shadow-inner shadow-black/20">
           <div className="mb-1.5 flex items-center justify-between gap-2 text-[11px] font-black">
@@ -174,7 +261,7 @@ export default function GameActions() {
                 onClick={() => attachDon(count)}
                 disabled={isPending}
                 title={`赋予 ${count} 张咚!!`}
-                className="rounded bg-amber-500/85 py-1 text-xs font-black text-black shadow transition-colors hover:bg-amber-300 disabled:cursor-not-allowed disabled:bg-gray-600 disabled:text-gray-300"
+                className="min-h-11 rounded bg-amber-500/85 text-xs font-black text-black shadow transition-colors hover:bg-amber-300 disabled:cursor-not-allowed disabled:bg-gray-600 disabled:text-gray-300"
               >
                 {count}
               </button>
@@ -185,7 +272,7 @@ export default function GameActions() {
               type="button"
               onClick={() => attachDon(attachDonCounts.length)}
               disabled={isPending}
-              className="mt-1.5 w-full rounded bg-amber-700/80 py-1 text-[11px] font-black text-amber-50 shadow transition-colors hover:bg-amber-600 disabled:cursor-not-allowed disabled:bg-gray-600"
+              className="mt-1.5 min-h-11 w-full rounded bg-amber-700/80 text-[11px] font-black text-amber-50 shadow transition-colors hover:bg-amber-600 disabled:cursor-not-allowed disabled:bg-gray-600"
             >
               全部（{attachDonCounts.length}）
             </button>
@@ -204,14 +291,63 @@ export default function GameActions() {
       )}
 
       {currentTurn && (
-        <button
-          onClick={endTurn}
-          disabled={isPending}
-          className={`${btn} bg-orange-500 hover:bg-orange-400`}
-        >
-          结束回合
-        </button>
+        <div className="mt-2 border-t border-rose-200/20 pt-4">
+          <p className="mb-2 text-[10px] font-black tracking-[0.18em] text-slate-500">
+            回合控制
+          </p>
+          {isEndTurnConfirming ? (
+            <div
+              className="rounded-md border border-rose-300/30 bg-rose-950/35 p-2"
+              role="group"
+              aria-label="确认结束回合"
+            >
+              <p className="mb-2 text-center text-[11px] font-bold text-rose-100">
+                确定结束回合？
+              </p>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsEndTurnConfirming(false)}
+                  disabled={isPending}
+                  className="min-h-12 rounded-md bg-slate-700 px-2 py-2 text-xs font-bold text-white transition-colors hover:bg-slate-600 disabled:cursor-not-allowed disabled:bg-gray-600"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmEndTurn}
+                  disabled={isPending}
+                  className="min-h-12 rounded-md bg-rose-600 px-2 py-2 text-xs font-bold text-white shadow transition-colors hover:bg-rose-500 disabled:cursor-not-allowed disabled:bg-gray-600"
+                >
+                  确认结束
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={requestEndTurn}
+              disabled={isPending}
+              className={`${btn} border border-rose-300/35 bg-rose-950/65 text-rose-50 hover:bg-rose-900/80`}
+            >
+              结束回合
+            </button>
+          )}
+        </div>
       )}
+
+      <CounterEventConfirmModal
+        pending={pendingMainEvent}
+        mode="main"
+        onCancel={() => setPendingMainEvent(null)}
+        onConfirm={() => {
+          const pending = pendingMainEvent;
+          setPendingMainEvent(null);
+          if (!pending || isPending || !currentTurn || phase !== "Main" || battle) return;
+          if (my?.handCardNumbers[pending.handIndex] !== pending.cardNumber) return;
+          GameRequest.playCard(pending.handIndex);
+        }}
+      />
 
       {!hasAny && (
         <p className="py-1 text-center text-xs text-slate-500">等待对手…</p>

@@ -66,6 +66,7 @@
             "max": 1,
             "min": 0,
             "as": "$tgt",
+            "valueBasis": "original",
             "filter": {
               "originalPowerLte": 5000
             }
@@ -109,7 +110,7 @@
             "min": 0,
             "as": "$b",
             "filter": {
-              "originalPowerLte": 0
+              "currentPowerLte": 0
             }
           },
           {
@@ -179,7 +180,8 @@
           "prompt": "OwnLeaderOrCharacter",
           "max": 1,
           "min": 0,
-          "as": "$t"
+          "as": "$t",
+          "text": "选择己方最多1张领袖或角色，本次战斗力量+3000"
         },
         {
           "op": "AddPowerThisBattle",
@@ -275,7 +277,8 @@
         "then": [
           {
             "op": "ActiveOwnDon",
-            "n": 2
+            "n": 2,
+            "chooseCount": true
           }
         ]
       }
@@ -333,7 +336,8 @@
         "then": [
           {
             "op": "ActiveOwnDon",
-            "n": 1
+            "n": 1,
+            "chooseCount": true
           }
         ]
       }
@@ -468,7 +472,8 @@
     "trigger": [
       {
         "op": "ActiveOwnDon",
-        "n": 5
+        "n": 5,
+        "chooseCount": true
       }
     ]
   },
@@ -790,7 +795,7 @@
             "max": 1,
             "restTo": "bottom",
             "match": {
-              "keyword": "巴洛克工作室",
+              "keywordContains": "巴洛克工作室",
               "excludeName": "Ms.情人节(美琪塔)"
             }
           }

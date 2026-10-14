@@ -29,12 +29,16 @@ public class OP06_102_Mantis : IScriptedEffect
 
         // 成本候选：场上费用为 1 的舞台（任意一方持有）
         var stages = new List<(CardInstance stage, int ownerIdx)>();
-        if (me.StageCard is { } myStage && myStage.Info.Cost == 1) stages.Add((myStage, ctx.OwnerIndex));
-        if (opp.StageCard is { } oppStage && oppStage.Info.Cost == 1) stages.Add((oppStage, 1 - ctx.OwnerIndex));
+        stages.AddRange(me.StageCards
+            .Where(stage => ctx.State.CurrentCostOf(stage) == 1)
+            .Select(stage => (stage, ctx.OwnerIndex)));
+        stages.AddRange(opp.StageCards
+            .Where(stage => ctx.State.CurrentCostOf(stage) == 1)
+            .Select(stage => (stage, 1 - ctx.OwnerIndex)));
         if (stages.Count == 0) return;
 
         // KO 目标：对方费用不高于 2 的角色
-        var targets = opp.Characters.Where(c => c.Info.Cost <= 2).ToList();
+        var targets = opp.Characters.Where(c => ctx.State.CurrentCostOf(c) <= 2).ToList();
         if (targets.Count == 0) return;
 
         bool use = await ctx.Prompts.ConfirmOptional(ctx.OwnerIndex,

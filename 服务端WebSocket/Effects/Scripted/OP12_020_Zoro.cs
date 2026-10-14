@@ -6,7 +6,8 @@ namespace GrandUMI.Effects.Scripted;
 /// OP12-020 罗罗诺亚·佐罗（领航）
 /// 【咚!!×3】【启动主要】【每回合1次】本回合中，此领袖与对方的角色进行战斗的场合，将此领袖转为活跃状态。
 /// 之后，本回合中，此领袖无法攻击对方原本的费用不高于7的角色。
-/// 实现：ReactivateAfterBattleThisTurn(战斗后重激活，引擎在 EndBattle 处理) + NoAttackCostLeThisTurn=7。
+/// 实现：战斗结束时由引擎记录“本回合已与角色战斗”；之后发动启动主要时立即转为活跃，
+/// 并从该时点起设置 NoAttackCostLeThisTurn=7。
 /// </summary>
 public class OP12_020_Zoro : IScriptedEffect
 {
@@ -29,10 +30,15 @@ public class OP12_020_Zoro : IScriptedEffect
         // 恒 false、按钮用后不消失，再点永远静默（反馈#168 根因）
         var key = "OP12-020-act:" + ctx.Source.Id;
         if (me.TurnOnceUsed.Contains(key)) return Task.CompletedTask;
-        me.TurnOnceUsed.Add(key);
+        if (!self.BattledOpponentCharacterThisTurn)
+        {
+            ctx.Engine?.SendError(ctx.OwnerIndex, "本回合此领袖尚未与对方角色进行战斗");
+            return Task.CompletedTask;
+        }
 
-        self.ReactivateAfterBattleThisTurn = true;   // 与对方角色战斗后转为活跃
-        self.NoAttackCostLeThisTurn = 7;             // 本回合无法攻击对方原费用≤7角色
+        me.TurnOnceUsed.Add(key);
+        self.IsTapped = false;
+        self.NoAttackCostLeThisTurn = 7;
         return Task.CompletedTask;
     }
 }

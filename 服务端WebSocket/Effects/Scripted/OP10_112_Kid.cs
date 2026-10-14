@@ -34,7 +34,7 @@ public class OP10_112_Kid : IScriptedEffect
             if (!use) return;
 
             // 成本：横置自身
-            AtomicOps.RestCard(self);
+            if (!AtomicOps.RestCard(self)) return;
 
             // 效果：对方生命顶 → 对方废弃区
             var top = opp.LifeArea[0];
@@ -45,7 +45,7 @@ public class OP10_112_Kid : IScriptedEffect
         {
             if (opp.LifeArea.Count > 2) return;
 
-            AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+            await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
 
             if (me.Hand.Count > 0)
             {

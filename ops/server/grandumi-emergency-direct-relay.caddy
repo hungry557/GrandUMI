@@ -1,0 +1,10 @@
+# Temporary low-latency relay used only while the new production host cannot
+# obtain a dedicated certificate for direct.grand-umi.com.
+direct.grand-umi.com {
+	reverse_proxy https://103.146.230.37 {
+		header_up Host __GRANDUMI_PRIMARY_DOMAIN__
+		transport http {
+			tls_server_name __GRANDUMI_PRIMARY_DOMAIN__
+		}
+	}
+}

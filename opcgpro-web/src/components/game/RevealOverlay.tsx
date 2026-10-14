@@ -6,6 +6,7 @@ import { useGameStore } from "@/store/gameStore";
 import { getGameCard } from "@/data/CardLoader";
 import CardItem from "@/components/ui/CardItem";
 import type { CardData } from "@/types/card";
+import { animationDuration, useSettingsStore } from "@/store/settingsStore";
 
 /** 公开浮层停留时长（毫秒） */
 const REVEAL_DURATION = 2500;
@@ -23,28 +24,29 @@ type Shown = { cards: CardData[]; label: string };
 export default function RevealOverlay() {
   const reveal = useGameStore((s) => s.reveal);
   const clearReveal = useGameStore((s) => s.clearReveal);
-  const mySpriteMap = useGameStore((s) => s.my?.spriteMap);
-  const opponentSpriteMap = useGameStore((s) => s.opponent?.spriteMap);
   const [shown, setShown] = useState<Shown | null>(null);
+  const animationSpeed = useSettingsStore((state) => state.animationSpeed);
 
   useEffect(() => {
-    if (!reveal) return;
-    const spriteMap = reveal.side === "my" ? mySpriteMap : opponentSpriteMap;
-    const cards = reveal.cardNumbers
+    const current = useGameStore.getState();
+    const currentReveal = current.reveal;
+    if (!currentReveal) return;
+    const spriteMap = currentReveal.side === "my" ? current.my?.spriteMap : current.opponent?.spriteMap;
+    const cards = currentReveal.cardNumbers
       .map((n) => getGameCard(n, spriteMap))
       .filter((c): c is CardData => !!c);
     if (cards.length === 0) {
       clearReveal();
       return;
     }
-    setShown({ cards, label: reveal.side === "my" ? "你公开了" : "对方公开了" });
+    setShown({ cards, label: currentReveal.side === "my" ? "你公开了" : "对方公开了" });
     const t = setTimeout(() => {
       setShown(null);
       clearReveal();
-    }, REVEAL_DURATION);
+    }, animationSpeed === "off" ? 1000 : animationDuration(REVEAL_DURATION, animationSpeed));
     return () => clearTimeout(t);
     // nonce 变化即重新触发一次展示
-  }, [reveal?.nonce, reveal, clearReveal, mySpriteMap, opponentSpriteMap]);
+  }, [animationSpeed, reveal?.nonce, clearReveal]);
 
   return (
     <AnimatePresence>
@@ -54,7 +56,7 @@ export default function RevealOverlay() {
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          transition={{ duration: 0.2 }}
+          transition={{ duration: animationDuration(200, animationSpeed) / 1000 }}
         >
           {/* 半透明压暗背景，弱于 Prompt 弹窗 */}
           <div className="absolute inset-0 bg-black/45" />
@@ -64,7 +66,9 @@ export default function RevealOverlay() {
             initial={{ scale: 0.7, y: 20 }}
             animate={{ scale: 1, y: 0 }}
             exit={{ scale: 0.85, opacity: 0 }}
-            transition={{ type: "spring", stiffness: 220, damping: 22 }}
+            transition={animationSpeed === "off"
+              ? { duration: 0 }
+              : { type: "spring", stiffness: 220, damping: 22 }}
           >
             <div className="rounded-full bg-orange-500/90 px-5 py-1.5 text-base font-bold text-white shadow-lg">
               {shown.label}

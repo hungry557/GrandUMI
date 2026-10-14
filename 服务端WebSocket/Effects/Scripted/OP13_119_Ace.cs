@@ -18,10 +18,8 @@ namespace GrandUMI.Effects.Scripted;
 ///   3. 若执行了步骤 2，则由对方从其手牌中选最多 1 张原费用 ≤4 的角色登场（对方决定，min=0）。
 ///      手牌候选经 extra.choiceCards 下发卡面给对方客户端。
 ///
-/// 简化点 / 未实现：
-///   - "生命 ≤3 时获得【速攻】" 为条件型持续被动（需引擎在判定速攻资格时按生命数动态求值），
-///     当前脚本不处理该被动；仅实现【登场时】。
-///   - "费用不高于 N" 按卡牌原本印刷费用（Info.Cost）判定。
+///   - “生命≤3时获得【速攻】”以条件型 ContinuousEffect 动态判定。
+///   - 场上角色的"费用不高于 N"按当前费用判定；手牌候选仍按卡面费用判定。
 /// </summary>
 public class OP13_119_Ace : IScriptedEffect
 {
@@ -35,12 +33,24 @@ public class OP13_119_Ace : IScriptedEffect
         var oppIndex = 1 - ctx.OwnerIndex;
         var opp = ctx.State.Players[oppIndex];
 
+        var selfId = ctx.Source.Id;
+        int owner = ctx.OwnerIndex;
+        ctx.State.ContinuousEffects.RemoveAll(effect => effect.SourceCardId == selfId.ToString());
+        ctx.State.ContinuousEffects.Add(new ContinuousEffect
+        {
+            SourceCardId = selfId.ToString(),
+            Scope = new ContinuousScope { Side = 0, IncludeLeader = false, IncludeCharacters = true },
+            GrantKeyword = "速攻",
+            Predicate = (state, side, card) =>
+                side == owner && card.Id == selfId && state.Players[owner].LifeArea.Count <= 3,
+        });
+
         // 1. 赋予我方领袖最多 1 张休息状态的咚!!：只取费用区中已休息的咚，无休息咚则不赋予
         //    （不回退取活跃咚，统一「赋予休息咚」语义，见 AttachDonFromCost 与 ST17-004 修复记录）
         AtomicOps.AttachDonFromCost(me, me.Leader.Id, 1, DonState.Rest);
 
         // 2. 可选：将对方 1 张原费用 ≤5 的角色放回其持有者手牌
-        var bounceCandidates = opp.Characters.Where(c => c.Info.Cost <= 5).ToList();
+        var bounceCandidates = opp.Characters.Where(c => ctx.State.CurrentCostOf(c) <= 5).ToList();
         if (bounceCandidates.Count == 0) return;
 
         var bounceChosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OpponentCharacter",

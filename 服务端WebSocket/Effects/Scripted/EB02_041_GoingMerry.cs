@@ -29,7 +29,7 @@ public class EB02_041_GoingMerry : IScriptedEffect
         if (ctx.Trigger == EffectTrigger.OnEnterField)
         {
             if (me.Leader.Info.HasKeyword("草帽一伙"))
-                AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 1);
+                await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 1);
             return;
         }
 
@@ -44,7 +44,7 @@ public class EB02_041_GoingMerry : IScriptedEffect
         if (!use) return;
 
         // 成本：横置此舞台
-        AtomicOps.RestCard(ctx.Source);
+        if (!AtomicOps.RestCard(ctx.Source)) return;
 
         // 条件：我方咚数 ≤ 对方咚数
         if (me.TotalDonInCostArea > opp.TotalDonInCostArea) return;

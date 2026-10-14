@@ -40,7 +40,7 @@ public class EB03_061_Uta : IScriptedEffect
             if (restDon != null) restDon.State = DonState.Active;
 
             // 之后：将对方最多 1 张费用≤4 的角色或咚!! 转为休息状态
-            var charCands = opp.Characters.Where(c => !c.IsTapped && c.Info.Cost <= 4).ToList();
+            var charCands = opp.Characters.Where(c => !c.IsTapped && ctx.State.CurrentCostOf(c) <= 4).ToList();
             var donCands  = opp.CostArea.Where(d => d.State == DonState.Active).ToList();
             // 对方咚!! 无固有费用，按文本"费用不高于 4 的角色或咚!!"将咚!! 视为可选目标。
 
@@ -64,7 +64,7 @@ public class EB03_061_Uta : IScriptedEffect
                 if (chosen.Count > 0)
                 {
                     var tgt = charCands.First(c => c.Id.ToString() == chosen[0]);
-                    tgt.IsTapped = true;
+                    AtomicOps.RestCard(tgt);
                 }
             }
             else if (choice == 1 && hasDon)

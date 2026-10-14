@@ -609,7 +609,7 @@
             "max": 1,
             "restTo": "bottom",
             "match": {
-              "keywordContains": "触发"
+              "hasTrigger": true
             }
           }
         ]
@@ -709,15 +709,7 @@
         },
         "then": [
           {
-            "op": "Choose",
-            "prompt": "OpponentLifeAll",
-            "max": 1,
-            "min": 0,
-            "as": "$tgt"
-          },
-          {
-            "op": "KO",
-            "target": "$tgt"
+            "op": "OppLifeToTrash"
           }
         ]
       }

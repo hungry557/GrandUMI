@@ -13,4 +13,41 @@
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.10" />
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.12" />
   </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="GrandUMIServer.Tests" />
+    <InternalsVisibleTo Include="GrandUMI.ProcessWorkerFixture" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Effects\Definitions\**\*.json"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Update="Training\Models\first-synthetic-model.v1.json"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Update="qq-access-enforcement-v1.marker"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest"
+          TargetPath=".grandumi-qq-access-enforcement-v1" />
+    <None Update="shared-account-v1.marker"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest"
+          TargetPath=".grandumi-shared-account-v1" />
+    <None Include="..\卡牌数据\**\*.json"
+          Link="卡牌数据\%(RecursiveDir)%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="ValidatePublishedDslDefinitions" AfterTargets="Publish">
+    <ItemGroup>
+      <PublishedDslDefinitions Include="$(PublishDir)Effects\Definitions\*.json" />
+      <PublishedCardData Include="$(PublishDir)卡牌数据\*.json" />
+    </ItemGroup>
+    <Error Condition="'@(PublishedDslDefinitions)' == ''"
+           Text="发布产物缺少 Effects/Definitions DSL 卡效定义。" />
+    <Error Condition="'@(PublishedCardData)' == ''"
+           Text="发布产物缺少与当前提交一致的卡牌数据。" />
+  </Target>
 </Project>

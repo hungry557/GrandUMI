@@ -1,5 +1,6 @@
 using System.Text.Json;
 using GrandUMI.Cards;
+using GrandUMI.Game.Hex;
 
 namespace GrandUMI.Game.Snapshot;
 
@@ -52,6 +53,25 @@ public static class ActionLogFormatter
                 return $"[咚] {Side(player)}为【{targetName}】附加 {count} 个咚";
             }
 
+            case "UndoAttachDon":
+            {
+                int player = GetInt(payload, "player");
+                int count = GetInt(payload, "count", 1);
+                string targetId = GetStr(payload, "targetId");
+                string targetName = targetId == "leader"
+                    ? "领袖"
+                    : (FindCard(state, targetId) is { } target ? target.Card.Info.Name : "角色");
+                return $"[咚] {Side(player)}撤回了为【{targetName}】附加的 {count} 个咚";
+            }
+
+            case "DetachAllDon":
+            {
+                int player = GetInt(payload, "player");
+                int count = GetInt(payload, "count");
+                string cardNumber = GetStr(payload, "cardNumber");
+                return $"[海克斯] {Side(player)}令【{Card(cardNumber)}】移除全部 {count} 个咚";
+            }
+
             case "Attack":
             {
                 string attackerId = GetStr(payload, "attacker");
@@ -59,15 +79,21 @@ public static class ActionLogFormatter
                 var atk = FindCard(state, attackerId);
                 int attackerOwner = atk?.Owner ?? state.CurrentTurnPlayer;
                 string attackerName = atk?.Card.Info.Name ?? "角色";
-                string targetDesc;
-                if (targetIsLeader)
-                    targetDesc = $"{Side(1 - attackerOwner)}领袖";
-                else
-                {
-                    var tgt = FindCard(state, GetStr(payload, "targetId"));
-                    targetDesc = tgt?.Card.Info.Name ?? "角色";
-                }
-                return $"[攻击] {Side(attackerOwner)}用【{attackerName}】攻击【{targetDesc}】";
+                string attackerPower = atk is { } attackerRef
+                    ? state.CurrentPowerOf(attackerRef.Owner, attackerRef.Card).ToString()
+                    : "?";
+
+                int targetOwner = 1 - attackerOwner;
+                CardRef? target = targetIsLeader
+                    ? new CardRef(targetOwner, state.Players[targetOwner].Leader)
+                    : FindCard(state, GetStr(payload, "targetId"));
+                targetOwner = target?.Owner ?? targetOwner;
+                string targetName = target?.Card.Info.Name ?? (targetIsLeader ? "领袖" : "角色");
+                string targetPower = target is { } targetRef
+                    ? state.CurrentPowerOf(targetRef.Owner, targetRef.Card).ToString()
+                    : "?";
+
+                return $"[攻击] {Side(attackerOwner)}【{attackerName}】{attackerPower} vs {Side(targetOwner)}【{targetName}】{targetPower}";
             }
 
             case "DeclareBlocker":
@@ -111,7 +137,15 @@ public static class ActionLogFormatter
                 string result = labels.Count == 0
                     ? "未选择"
                     : string.Join("、", labels.Select(x => $"【{x}】"));
-                string prompt = string.IsNullOrWhiteSpace(promptText) ? "" : $"：“{promptText}”";
+                string textVisibility = GetStr(payload, "textVisibility");
+                var textViewers = GetIntArray(payload, "textViewers");
+                bool maySeePromptText = textVisibility != "restricted"
+                    || viewerIndex == actor
+                    || textViewers.Contains(viewerIndex);
+                string visiblePromptText = maySeePromptText
+                    ? promptText
+                    : GetStr(payload, "publicText");
+                string prompt = string.IsNullOrWhiteSpace(visiblePromptText) ? "" : $"：“{visiblePromptText}”";
                 return $"[效果选择] {Side(actor)}处理 {source}{prompt} → {result}";
             }
 
@@ -130,8 +164,28 @@ public static class ActionLogFormatter
                 return $"—— 第 {turnCount} 回合 · {Side(newTurnPlayer)}回合 ——";
             }
 
+            case "HexCandidateRefreshed":
+                return $"[海克斯] {Side(GetInt(payload, "player"))}刷新了一个私密候选";
+
+            case "HexDraftResolved":
+            {
+                int actor = GetInt(payload, "player");
+                int choice = GetInt(payload, "choice");
+                var hex = HexCatalog.Get(choice);
+                return $"[海克斯] {Side(actor)}获得【{hex.Name}】";
+            }
+
             case "Surrender":
                 return $"[结束] {Side(GetInt(payload, "surrendered"))}投降";
+
+            case "DrawRequested":
+                return $"[平局申请] {Side(GetInt(payload, "requester"))}请求因 Bug 平局";
+
+            case "DrawRequestRejected":
+                return $"[平局申请] {Side(GetInt(payload, "responder"))}拒绝平局申请（第 {GetInt(payload, "rejectionCount")} 次）";
+
+            case "DrawAgreed":
+                return "[结束] 双方同意因 Bug 平局";
 
             // ── GM 调试动作 ──
             case "DebugAddCard":
@@ -170,6 +224,7 @@ public static class ActionLogFormatter
             var c = p.Characters.FirstOrDefault(x => x.Id == id);
             if (c is not null) return new CardRef(idx, c);
             if (p.StageCard is { } st && st.Id == id) return new CardRef(idx, st);
+            if (p.ExtraStageCard is { } extraStage && extraStage.Id == id) return new CardRef(idx, extraStage);
         }
         return null;
     }

@@ -37,6 +37,152 @@ textarea {
   touch-action: manipulation;
 }
 
+.friend-chat-wallpaper {
+  background-color: #0b141a;
+  background-image:
+    radial-gradient(circle at 20% 20%, rgb(255 255 255 / 0.022) 0 1px, transparent 1.5px),
+    radial-gradient(circle at 80% 65%, rgb(16 185 129 / 0.025) 0 1px, transparent 1.5px);
+  background-size: 28px 28px, 36px 36px;
+}
+
+/* 弹窗打开时收起全局设置入口，避免遮挡聊天标题、返回按钮等关键操作。 */
+body[data-modal-open-count] [data-layout-settings-trigger] {
+  display: none;
+}
+
+@keyframes global-announcement-scroll {
+  from { transform: translateX(100vw); }
+  to { transform: translateX(-100%); }
+}
+
+.global-announcement-marquee {
+  display: inline-block;
+  white-space: nowrap;
+  animation: global-announcement-scroll 14s linear both;
+}
+
+/* ===== 排位榜阵营巅峰称号 ===== */
+
+@property --rank-badge-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@keyframes rank-badge-orbit {
+  to { --rank-badge-angle: 360deg; }
+}
+
+@keyframes rank-badge-supreme-pulse {
+  0%, 100% { filter: brightness(0.96); transform: translateY(0) scale(1); }
+  50% { filter: brightness(1.18); transform: translateY(-0.5px) scale(1.025); }
+}
+
+@keyframes rank-badge-elite-sheen {
+  0%, 28% { transform: translateX(-180%) skewX(-18deg); opacity: 0; }
+  43% { opacity: 0.7; }
+  58%, 100% { transform: translateX(280%) skewX(-18deg); opacity: 0; }
+}
+
+.rank-tier-badge {
+  --rank-badge-rgb: 167 139 250;
+  --rank-badge-strong-rgb: 233 213 255;
+  isolation: isolate;
+  position: relative;
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 0.3rem;
+  overflow: hidden;
+  border: 1px solid rgb(var(--rank-badge-rgb) / 0.58);
+  border-radius: 999px;
+  padding: 0.2rem 0.55rem 0.2rem 0.4rem;
+  color: rgb(var(--rank-badge-strong-rgb));
+  background:
+    radial-gradient(circle at 18% 0%, rgb(255 255 255 / 0.22), transparent 35%),
+    linear-gradient(135deg, rgb(var(--rank-badge-rgb) / 0.22), rgb(3 7 18 / 0.94));
+  box-shadow:
+    inset 0 0 8px rgb(var(--rank-badge-rgb) / 0.18),
+    0 0 8px rgb(var(--rank-badge-rgb) / 0.16);
+  line-height: 1.15;
+  white-space: nowrap;
+}
+
+.rank-tier-badge--pirate {
+  --rank-badge-rgb: 244 63 94;
+  --rank-badge-strong-rgb: 254 205 211;
+}
+
+.rank-tier-badge--marine {
+  --rank-badge-rgb: 14 165 233;
+  --rank-badge-strong-rgb: 186 230 253;
+}
+
+.rank-tier-badge--government {
+  --rank-badge-rgb: 245 158 11;
+  --rank-badge-strong-rgb: 253 230 138;
+}
+
+.rank-tier-badge__aura {
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+}
+
+.rank-tier-badge__emblem {
+  position: relative;
+  flex: none;
+  color: rgb(255 255 255 / 0.96);
+  text-shadow: 0 0 6px rgb(var(--rank-badge-rgb) / 0.95);
+}
+
+.rank-tier-badge__label {
+  position: relative;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 900;
+  letter-spacing: 0.025em;
+  text-shadow: 0 0 8px rgb(var(--rank-badge-rgb) / 0.75);
+}
+
+.rank-tier-badge--supreme {
+  border-color: rgb(var(--rank-badge-strong-rgb) / 0.88);
+  background:
+    linear-gradient(rgb(3 7 18 / 0.78), rgb(3 7 18 / 0.9)) padding-box,
+    conic-gradient(
+      from var(--rank-badge-angle),
+      rgb(var(--rank-badge-rgb) / 0.22),
+      rgb(255 255 255 / 0.96),
+      rgb(var(--rank-badge-rgb) / 0.72),
+      rgb(255 255 255 / 0.88),
+      rgb(var(--rank-badge-rgb) / 0.22)
+    ) border-box;
+  border-color: transparent;
+  box-shadow:
+    inset 0 0 11px rgb(var(--rank-badge-rgb) / 0.32),
+    0 0 12px rgb(var(--rank-badge-rgb) / 0.38),
+    0 0 2px rgb(255 255 255 / 0.72);
+  animation:
+    rank-badge-orbit 3.2s linear infinite,
+    rank-badge-supreme-pulse 2.4s ease-in-out infinite;
+}
+
+.rank-tier-badge--supreme .rank-tier-badge__aura {
+  background:
+    radial-gradient(circle at 12% 50%, rgb(255 255 255 / 0.5), transparent 15%),
+    linear-gradient(105deg, transparent 15%, rgb(var(--rank-badge-rgb) / 0.24) 50%, transparent 85%);
+}
+
+.rank-tier-badge--elite .rank-tier-badge__aura::after {
+  content: "";
+  position: absolute;
+  inset: -25% auto -25% -35%;
+  width: 32%;
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.7), transparent);
+  animation: rank-badge-elite-sheen 4.2s ease-in-out infinite;
+}
+
 /* 路由页面原有的视口尺寸类改为跟随布局预览画布。 */
 .layout-preview-route > * {
   width: 100%;
@@ -517,7 +663,154 @@ textarea {
   transform-origin: center;
 }
 
+/* ===== 权威开场 / 终局演出 ===== */
+
+@keyframes game-cinematic-board-shake {
+  0%, 100% { transform: translate3d(0, 0, 0); }
+  10% { transform: translate3d(-3px, 1px, 0); }
+  19% { transform: translate3d(4px, -2px, 0); }
+  29% { transform: translate3d(-5px, 2px, 0); }
+  41% { transform: translate3d(4px, 1px, 0); }
+  54% { transform: translate3d(-3px, -1px, 0); }
+  68% { transform: translate3d(2px, 1px, 0); }
+  84% { transform: translate3d(-1px, 0, 0); }
+}
+
+@keyframes leader-defeat-flash {
+  0% { opacity: 0; }
+  8% { opacity: 1; }
+  24% { opacity: 0.92; }
+  52%, 100% { opacity: 0; }
+}
+
+@keyframes leader-defeat-shockwave {
+  0%, 14% { opacity: 0; transform: scale(0.58); }
+  24% { opacity: 0.95; }
+  74% { opacity: 0; transform: scale(1.75); }
+  100% { opacity: 0; transform: scale(1.9); }
+}
+
+@keyframes leader-defeat-fracture {
+  0%, 18% { opacity: 0; transform: rotate(var(--fracture-r)) scaleY(0); }
+  26% { opacity: 1; transform: rotate(var(--fracture-r)) scaleY(1); }
+  70% { opacity: 0.78; }
+  100% { opacity: 0; }
+}
+
+@keyframes leader-defeat-shard {
+  0%, 24% { opacity: 0; transform: translate3d(0, 0, 0) rotate(0deg) scale(0.5); }
+  34% { opacity: 0.95; }
+  100% { opacity: 0; transform: translate3d(var(--shard-x), var(--shard-y), 0) rotate(var(--shard-r)) scale(1); }
+}
+
+@keyframes game-cinematic-bubble-opening {
+  0% { opacity: 0; transform: translate3d(18px, -50%, 0) scale(0.92); }
+  72% { opacity: 1; transform: translate3d(-3px, -50%, 0) scale(1.015); }
+  100% { opacity: 1; transform: translate3d(0, -50%, 0) scale(1); }
+}
+
+@keyframes game-cinematic-bubble-victory {
+  0% { opacity: 0; transform: translate3d(22px, -50%, 0) scale(0.84); filter: brightness(1.8); }
+  68% { opacity: 1; transform: translate3d(-4px, -50%, 0) scale(1.035); filter: brightness(1.15); }
+  100% { opacity: 1; transform: translate3d(0, -50%, 0) scale(1); filter: brightness(1); }
+}
+
+.game-cinematic-board-impact {
+  animation: game-cinematic-board-shake 1080ms cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+  will-change: transform;
+}
+
+.leader-defeat-impact {
+  isolation: isolate;
+  overflow: visible;
+}
+
+.leader-defeat-flash,
+.leader-defeat-shockwave,
+.leader-defeat-fracture,
+.leader-defeat-shard {
+  position: absolute;
+  pointer-events: none;
+}
+
+.leader-defeat-flash {
+  inset: 18%;
+  z-index: 4;
+  border-radius: 0.45rem;
+  background: white;
+  box-shadow: 0 0 20px 10px rgb(255 255 255 / 0.9), 0 0 45px 18px rgb(56 189 248 / 0.55);
+  mix-blend-mode: screen;
+  animation: leader-defeat-flash 1080ms ease-out both;
+}
+
+.leader-defeat-shockwave {
+  inset: 5%;
+  z-index: 1;
+  border: 3px solid rgb(255 255 255 / 0.9);
+  border-radius: 50%;
+  box-shadow: 0 0 18px rgb(56 189 248 / 0.72), inset 0 0 14px rgb(244 63 94 / 0.58);
+  animation: leader-defeat-shockwave 1080ms ease-out both;
+}
+
+.leader-defeat-fracture {
+  --fracture-r: 0deg;
+  z-index: 5;
+  left: 50%;
+  top: 14%;
+  width: 2px;
+  height: 72%;
+  transform-origin: 50% 34%;
+  background: linear-gradient(to bottom, transparent, white 16%, rgb(125 211 252) 54%, transparent);
+  filter: drop-shadow(0 0 3px white);
+  clip-path: polygon(35% 0, 100% 0, 62% 24%, 100% 34%, 45% 52%, 82% 68%, 0 100%, 28% 62%, 0 48%, 54% 30%);
+  animation: leader-defeat-fracture 1080ms ease-out both;
+}
+
+.leader-defeat-fracture--one { --fracture-r: 18deg; }
+.leader-defeat-fracture--two { --fracture-r: -34deg; animation-delay: 45ms; }
+.leader-defeat-fracture--three { --fracture-r: 63deg; animation-delay: 80ms; }
+
+.leader-defeat-shard {
+  z-index: 3;
+  left: 45%;
+  top: 42%;
+  width: 18px;
+  height: 24px;
+  background: linear-gradient(135deg, rgb(255 255 255 / 0.95), rgb(56 189 248 / 0.48));
+  clip-path: polygon(50% 0, 100% 100%, 0 72%);
+  filter: drop-shadow(0 0 4px rgb(255 255 255 / 0.8));
+  animation: leader-defeat-shard 1080ms cubic-bezier(0.15, 0.7, 0.2, 1) both;
+}
+
+.leader-defeat-shard--one { --shard-x: -52px; --shard-y: -40px; --shard-r: -95deg; }
+.leader-defeat-shard--two { --shard-x: 58px; --shard-y: -28px; --shard-r: 130deg; animation-delay: 40ms; }
+.leader-defeat-shard--three { --shard-x: -44px; --shard-y: 54px; --shard-r: 75deg; animation-delay: 70ms; }
+.leader-defeat-shard--four { --shard-x: 54px; --shard-y: 62px; --shard-r: -145deg; animation-delay: 100ms; }
+
+.game-cinematic-bubble {
+  transform: translateY(-50%);
+  transform-origin: right center;
+  overflow-wrap: anywhere;
+  will-change: transform, opacity;
+}
+
+.game-cinematic-bubble--opening {
+  animation: game-cinematic-bubble-opening 260ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.game-cinematic-bubble--victory {
+  animation: game-cinematic-bubble-victory 320ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
 @media (prefers-reduced-motion: reduce) {
+  .global-announcement-marquee {
+    display: block;
+    overflow: hidden;
+    padding: 0 0.75rem;
+    text-overflow: ellipsis;
+    animation: none;
+  }
+
   .leader-breath-depth,
   .leader-breath-subject,
   .leader-breath-gaze,
@@ -526,10 +819,30 @@ textarea {
   .leader-breath-energy::before,
   .leader-breath-energy::after,
   .leader-breath-frame,
-  .battle-attacker-lunge-up,
-  .battle-attacker-lunge-down,
-  .battle-target-impact {
-    animation: none;
+  .rank-tier-badge--supreme,
+  .rank-tier-badge--elite .rank-tier-badge__aura::after,
+    .battle-attacker-lunge-up,
+    .battle-attacker-lunge-down,
+    .battle-target-impact,
+    .game-cinematic-board-impact,
+    .leader-defeat-flash,
+    .leader-defeat-shockwave,
+    .leader-defeat-fracture,
+    .leader-defeat-shard,
+    .game-cinematic-bubble--opening,
+    .game-cinematic-bubble--victory {
+      animation: none;
+    }
+
+  .game-cinematic-bubble {
+    opacity: 1;
+    filter: none;
+    transform: translateY(-50%);
+  }
+
+  .rank-tier-badge--supreme {
+    filter: none;
+    transform: none;
   }
 
   .leader-breath-gaze {

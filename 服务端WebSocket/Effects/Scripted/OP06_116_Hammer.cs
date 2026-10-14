@@ -9,10 +9,9 @@ namespace GrandUMI.Effects.Scripted;
 ///   ・将对方最多1张费用不高于5的角色KO。
 ///   ・对方生命卡牌为1张的场合，给予对方1点伤害。之后，将我方生命区最上方的1张卡牌加入手牌。
 ///
-/// 实现说明 / 简化点：
+/// 实现说明：
 ///   - 用 ChooseOption 二选一。
-///   - "给予对方1点伤害"实现为公开对方生命区最上方的1张卡牌，结算其生命触发并加入对方手牌
-///     （生命减少1）。本实现简化：直接将对方生命区顶卡移入对方手牌，不结算【触发】。
+///   - "给予对方1点伤害"复用生命伤害管理器，完整结算【触发】与【流放】等规则。
 ///   - 之后将我方生命区最上方的1张卡牌加入我方手牌。
 /// </summary>
 public class OP06_116_Hammer : IScriptedEffect
@@ -37,7 +36,7 @@ public class OP06_116_Hammer : IScriptedEffect
         if (pick == 0)
         {
             // KO 对方最多1张费用≤5的角色
-            var cands = opp.Characters.Where(c => c.CurrentCost() <= 5).ToList();
+            var cands = opp.Characters.Where(c => ctx.State.CurrentCostOf(c) <= 5).ToList();
             if (cands.Count == 0) return;
             var chosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OpponentCharacter",
                 "将对方最多1张费用不高于5的角色KO",
@@ -53,9 +52,10 @@ public class OP06_116_Hammer : IScriptedEffect
         // pick == 1：对方生命为1张时给予1点伤害
         if (opp.LifeArea.Count == 1)
         {
-            var dmg = opp.LifeArea[0];
-            opp.LifeArea.RemoveAt(0);
-            opp.Hand.Add(dmg);
+            if (ctx.Engine is not null)
+                await LifeRevealManager.DealDamageToLeader(ctx.Engine, 1 - ctx.OwnerIndex, 1);
+            else
+                LifeRevealManagerSync.DealDamageToLeaderNoPrompt(ctx.State, 1 - ctx.OwnerIndex, 1);
 
             // 之后：将我方生命区最上方的1张卡牌加入手牌
             if (me.LifeArea.Count > 0)

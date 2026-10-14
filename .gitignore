@@ -31,6 +31,8 @@ crashlytics-build.properties
 服务端WebSocket/Data/
 服务端WebSocket/MatchLogs/
 服务端WebSocket/releases/
+服务端WebSocket.ProcessWorkerFixture/bin/
+服务端WebSocket.ProcessWorkerFixture/obj/
 *.user
 *.suo
 
@@ -103,6 +105,9 @@ _归档_卡效工作流/
 # =========================
 qq-bug-bot/config.json
 qq-bug-bot/feedback.db
+/qq-whitelist-297542853-*-live.json
+# 群成员 QQ 原始导出仅保留本地，避免进入公开仓库。
+/exports/qq-whitelist-dual-*.json
 __pycache__/
 *.py[cod]
 

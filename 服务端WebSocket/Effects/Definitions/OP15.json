@@ -45,10 +45,17 @@
             "op": "Choose",
             "prompt": "OwnHandCharacter",
             "max": 1,
+            "min": 0,
+            "filter": {
+              "originalCostLte": 5
+            },
             "as": "$c"
+          },
+          {
+            "op": "PlayFromHandFree",
+            "target": "$c"
           }
-        ],
-        "_doc": "需 PlayFromHand 原子（filter cost ≤5）"
+        ]
       }
     ]
   },
@@ -137,6 +144,9 @@
     ],
     "activated": {
       "oncePerTurn": true,
+      "cost": {
+        "selfToTrash": true
+      },
       "then": [
         {
           "op": "Choose",
@@ -203,6 +213,7 @@
           "max": 1,
           "min": 0,
           "as": "$tgt",
+          "valueBasis": "original",
           "filter": {
             "originalCostLte": 8
           }
@@ -407,6 +418,10 @@
     "triggers": [
       {
         "on": "OnEnterField",
+        "cost": {
+          "donReturn": 1
+        },
+        "costPrompt": "咚!!-1：发动抽卡效果？",
         "then": [
           {
             "op": "Draw",
@@ -459,7 +474,7 @@
   },
   "OP15-067": {
     "_name": "修罗",
-    "_matcher": "登场时咚-1抽1(反馈#217补成本;条件速攻属abilities硬写通病另行专项)",
+    "_matcher": "我方场上咚≤6时持续获得速攻；登场时咚-1抽1(反馈#217补成本；条件速攻由DeclaredOmissionEffects注册)",
     "triggers": [
       {
         "on": "OnEnterField",
@@ -477,7 +492,7 @@
   },
   "OP15-074": {
     "_name": "放电",
-    "_matcher": "启动主要 咚-N 抽 1",
+    "_matcher": "主要:咚-1；领袖为艾尼路时抽1；之后我方最多1张角色费用+2直到下个对方结束阶段",
     "main": {
       "cost": {
         "donReturn": 1
@@ -485,7 +500,24 @@
       "then": [
         {
           "op": "Draw",
-          "n": 1
+          "n": 1,
+          "if": {
+            "leaderNameEquals": "艾尼路"
+          }
+        },
+        {
+          "op": "Choose",
+          "prompt": "OwnCharacter",
+          "max": 1,
+          "min": 0,
+          "as": "$tgt",
+          "text": "选择我方最多1张角色，使其费用+2直到下个对方的结束阶段结束"
+        },
+        {
+          "op": "AddCostMod",
+          "target": "$tgt",
+          "delta": 2,
+          "duration": "UntilNextOpponentEndPhase"
         }
       ]
     },
@@ -494,7 +526,12 @@
         "op": "Choose",
         "prompt": "OwnLeaderOrCharacter",
         "max": 1,
-        "as": "$tgt"
+        "min": 0,
+        "filter": {
+          "nameEquals": "艾尼路"
+        },
+        "as": "$tgt",
+        "text": "选择我方最多1张艾尼路领袖或角色，本次战斗力量+2000"
       },
       {
         "op": "AddPowerThisBattle",
@@ -505,7 +542,7 @@
   },
   "OP15-075": {
     "_name": "神之制裁",
-    "_matcher": "主要:咚-1领袖艾尼路时我方1张+1000,之后KO对方1张力量≤3000角色(反馈#233补整段);反击:我方1张艾尼路本战斗+2000(补名过滤)",
+    "_matcher": "主要:咚-1领袖艾尼路时我方1张+1000,之后KO对方1张当前力量≤3000角色(反馈#233补整段);反击:我方1张艾尼路本战斗+2000(补名过滤)",
     "main": {
       "cost": {
         "donReturn": 1
@@ -533,7 +570,7 @@
           "max": 1,
           "min": 0,
           "filter": {
-            "originalPowerLte": 3000
+            "currentPowerLte": 3000
           },
           "as": "$b",
           "text": "将对方最多1张力量不高于3000的角色KO"
@@ -630,7 +667,7 @@
           "max": 1,
           "min": 0,
           "filter": {
-            "originalPowerLte": 6000
+            "currentPowerLte": 6000
           },
           "as": "$tgt",
           "text": "对方最多1张休息状态且力量不高于6000的角色，下个对方重置阶段不转为活跃"
@@ -1018,13 +1055,28 @@
         }
       ]
     },
-    "counter": [
-      {
-        "op": "AddPowerThisBattle",
-        "target": "selfLeader",
-        "delta": 3000
-      }
-    ]
+    "counter": {
+      "cost": {
+        "handDiscard": {
+          "n": 1,
+          "text": "丢弃 1 张手牌以发动反击效果（可放弃）"
+        }
+      },
+      "then": [
+        {
+          "op": "Choose",
+          "prompt": "OwnLeaderOrCharacter",
+          "min": 0,
+          "max": 1,
+          "as": "$tgt"
+        },
+        {
+          "op": "AddPowerThisBattle",
+          "target": "$tgt",
+          "delta": 3000
+        }
+      ]
+    }
   },
   "OP15-110": {
     "triggers": [

@@ -1,12 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useGameStore } from "@/store/gameStore";
 import { GameRequest } from "@/net/GameRequest";
 import { getGameCard } from "@/data/CardLoader";
 import CardItem from "@/components/ui/CardItem";
 import { useResponsive } from "@/hooks/useResponsive";
+import { showMessage } from "@/components/ui/MessageBox";
+import { useServerCountdown } from "@/hooks/useServerCountdown";
 
 const RECOVERY_RETRY_INTERVAL_MS = 2500;
 const MAX_RECOVERY_ATTEMPTS = 3;
@@ -18,24 +20,21 @@ export default function MulliganOverlay() {
   const isFirst = useGameStore((s) => s.isFirstPlayer);
   const mulliganBothDone = useGameStore((s) => s.mulliganBothDone);
   const mulliganDeadlineUtc = useGameStore((s) => s.mulliganDeadlineUtc);
+  const serverNowUtc = useGameStore((s) => s.serverNowUtc);
   const isPending = useGameStore((s) => s.isPending);
+  const isGameOver = useGameStore((s) => s.isGameOver);
   const { cardSize } = useResponsive();
-  const [now, setNow] = useState(() => Date.now());
   const [recoveryAttempts, setRecoveryAttempts] = useState(0);
+  const opponentRedrawNotified = useRef(false);
+  const opponentRedrew = opp?.mulliganDone === true && opp.hasReDraw === false;
 
-  const deadlineMs = mulliganDeadlineUtc ? Date.parse(mulliganDeadlineUtc) : Number.NaN;
-  const remainingSeconds = Number.isFinite(deadlineMs)
-    ? Math.max(0, Math.ceil((deadlineMs - now) / 1000))
-    : 60;
+  const remainingSeconds = useServerCountdown(
+    mulliganDeadlineUtc,
+    serverNowUtc,
+    Boolean(mulliganDeadlineUtc && !mulliganBothDone),
+  );
   const isExpiring = remainingSeconds <= 10;
   const timedOut = remainingSeconds === 0;
-
-  useEffect(() => {
-    if (!mulliganDeadlineUtc || mulliganBothDone) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 250);
-    return () => window.clearInterval(timer);
-  }, [mulliganDeadlineUtc, mulliganBothDone]);
 
   useEffect(() => {
     if (!timedOut || mulliganBothDone || !mulliganDeadlineUtc) {
@@ -62,8 +61,20 @@ export default function MulliganOverlay() {
     return () => window.clearInterval(timer);
   }, [timedOut, mulliganBothDone, mulliganDeadlineUtc]);
 
+  useEffect(() => {
+    if (!opp?.mulliganDone) {
+      opponentRedrawNotified.current = false;
+      return;
+    }
+    if (!opponentRedrew || opponentRedrawNotified.current) return;
+    opponentRedrawNotified.current = true;
+    showMessage("重要对战信息：对手已调度起始手牌", "warn");
+  }, [opp?.mulliganDone, opponentRedrew]);
+
+  if (isGameOver) return null;
   if (!my) return null;
   if (!firstPlayerChosen) return null;
+  if (!mulliganDeadlineUtc) return null;
   if (mulliganBothDone) return null;
 
   const myDone = my.mulliganDone;
@@ -71,7 +82,7 @@ export default function MulliganOverlay() {
   const choosing = !myDone;
 
   const submitMulligan = (redraw: boolean) => {
-    if (timedOut || useGameStore.getState().isPending) return;
+    if (useGameStore.getState().isPending) return;
     GameRequest.mulligan(redraw);
   };
 
@@ -80,7 +91,7 @@ export default function MulliganOverlay() {
   return (
     <AnimatePresence>
       <motion.div
-        className="fixed inset-0 z-50 bg-black/80 flex flex-col items-center justify-center gap-6"
+        className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-4 overflow-y-auto bg-black/80 px-[calc(1rem+var(--layout-safe-left,0px))] py-[calc(1rem+var(--layout-safe-top,0px))] [padding-bottom:calc(1rem+var(--layout-safe-bottom,0px))] [padding-right:calc(1rem+var(--layout-safe-right,0px))] sm:gap-6"
         initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
       >
         <div className="text-center">
@@ -90,14 +101,25 @@ export default function MulliganOverlay() {
           </p>
           <p className="text-gray-400 text-sm">
             {timedOut && choosing
-              ? "时间到，正在同步自动保留结果…"
+              ? "时间到，服务器正在自动保留；完成前仍可提交选择"
               : timedOut
                 ? "对手选择已超时，正在恢复对局状态…"
               : choosing ? "是否要更换起始手牌？" : oppDone ? "进入对局..." : "等待对手选择..."}
           </p>
         </div>
 
-        <div className="flex items-center justify-center gap-2 px-4">
+        {opponentRedrew && (
+          <motion.div
+            role="status"
+            className="w-full max-w-md rounded-lg border-2 border-amber-300 bg-amber-950/95 px-4 py-3 text-center text-sm font-black text-amber-100 shadow-[0_0_24px_rgba(251,191,36,.3)]"
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+          >
+            重要对战信息：对手已调度起始手牌
+          </motion.div>
+        )}
+
+        <div className="flex w-full max-w-full items-center justify-start gap-2 overflow-x-auto px-1 pb-2 sm:justify-center sm:px-4">
           {handCards.map((card, i) => (
             <motion.div
               key={`mulligan-${card?.number ?? i}-${i}`}
@@ -111,14 +133,14 @@ export default function MulliganOverlay() {
         </div>
 
         {choosing && (
-          <motion.div className="flex gap-4"
+          <motion.div className="flex flex-wrap justify-center gap-4"
             initial={{ y: 20, opacity: 0 }} animate={{ y: 0, opacity: 1 }} transition={{ delay: 0.4 }}>
-            <button onClick={() => submitMulligan(true)} disabled={timedOut || isPending}
-              className="bg-blue-600 hover:bg-blue-500 text-white px-8 py-3 rounded-lg font-bold text-base transition-colors disabled:cursor-wait disabled:opacity-50">
+            <button onClick={() => submitMulligan(true)} disabled={isPending}
+              className="min-h-12 min-w-28 rounded-lg bg-blue-600 px-8 py-3 text-base font-bold text-white transition-colors hover:bg-blue-500 disabled:cursor-wait disabled:opacity-50">
               更换
             </button>
-            <button onClick={() => submitMulligan(false)} disabled={timedOut || isPending}
-              className="bg-orange-500 hover:bg-orange-400 text-white px-8 py-3 rounded-lg font-bold text-base transition-colors disabled:cursor-wait disabled:opacity-50">
+            <button onClick={() => submitMulligan(false)} disabled={isPending}
+              className="min-h-12 min-w-28 rounded-lg bg-orange-500 px-8 py-3 text-base font-bold text-white transition-colors hover:bg-orange-400 disabled:cursor-wait disabled:opacity-50">
               保留
             </button>
           </motion.div>

@@ -11,12 +11,16 @@ import CardHoverPreview, { type HoverInfo, RARITY_STYLES } from "./CardHoverPrev
 import { CARD_BACK_SRC, displaySrc, nextCardImageSrc, thumbSrc } from "@/lib/sprite";
 import { useVirtualList } from "@/hooks/useVirtualList";
 import { compareCatalogCards, filterAndSortCards } from "@/lib/cardSearch";
+import { useSlowImageFallback } from "@/hooks/useSlowImageFallback";
 
 const HOVER_DELAY  = 180;   // 悬停多少毫秒后显示（避免划过时闪烁）
+const TOUCH_LONG_PRESS_DELAY = 500;
+const TOUCH_MOVE_TOLERANCE = 10;
+const TOUCH_CLICK_SUPPRESS_DURATION = 1000;
 const CARD_WIDTH    = 72;   // w-16(64px) + gap
 const CARD_HEIGHT   = 108;  // h-24(96px) + 名称行 + gap
 
-// 悬停后立即预加载原图，利用预览出现前的延迟提前完成网络请求。
+// 悬停确认后再预加载高清图，快速划过卡牌不会争抢下载带宽。
 // 加载失败时移出缓存集合，后续悬停仍可重试。
 const preloadedSprites = new Set<string>();
 function preloadSprite(src: string) {
@@ -24,13 +28,15 @@ function preloadSprite(src: string) {
   if (!optimizedSrc || preloadedSprites.has(optimizedSrc)) return;
   preloadedSprites.add(optimizedSrc);
   const image = new window.Image();
+  image.decoding = "async";
+  image.fetchPriority = "low";
   image.onerror = () => preloadedSprites.delete(optimizedSrc);
   image.src = optimizedSrc;
 }
 
 // ── 主组件 ────────────────────────────────────────────────────────────────
 export default function SearchResultPanel() {
-  const { format, leader, searchQuery, filterColors, filterType, filterProperty, filterRarity, filterCost, filterSets, filterShowSub1, gridColumns, addCard, setLeader, getCount, notice, clearNotice } =
+  const { format, leader, searchQuery, filterColors, filterType, filterProperty, filterRarity, filterCost, filterSets, filterShowSub1, filterHasTrigger, gridColumns, addCard, setLeader, setFilterType, getCount, notice, clearNotice } =
     useDeckStore();
   const [modal, setModal]     = useState<CardData | null>(null);   // 右键弹窗
   const [hover, setHover]     = useState<HoverInfo | null>(null);  // 悬停预览
@@ -61,6 +67,7 @@ export default function SearchResultPanel() {
         filterCost,
         filterSets,
         filterShowSub1,
+        filterHasTrigger,
       },
       {
         allowedSets: whitelist,
@@ -68,7 +75,7 @@ export default function SearchResultPanel() {
         sortComparator: filterSets.length === 1 ? compareCatalogCards : undefined,
       },
     );
-  }, [format, leader, searchQuery, filterColors, filterType, filterProperty, filterRarity, filterCost, filterSets, filterShowSub1, isLeaderMode]);
+  }, [format, leader, searchQuery, filterColors, filterType, filterProperty, filterRarity, filterCost, filterSets, filterShowSub1, filterHasTrigger, isLeaderMode]);
 
   // 虚拟网格列表
   const {
@@ -84,13 +91,22 @@ export default function SearchResultPanel() {
     overscan: 2,
   });
 
-  const handleCardClick = (card: CardData) =>
-    isLeaderMode ? setLeader(card) : addCard(card);
+  const handleCardClick = (card: CardData) => {
+    if (!isLeaderMode) {
+      addCard(card);
+      return;
+    }
+
+    setLeader(card);
+    // 竖屏手机选定领航后直接回到普通牌池，免去手动切换的一步。
+    if (window.matchMedia("(max-width: 767px) and (orientation: portrait)").matches) {
+      setFilterType("");
+    }
+  };
 
   // 延迟显示预览，鼠标快速划过时不触发
   const handleMouseEnter = useCallback((card: CardData, rect: DOMRect, currentSprite: string) => {
     if (hoverTimer.current) clearTimeout(hoverTimer.current);
-    preloadSprite(currentSprite);
     hoverTimer.current = setTimeout(() => {
       // 延迟期间可能已点击异画箭头，触发时必须读取最新版本，不能使用移入时的旧闭包值。
       const latestSprite = card.sprite ?? currentSprite;
@@ -159,6 +175,10 @@ export default function SearchResultPanel() {
                     isLeaderMode={isLeaderMode}
                     onClick={() => handleCardClick(card)}
                     onRightClick={(e) => { e.preventDefault(); setModal(card); }}
+                    onLongPress={() => {
+                      handleMouseLeave();
+                      setModal(card);
+                    }}
                     onMouseEnter={handleMouseEnter}
                     onMouseLeave={handleMouseLeave}
                     onSpriteChange={(sprite) => {
@@ -183,8 +203,8 @@ export default function SearchResultPanel() {
         {hover && <CardHoverPreview info={hover} />}
       </AnimatePresence>
 
-      {/* 右键弹窗 */}
-      <CardInfoPanel card={modal} onClose={() => setModal(null)} />
+      {/* 桌面右键或手机长按打开详情；手机竖屏使用更紧凑的卡图尺寸。 */}
+      <CardInfoPanel card={modal} onClose={() => setModal(null)} compactMobile />
     </div>
   );
 }
@@ -197,26 +217,43 @@ interface CardGridItemProps {
   isLeaderMode: boolean;
   onClick: () => void;
   onRightClick: (e: React.MouseEvent) => void;
+  onLongPress: () => void;
   onMouseEnter: (card: CardData, rect: DOMRect, currentSprite: string) => void;
   onMouseLeave: () => void;
   onSpriteChange: (sprite: string) => void;
 }
 
 function CardGridItem({
-  card, deckCount, isLeaderMode, onClick, onRightClick, onMouseEnter, onMouseLeave, onSpriteChange,
+  card, deckCount, isLeaderMode, onClick, onRightClick, onLongPress, onMouseEnter, onMouseLeave, onSpriteChange,
 }: CardGridItemProps) {
   const isFull    = !isLeaderMode && deckCount >= 4 && !UNLIMITED_COPY_CARDS.has(card.number);
   const hasInDeck = deckCount > 0;
+  const isPending = card.playability === "pending";
 
   const sprites   = card.sprites?.length ? card.sprites : [card.sprite ?? CARD_BACK_SRC];
   const hasAlts   = sprites.length > 1;
   const [spriteIdx, setSpriteIdx] = useState(sprites.length - 1);
   const rawSrc = sprites[spriteIdx] ?? CARD_BACK_SRC;
   const [currentSrc, setCurrentSrc] = useState(thumbSrc(rawSrc));
+  const imageRef = useRef<HTMLImageElement>(null);
+  useSlowImageFallback(imageRef, currentSrc, setCurrentSrc);
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pressStart = useRef<{ x: number; y: number } | null>(null);
+  const suppressClickUntil = useRef(0);
+
+  const clearLongPressTimer = useCallback(() => {
+    if (longPressTimer.current) clearTimeout(longPressTimer.current);
+    longPressTimer.current = null;
+    pressStart.current = null;
+  }, []);
 
   useEffect(() => {
     setCurrentSrc(thumbSrc(rawSrc));
   }, [rawSrc]);
+
+  useEffect(() => () => {
+    if (longPressTimer.current) clearTimeout(longPressTimer.current);
+  }, []);
 
   // 初始化时同步默认异画的 sprite 到 card 对象，确保添加卡牌时使用正确的异画
   useEffect(() => {
@@ -241,6 +278,53 @@ function CardGridItem({
     onSpriteChange(sprites[next]);
   };
 
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === "mouse" || !e.isPrimary) return;
+    if ((e.target as Element).closest("button")) return;
+
+    onMouseLeave();
+    clearLongPressTimer();
+    suppressClickUntil.current = 0;
+    pressStart.current = { x: e.clientX, y: e.clientY };
+    longPressTimer.current = setTimeout(() => {
+      longPressTimer.current = null;
+      suppressClickUntil.current = Date.now() + TOUCH_CLICK_SUPPRESS_DURATION;
+      onLongPress();
+    }, TOUCH_LONG_PRESS_DELAY);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === "mouse" || !pressStart.current) return;
+    const deltaX = e.clientX - pressStart.current.x;
+    const deltaY = e.clientY - pressStart.current.y;
+    if (Math.hypot(deltaX, deltaY) > TOUCH_MOVE_TOLERANCE) clearLongPressTimer();
+  };
+
+  const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === "mouse") return;
+    clearLongPressTimer();
+  };
+
+  const handlePointerCancel = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === "mouse") return;
+    clearLongPressTimer();
+  };
+
+  const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (Date.now() < suppressClickUntil.current) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    onClick();
+  };
+
+  const handleContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const pointerType = (e.nativeEvent as PointerEvent).pointerType;
+    if (!pointerType || pointerType === "mouse") onRightClick(e);
+  };
+
   return (
     <motion.div
       layout
@@ -249,23 +333,38 @@ function CardGridItem({
       exit={{ opacity: 0, scale: 0.9 }}
       transition={{ duration: 0.15 }}
       className="group flex flex-col items-center gap-1 transform-gpu backface-hidden"
-      onMouseEnter={(e) => onMouseEnter(card, e.currentTarget.getBoundingClientRect(), rawSrc)}
-      onMouseLeave={onMouseLeave}
+      onPointerEnter={(e) => {
+        if (e.pointerType === "mouse") {
+          onMouseEnter(card, e.currentTarget.getBoundingClientRect(), rawSrc);
+        }
+      }}
+      onPointerLeave={(e) => {
+        if (e.pointerType === "mouse") onMouseLeave();
+        else clearLongPressTimer();
+      }}
     >
       <div
         className={`relative w-16 h-24 rounded-lg overflow-hidden select-none border-2 transition-all
           ${isFull
             ? "border-red-800 opacity-50 cursor-not-allowed"
+            : isPending
+              ? "border-amber-500 hover:border-amber-300 cursor-pointer"
             : isLeaderMode
               ? "border-yellow-600 hover:border-yellow-400 hover:scale-105 cursor-pointer"
               : hasInDeck
                 ? "border-orange-500 hover:scale-105 cursor-pointer"
                 : "border-gray-700 hover:border-gray-400 hover:scale-105 cursor-pointer"
           }`}
-        onClick={isFull ? undefined : onClick}
-        onContextMenu={onRightClick}
+        style={{ WebkitTouchCallout: "none" }}
+        onClick={isFull ? undefined : handleClick}
+        onContextMenu={handleContextMenu}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerCancel}
       >
         <NextImage
+          ref={imageRef}
           src={currentSrc}
           alt={card.name}
           fill
@@ -276,6 +375,15 @@ function CardGridItem({
             setCurrentSrc((current) => nextCardImageSrc(current, rawSrc, card.image, "thumb"))
           }
         />
+
+        {isPending && (
+          <span
+            data-card-playability="pending"
+            className="absolute inset-x-0 bottom-0 z-20 bg-amber-500/95 px-0.5 py-0.5 text-center text-[8px] font-black leading-tight text-gray-950"
+          >
+            暂不可对战
+          </span>
+        )}
 
         {/* 异画切换箭头（仅有多版本时显示） */}
         {hasAlts && (

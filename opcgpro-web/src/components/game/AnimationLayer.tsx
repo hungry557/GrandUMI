@@ -1,8 +1,27 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { useGameAnimation, type AnimationEvent } from "@/hooks/useGameAnimation";
+import { useGameAnimation } from "@/hooks/useGameAnimation";
+import { useGameStore } from "@/store/gameStore";
+import { animationDuration, useSettingsStore } from "@/store/settingsStore";
+
+type TurnBanner = {
+  id: number;
+  kind: "turn";
+  side: "my" | "opponent";
+  text: string;
+  turnCount: number;
+};
+
+type ResultBanner = {
+  id: number;
+  kind: "result";
+  text: string;
+  color: string;
+};
+
+type Banner = TurnBanner | ResultBanner;
 
 /**
  * AnimationLayer — 根据服务端 lastAction 驱动战斗动画特效
@@ -16,35 +35,88 @@ import { useGameAnimation, type AnimationEvent } from "@/hooks/useGameAnimation"
  */
 export default function AnimationLayer() {
   const anim = useGameAnimation();
+  const mode = useGameStore((state) => state.mode);
+  const currentTurn = useGameStore((state) => state.currentTurn);
+  const turnCount = useGameStore((state) => state.turnCount);
+  const isGameOver = useGameStore((state) => state.isGameOver);
+  const openingBubbleCount = useGameStore((state) => state.cinematic.openingBubbles.length);
+  const cinematicPhase = useGameStore((state) => state.cinematic.phase);
+  const animationSpeed = useSettingsStore((state) => state.animationSpeed);
+  const cinematicBlockingBanner = isGameOver
+    || openingBubbleCount > 0
+    || cinematicPhase === "impact"
+    || cinematicPhase === "victory";
 
   const [shake, setShake] = useState(false);
   const [flash, setFlash] = useState(false);
-  const [banner, setBanner] = useState<{ text: string; color: string } | null>(null);
+  const [banner, setBanner] = useState<Banner | null>(null);
+  const bannerIdRef = useRef(0);
+  const bannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastShownTurnRef = useRef(0);
+
+  useEffect(() => () => {
+    if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+  }, []);
+
+  // 回合归属以服务端权威快照为准。机器人或网络抖动可能让多个 lastAction 在 React
+  // 渲染前合并，但 turnCount 的最终变化不会丢失，因此每个可见回合至少提示一次。
+  useEffect(() => {
+    if (cinematicBlockingBanner || turnCount <= 0 || mode === "Observer" || animationSpeed === "off") {
+      lastShownTurnRef.current = turnCount;
+      if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+      bannerTimerRef.current = null;
+      setBanner((current) => current?.kind === "turn" ? null : current);
+      return;
+    }
+    if (lastShownTurnRef.current === turnCount) return;
+    lastShownTurnRef.current = turnCount;
+
+    if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+    bannerIdRef.current += 1;
+    const turnBanner: TurnBanner = {
+      id: bannerIdRef.current,
+      kind: "turn",
+      side: currentTurn ? "my" : "opponent",
+      text: currentTurn ? "我的回合！" : "对手回合",
+      turnCount,
+    };
+    setBanner(turnBanner);
+    bannerTimerRef.current = setTimeout(() => {
+      setBanner((current) => current?.id === turnBanner.id ? null : current);
+      bannerTimerRef.current = null;
+    }, animationDuration(2200, animationSpeed));
+  }, [animationSpeed, cinematicBlockingBanner, currentTurn, mode, turnCount]);
 
   useEffect(() => {
+    if (cinematicBlockingBanner) {
+      if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+      bannerTimerRef.current = null;
+      setBanner(null);
+      return;
+    }
+
     switch (anim.type) {
       case "damage":
+        if (animationSpeed === "off") break;
         setFlash(true);
         setShake(true);
-        setTimeout(() => setFlash(false), 200);
-        setTimeout(() => setShake(false), 500);
+        setTimeout(() => setFlash(false), animationDuration(200, animationSpeed));
+        setTimeout(() => setShake(false), animationDuration(500, animationSpeed));
         break;
 
       case "koUnit":
+        if (animationSpeed === "off") break;
         setFlash(true);
-        setTimeout(() => setFlash(false), 150);
-        break;
-
-      case "turnStart":
-        setBanner({
-          text: anim.side === "my" ? "我的回合！" : "对手回合",
-          color: anim.side === "my" ? "bg-orange-500" : "bg-blue-500",
-        });
-        setTimeout(() => setBanner(null), 2000);
+        setTimeout(() => setFlash(false), animationDuration(150, animationSpeed));
         break;
 
       case "gameOver":
+        if (bannerTimerRef.current) clearTimeout(bannerTimerRef.current);
+        bannerTimerRef.current = null;
+        bannerIdRef.current += 1;
         setBanner({
+          id: bannerIdRef.current,
+          kind: "result",
           text: anim.isWin ? "胜利！" : "失败",
           color: anim.isWin ? "bg-yellow-500" : "bg-red-600",
         });
@@ -54,7 +126,7 @@ export default function AnimationLayer() {
       default:
         break;
     }
-  }, [anim]);
+  }, [anim, animationSpeed, cinematicBlockingBanner]);
 
   return (
     <>
@@ -62,7 +134,7 @@ export default function AnimationLayer() {
       <motion.div
         className="fixed inset-0 pointer-events-none z-20"
         animate={shake ? { x: [0, -6, 6, -4, 4, 0], y: [0, 3, -3, 2, -2, 0] } : {}}
-        transition={{ duration: 0.4 }}
+        transition={{ duration: animationDuration(400, animationSpeed) / 1000 }}
       />
 
       {/* 红色闪光（伤害/KO） */}
@@ -73,24 +145,90 @@ export default function AnimationLayer() {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            transition={{ duration: 0.15 }}
+            transition={{ duration: animationDuration(150, animationSpeed) / 1000 }}
           />
         )}
       </AnimatePresence>
 
-      {/* 横幅提示（回合开始/游戏结束） */}
-      <AnimatePresence>
+      {/* 横幅提示（回合开始/游戏结束）：只做视觉提示，不拦截牌桌操作 */}
+      <AnimatePresence mode="wait">
         {banner && (
           <motion.div
-            className="fixed top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 z-30 pointer-events-none"
-            initial={{ opacity: 0, scale: 0.5, y: -20 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.8, y: -10 }}
-            transition={{ type: "spring", stiffness: 200, damping: 20 }}
+            key={banner.id}
+            className="pointer-events-none fixed inset-0 z-30 flex items-center justify-center"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: animationDuration(180, animationSpeed) / 1000 }}
+            role="status"
+            aria-live="assertive"
           >
-            <div className={`${banner.color} text-white px-8 py-3 rounded-xl text-2xl font-bold shadow-2xl`}>
-              {banner.text}
-            </div>
+            {banner.kind === "turn" ? (
+              <>
+                <motion.div
+                  className="absolute inset-0 bg-black/25"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                />
+                <motion.div
+                  className={[
+                    "absolute inset-x-0 h-px bg-gradient-to-r from-transparent to-transparent",
+                    banner.side === "my" ? "via-amber-200/90" : "via-sky-200/90",
+                  ].join(" ")}
+                  initial={{ scaleX: 0, opacity: 0 }}
+                  animate={{ scaleX: 1, opacity: 1 }}
+                  exit={{ scaleX: 0.35, opacity: 0 }}
+                  transition={{ duration: 0.42, ease: "easeOut" }}
+                />
+                <motion.div
+                  className={[
+                    "relative w-[34rem] max-w-[calc(100%-2rem)] overflow-hidden rounded-2xl border px-10 py-5 text-center text-white backdrop-blur-md",
+                    banner.side === "my"
+                      ? "border-amber-200/70 bg-gradient-to-r from-amber-950/95 via-orange-500/90 to-amber-950/95 shadow-[0_0_64px_rgba(251,146,60,0.55)]"
+                      : "border-sky-200/70 bg-gradient-to-r from-blue-950/95 via-blue-600/90 to-blue-950/95 shadow-[0_0_64px_rgba(56,189,248,0.5)]",
+                  ].join(" ")}
+                  initial={{
+                    opacity: 0,
+                    scale: 0.82,
+                    x: banner.side === "my" ? -120 : 120,
+                  }}
+                  animate={{ opacity: 1, scale: 1, x: 0 }}
+                  exit={{
+                    opacity: 0,
+                    scale: 1.06,
+                    x: banner.side === "my" ? 80 : -80,
+                  }}
+                  transition={{ type: "spring", stiffness: 230, damping: 22 }}
+                >
+                  <div
+                    className={[
+                      "absolute inset-x-10 top-0 h-px",
+                      banner.side === "my" ? "bg-amber-100" : "bg-sky-100",
+                    ].join(" ")}
+                  />
+                  <p className="text-xs font-black tracking-[0.35em] text-white/75">
+                    第 {banner.turnCount} 回合
+                  </p>
+                  <p className="mt-1 text-5xl font-black tracking-[0.12em] drop-shadow-[0_2px_8px_rgba(0,0,0,0.65)]">
+                    {banner.text}
+                  </p>
+                  {banner.side === "my" && (
+                    <p className="mt-1 text-sm font-bold tracking-[0.22em] text-amber-50/90">该你了</p>
+                  )}
+                </motion.div>
+              </>
+            ) : (
+              <motion.div
+                className={`${banner.color} rounded-xl px-8 py-3 text-2xl font-bold text-white shadow-2xl`}
+                initial={{ opacity: 0, scale: 0.5, y: -20 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.8, y: -10 }}
+                transition={{ type: "spring", stiffness: 200, damping: 20 }}
+              >
+                {banner.text}
+              </motion.div>
+            )}
           </motion.div>
         )}
       </AnimatePresence>

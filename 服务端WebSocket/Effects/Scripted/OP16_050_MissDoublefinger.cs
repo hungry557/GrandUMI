@@ -20,7 +20,7 @@ public class OP16_050_MissDoublefinger : IScriptedEffect
     {
         var me = ctx.State.Players[ctx.OwnerIndex];
 
-        var costCands = me.Characters.Where(c => c.Info.Cost >= 2).ToList();
+        var costCands = me.Characters.Where(c => ctx.State.CurrentCostOf(c) >= 2).ToList();
         if (costCands.Count == 0) return; // 无费用≥2角色可回手 → 不可发动
 
         bool use = await ctx.Prompts.ConfirmOptional(ctx.OwnerIndex,
@@ -39,7 +39,7 @@ public class OP16_050_MissDoublefinger : IScriptedEffect
         AtomicOps.BounceToHand(ctx.State, ctx.OwnerIndex, bounce);
 
         // 收益：抽2张，丢弃我方1张手牌
-        AtomicOps.Draw(ctx.State, ctx.OwnerIndex, 2);
+        await AtomicOps.DrawAsync(ctx.State, ctx.OwnerIndex, 2);
         if (me.Hand.Count > 0)
         {
             var dch = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OwnHand",

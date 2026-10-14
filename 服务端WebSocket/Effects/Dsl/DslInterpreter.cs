@@ -1,5 +1,6 @@
 using System.Text.Json;
 using GrandUMI.Cards;
+using GrandUMI.Effects.Rules;
 using GrandUMI.Game;
 using GrandUMI.Game.PhaseFlow;
 using GrandUMI.Game.Validation;
@@ -25,46 +26,137 @@ namespace GrandUMI.Effects.Dsl;
 /// </summary>
 public static class DslInterpreter
 {
-    private static Dictionary<string, JsonElement> _defs = new();
-    private static bool _loaded;
-    private static readonly object _loadLock = new();
+    private static readonly object BuiltInLoadGate = new();
+    private static bool _builtInLoaded;
 
-    public static void Load(string path)
+    /// <summary>启动效果的自身休息成本同时约束动作入口与快照，不能先接受发动再静默失败。</summary>
+    internal static string? GetRestSelfActivationUnavailableReason(GameState state, CardInstance source)
     {
-        LoadFile(path);
-        _loaded = true;
+        var ruleset = CardRulesetManager.For(state);
+        // 手写实现以自己的可用性接口为准，不能套用未执行的历史 DSL。
+        if (ruleset.TryGetScriptedEffect(source.Info.Number)?.HandlesTrigger(EffectTrigger.ActivatedMain) == true
+            || !ruleset.TryGetDslDefinition(source.Info.Number, out var definition)
+            || !definition.TryGetProperty("activated", out var activated)
+            || !activated.TryGetProperty("cost", out var cost)
+            || !cost.TryGetProperty("restSelf", out var restSelf)
+            || restSelf.ValueKind != JsonValueKind.True)
+            return null;
+        return source.IsTapped || !AtomicOps.CanRestCard(state, source)
+            ? "此卡当前无法转为休息状态，不能支付发动成本"
+            : null;
     }
 
-    /// <summary>批量加载某个目录下所有 *.json。幂等且线程安全：首次加载后重复调用直接返回。</summary>
-    public static void LoadDirectory(string dir)
+    /// <summary>该卡的有效 DSL 定义中是否包含【每回合1次】效果。</summary>
+    public static bool HasOncePerTurnEffect(string cardNumber)
+        => CardRulesetManager.Current.HasOncePerTurnEffect(cardNumber);
+
+    internal static bool ContainsOncePerTurnDefinition(JsonElement element)
     {
-        if (_loaded) return;
-        lock (_loadLock)
+        if (element.ValueKind == JsonValueKind.Object)
         {
-            if (_loaded) return;
-            LoadDirectoryCore(dir);
-            _loaded = true;
+            foreach (var property in element.EnumerateObject())
+            {
+                if (property.NameEquals("oncePerTurn") && property.Value.ValueKind == JsonValueKind.True)
+                    return true;
+                if (ContainsOncePerTurnDefinition(property.Value)) return true;
+            }
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+                if (ContainsOncePerTurnDefinition(item)) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 判断当前对局固定的规则集中，指定卡牌是否真的定义了该触发时机。
+    /// 卡牌数据中的 EffectTags 只负责发现候选；它可能因历史文本迁移而保留兼容标签，
+    /// 不能据此把一个实际不存在的效果放入需要玩家排序的权威候选集合。
+    /// </summary>
+    internal static bool HasTriggerDefinition(CardRuleset ruleset, string cardNumber, EffectTrigger trigger)
+    {
+        if (!ruleset.TryGetDslDefinition(cardNumber, out var definition)) return false;
+
+        string triggerName = trigger.ToString();
+        if (definition.TryGetProperty("triggers", out var triggers)
+            && triggers.ValueKind == JsonValueKind.Array
+            && triggers.EnumerateArray().Any(item =>
+                item.TryGetProperty("on", out var on)
+                && string.Equals(on.GetString(), triggerName, StringComparison.Ordinal)))
+            return true;
+
+        return trigger switch
+        {
+            EffectTrigger.ActivatedMain => definition.TryGetProperty("activated", out _),
+            EffectTrigger.EventMain => definition.TryGetProperty("main", out _),
+            EffectTrigger.EventCounter => definition.TryGetProperty("counter", out _),
+            EffectTrigger.OnLifeRevealTrigger => definition.TryGetProperty("trigger", out _),
+            _ => false,
+        };
+    }
+
+    public static void Load(string path, string rulesetId = "builtin-test")
+    {
+        lock (BuiltInLoadGate)
+        {
+            if (_builtInLoaded) return;
+            var definitions = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
+            LoadFile(path, definitions);
+            if (definitions.Count == 0)
+                throw new InvalidOperationException($"DSL 定义文件未加载到任何卡效：{path}");
+            CardRulesetManager.InitializeBuiltIn(definitions, rulesetId);
+            _builtInLoaded = true;
         }
     }
 
-    private static void LoadDirectoryCore(string dir)
+    /// <summary>批量加载某个目录下所有 *.json，注册为当前发布产物的内置规则。</summary>
+    public static void LoadDirectory(string dir, string rulesetId = "builtin-test", bool failClosed = false)
     {
-        if (!Directory.Exists(dir))
+        lock (BuiltInLoadGate)
         {
-            Console.Error.WriteLine($"[DSL] 未找到定义目录: {dir}");
-            return;
+            if (_builtInLoaded) return;
+            var definitions = ReadDefinitionsDirectory(dir, failClosed: failClosed);
+            CardRulesetManager.InitializeBuiltIn(definitions, rulesetId);
+            _builtInLoaded = true;
         }
+    }
+
+    internal static IReadOnlyDictionary<string, JsonElement> ReadDefinitionsDirectory(
+        string dir,
+        bool strict = false,
+        bool failClosed = false)
+    {
+        var files = GetDefinitionFiles(dir);
+        var definitions = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
         int total = 0;
-        foreach (var file in Directory.GetFiles(dir, "*.json"))
+        foreach (var file in files)
         {
-            int n = LoadFile(file);
+            int n = LoadFile(file, definitions, strict, failClosed);
             total += n;
         }
-        Console.WriteLine($"[DSL] 累计加载 {total} 条卡效定义，{_defs.Count} 张唯一卡");
-        _loaded = true;
+        if (definitions.Count == 0)
+            throw new InvalidOperationException($"DSL 定义目录未加载到任何卡效: {dir}");
+        Console.WriteLine($"[DSL] 累计加载 {total} 条卡效定义，{definitions.Count} 张唯一卡");
+        return definitions;
     }
 
-    private static int LoadFile(string path)
+    internal static string[] GetDefinitionFiles(string dir)
+    {
+        if (!Directory.Exists(dir))
+            throw new DirectoryNotFoundException($"DSL 定义目录不存在: {dir}");
+
+        var files = Directory.GetFiles(dir, "*.json");
+        if (files.Length == 0)
+            throw new InvalidOperationException($"DSL 定义目录中没有 JSON 文件: {dir}");
+        return files;
+    }
+
+    private static int LoadFile(
+        string path,
+        IDictionary<string, JsonElement> definitions,
+        bool strict = false,
+        bool failClosed = false)
     {
         if (!File.Exists(path)) return 0;
         try
@@ -78,8 +170,10 @@ public static class DslInterpreter
                 // 占位条目（仅 complex/noEffect 标记、无真实效果键）不得覆盖已加载的真实定义。
                 // 定义目录按 Directory.GetFiles 枚举顺序加载，该顺序在 Linux 生产机不保证字母序，
                 // 占位文件(如 *_gap.json)可能后加载冲掉真实定义(如 *_wf.json)，导致线上卡效失效。
-                if (_defs.ContainsKey(k) && IsPlaceholderDef(v)) continue;
-                _defs[k] = v;
+                if (definitions.ContainsKey(k) && IsPlaceholderDef(v)) continue;
+                if (strict && definitions.ContainsKey(k))
+                    throw new InvalidOperationException($"规则包内重复定义卡牌 {k}");
+                definitions[k] = v.Clone();
                 n++;
             }
             Console.WriteLine($"[DSL] {Path.GetFileName(path)} 加载 {n} 条");
@@ -87,6 +181,8 @@ public static class DslInterpreter
         }
         catch (Exception ex)
         {
+            if (strict || failClosed)
+                throw new InvalidOperationException($"DSL 加载失败：{path}：{ex.Message}", ex);
             Console.Error.WriteLine($"[DSL] 加载 {path} 失败: {ex.Message}");
             return 0;
         }
@@ -107,8 +203,9 @@ public static class DslInterpreter
 
     public static async Task<bool> TryResolve(EffectContext ctx)
     {
-        if (!_loaded) return false;
-        if (!_defs.TryGetValue(ctx.Source.Info.Number, out var def)) return false;
+        var ruleset = CardRulesetManager.For(ctx.State);
+        if (!ruleset.TryGetDslDefinition(ctx.Source.Info.Number, out var def)) return false;
+        bool activated = false;
 
         var triggerName = ctx.Trigger.ToString();
         // 1. triggers: 数组里找 on == 当前触发的项
@@ -137,6 +234,7 @@ public static class DslInterpreter
                     if (!await PayActivationCost(t, ctx)) continue;
                     await RunSteps(t.GetProperty("then"), ctx);
                     MarkTriggerOncePerTurnUsed(t, ctx, triggerName);
+                    activated = true;
                 }
             }
         }
@@ -145,7 +243,10 @@ public static class DslInterpreter
         if (ctx.Trigger == EffectTrigger.EventMain && def.TryGetProperty("main", out var main))
         {
             if (CheckCondition(main, ctx) && await PayActivationCost(main, ctx) && main.TryGetProperty("then", out var then))
+            {
                 await RunSteps(then, ctx);
+                activated = true;
+            }
         }
         // 4. trigger: 生命牌触发（数组=直接执行；对象=支持 cost/if 节，复用 PayActivationCost，同 counter）
         if (ctx.Trigger == EffectTrigger.OnLifeRevealTrigger && def.TryGetProperty("trigger", out var trig))
@@ -153,11 +254,15 @@ public static class DslInterpreter
             if (trig.ValueKind == JsonValueKind.Array)
             {
                 await RunSteps(trig, ctx);
+                activated = true;
             }
             else if (trig.ValueKind == JsonValueKind.Object)
             {
                 if (CheckCondition(trig, ctx) && await PayActivationCost(trig, ctx) && trig.TryGetProperty("then", out var tthen))
+                {
                     await RunSteps(tthen, ctx);
+                    activated = true;
+                }
             }
         }
         // 5. activated: 【启动主要】（由 HandleUseEffect 触发 ActivatedMain）
@@ -169,6 +274,7 @@ public static class DslInterpreter
                 {
                     await RunSteps(then, ctx);
                     MarkOncePerTurnUsed(act, ctx);
+                    activated = true;
                 }
             }
         }
@@ -178,14 +284,18 @@ public static class DslInterpreter
             if (co.ValueKind == JsonValueKind.Array)
             {
                 await RunSteps(co, ctx);
+                activated = true;
             }
             else if (co.ValueKind == JsonValueKind.Object)
             {
                 if (CheckCondition(co, ctx) && await PayActivationCost(co, ctx) && co.TryGetProperty("then", out var cthen))
+                {
                     await RunSteps(cthen, ctx);
+                    activated = true;
+                }
             }
         }
-        return true;
+        return activated;
     }
 
     /// <summary>检查"【每回合 1 次】"占位是否已用</summary>
@@ -220,6 +330,8 @@ public static class DslInterpreter
     static async Task<bool> PayActivationCost(JsonElement node, EffectContext ctx)
     {
         if (!node.TryGetProperty("cost", out var cost) || cost.ValueKind != JsonValueKind.Object) return true;
+        // 所有入口都先检查完整成本，避免砂糖等启动效果在活跃咚不足时只休息自身。
+        if (!CanPayActivationCost(node, ctx)) return false;
         // 标记"正在支付成本"：监听方可按各自规则区分成本与收益阶段（OP12-040 两者均触发）
         EffectRuntime.PayingCost = true;
         try
@@ -249,11 +361,36 @@ public static class DslInterpreter
             if (!await AtomicOps.PromptReturnAtLeastOneDonToDeck(ctx)) return false;
         }
 
+        // detachAttachedDon: 将指定数量被赋予中的咚以休息状态放回费用区。
+        if (cost.TryGetProperty("detachAttachedDon", out var dad) && dad.ValueKind == JsonValueKind.Number)
+        {
+            int n = dad.GetInt32();
+            var attached = me.CostArea.Where(don => don.State == DonState.Attached).ToList();
+            if (attached.Count < n) return false;
+            var chosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OwnAttachedDon",
+                $"选择 {n} 张被赋予中的咚!!，以休息状态放回费用区（可放弃）",
+                attached.Select(don => don.Id.ToString()).ToList(), 0, n,
+                new Dictionary<string, object?>
+                {
+                    ["choiceDons"] = attached.Select(don => new
+                    {
+                        id = don.Id.ToString(),
+                        attachedToCardId = don.AttachedToCardId?.ToString(),
+                    }).ToList(),
+                });
+            if (chosen.Count < n) return false;
+            foreach (var id in chosen)
+            {
+                var don = attached.First(item => item.Id.ToString() == id);
+                don.State = DonState.Rest;
+                don.AttachedToCardId = null;
+            }
+        }
+
         // restSelf: 把自身转休息
         if (cost.TryGetProperty("restSelf", out var rs) && rs.ValueKind == JsonValueKind.True)
         {
-            if (ctx.Source.IsTapped) return false;
-            ctx.Source.IsTapped = true;
+            if (ctx.Source.IsTapped || !AtomicOps.RestCard(ctx.Source)) return false;
         }
 
         // selfToTrash: 把自身放置到废弃区
@@ -306,17 +443,36 @@ public static class DslInterpreter
         {
             int n = rad.GetInt32();
             if (me.ActiveDonCount < n) return false;   // 前置检查：活跃咚不足则不支付，避免部分休息
-            int restCount = 0;
-            foreach (var d in me.CostArea)
+            if (ctx.Trigger == EffectTrigger.EventMain && n > 0)
             {
-                if (restCount >= n) break;
-                if (d.State == DonState.Active && d.AttachedToCardId is null)
-                {
-                    d.State = DonState.Rest;
-                    restCount++;
-                }
+                // 事件上的“可以横置咚”由玩家决定并选择具体咚；不得自动支付后跳过选择。
+                if (!await ctx.Prompts.ConfirmOptional(ctx.OwnerIndex, $"是否将 {n} 张活跃咚转为休息状态以发动此效果？"))
+                    return false;
+                var active = me.CostArea.Where(don => don.State == DonState.Active && don.AttachedToCardId is null).ToList();
+                var selected = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "RestOwnDon",
+                    $"选择 {n} 张活跃咚转为休息状态", active.Select(don => don.Id.ToString()).ToList(), n, n,
+                    new Dictionary<string, object?>
+                    {
+                        ["donChoices"] = active.Select(don => new { id = don.Id.ToString(), state = don.State.ToString() }).ToList(),
+                    });
+                if (selected.Count != n || selected.Distinct().Count() != n
+                    || selected.Any(id => !active.Any(don => don.Id.ToString() == id))) return false;
+                foreach (var id in selected) active.First(don => don.Id.ToString() == id).State = DonState.Rest;
             }
-            if (restCount < n) return false;
+            else
+            {
+                int restCount = 0;
+                foreach (var d in me.CostArea)
+                {
+                    if (restCount >= n) break;
+                    if (d.State == DonState.Active && d.AttachedToCardId is null)
+                    {
+                        d.State = DonState.Rest;
+                        restCount++;
+                    }
+                }
+                if (restCount < n) return false;
+            }
         }
 
         // restCards: 将 N 张"卡牌"转为休息状态（活跃 领袖/角色/舞台/咚!! 混选）。
@@ -334,6 +490,20 @@ public static class DslInterpreter
                 $"将我方 {n} 张卡牌转为休息状态（{(rcOpt ? "可放弃，" : "")}可选活跃 领袖/角色/舞台/咚!!）", rcOpt)) return false;
         }
 
+        // restCharacters：只可横置我方角色，不能把领袖、舞台或咚当作角色成本。
+        if (cost.TryGetProperty("restCharacters", out var rch))
+        {
+            int n = 0; bool optional = false;
+            if (rch.ValueKind == JsonValueKind.Number) n = rch.GetInt32();
+            else if (rch.ValueKind == JsonValueKind.Object)
+            {
+                n = GetInt(rch, "n", 1);
+                optional = rch.TryGetProperty("optional", out var opt) && opt.ValueKind == JsonValueKind.True;
+            }
+            if (n > 0 && !await AtomicOps.PromptRestOwnCharacters(ctx, n,
+                $"将我方 {n} 张角色转为休息状态（{(optional ? "可放弃" : "必须支付")}）", optional)) return false;
+        }
+
         // millTop: 从卡组顶废弃 N 张（用于某些特殊费用）
         if (cost.TryGetProperty("millTop", out var mt) && mt.ValueKind == JsonValueKind.Number)
         {
@@ -349,7 +519,7 @@ public static class DslInterpreter
             if (me.LifeArea.Count == 0) return false;
             var top = me.LifeArea[0];
             me.LifeArea.RemoveAt(0);
-            me.Hand.Add(top);
+            LifeRevealManager.AddRevealedLifeToHandOrDeck(me, top);
         }
 
         // revealHand: 公开我方手牌中 1 张符合过滤条件的卡牌作为成本（"可以…公开…：…"）。
@@ -450,12 +620,13 @@ public static class DslInterpreter
             var rcands = new List<CardInstance>();
             if (!me.Leader.IsTapped && (kw == "" || me.Leader.Info.HasKeyword(kw))) rcands.Add(me.Leader);
             if (me.StageCard is not null && !me.StageCard.IsTapped && (kw == "" || me.StageCard.Info.HasKeyword(kw))) rcands.Add(me.StageCard);
+            if (me.ExtraStageCard is not null && !me.ExtraStageCard.IsTapped && (kw == "" || me.ExtraStageCard.Info.HasKeyword(kw))) rcands.Add(me.ExtraStageCard);
             if (rcands.Count == 0) return false;
             var rchosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OwnLeaderOrStageToRest",
                 kw == "" ? "将我方1张领袖或舞台转为休息状态（可放弃）" : $"将我方1张《{kw}》领袖或舞台转为休息状态（可放弃）",
                 rcands.Select(c => c.Id.ToString()).ToList(), 0, 1);
             if (rchosen.Count == 0) return false;
-            AtomicOps.RestCard(rcands.First(c => c.Id.ToString() == rchosen[0]));
+            if (!AtomicOps.RestCard(rcands.First(c => c.Id.ToString() == rchosen[0]))) return false;
         }
 
         // bounceOwnChar: 将我方 N 张角色放回手牌作为成本（数字=任意角色；对象 {n,...过滤} 带筛选，如 OP10-056 费≥4 德莱斯罗兹）。
@@ -510,21 +681,29 @@ public static class DslInterpreter
             var lc = me.LifeArea[0]; me.LifeArea.RemoveAt(0); lc.IsLifeFaceUp = false; me.Trash.Add(lc);
         }
 
-        // returnOwnStage: 将我方 1 张舞台放回卡组最下方作为成本（可带 originalCost 过滤；可放弃）。
-        if (cost.TryGetProperty("returnOwnStage", out var ros) && (ros.ValueKind == JsonValueKind.Object || ros.ValueKind == JsonValueKind.True))
+        // returnStage 可选择双方舞台；returnOwnStage 保留仅限我方的既有语义。
+        bool anySideStage = cost.TryGetProperty("returnStage", out var ros);
+        if ((anySideStage || cost.TryGetProperty("returnOwnStage", out ros))
+            && (ros.ValueKind == JsonValueKind.Object || ros.ValueKind == JsonValueKind.True))
         {
-            if (me.StageCard is null) return false;
-            bool sok = true;
-            if (ros.ValueKind == JsonValueKind.Object)
-            {
-                if (ros.TryGetProperty("originalCostLte", out var ocl) && me.StageCard.Info.Cost > ocl.GetInt32()) sok = false;
-                if (ros.TryGetProperty("originalCostGte", out var ocg) && me.StageCard.Info.Cost < ocg.GetInt32()) sok = false;
-            }
-            if (!sok) return false;
-            var schosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OwnStageToDeckBottom",
-                "将我方1张舞台放回卡组最下方（可放弃）", new List<string> { me.StageCard.Id.ToString() }, 0, 1);
+            var stageOwners = anySideStage ? ctx.State.Players : new[] { me };
+            var stages = stageOwners.SelectMany(player => new[] { player.StageCard, player.ExtraStageCard })
+                .OfType<CardInstance>()
+                .Where(stage => ros.ValueKind != JsonValueKind.Object
+                    || (!ros.TryGetProperty("originalCostLte", out var ocl) || stage.Info.Cost <= ocl.GetInt32())
+                    && (!ros.TryGetProperty("originalCostGte", out var ocg) || stage.Info.Cost >= ocg.GetInt32()))
+                .ToList();
+            if (stages.Count == 0) return false;
+            var schosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex,
+                anySideStage ? "AnyStageToDeckBottom" : "OwnStageToDeckBottom",
+                anySideStage ? "将双方任意1张合格舞台放回持有者卡组最下方（可放弃）" : "将我方1张舞台放回卡组最下方（可放弃）",
+                stages.Select(stage => stage.Id.ToString()).ToList(), 0, 1);
             if (schosen.Count == 0) return false;
-            AtomicOps.ReturnFieldToDeckBottom(ctx.State, ctx.OwnerIndex, me.StageCard);
+            var selectedStage = stages.FirstOrDefault(stage => stage.Id.ToString() == schosen[0]);
+            if (selectedStage is null) return false;
+            int stageOwner = ctx.State.SideOf(selectedStage);
+            if (stageOwner < 0) return false;
+            AtomicOps.ReturnFieldToDeckBottom(ctx.State, stageOwner, selectedStage);
         }
 
         // selfToDeckBottom: 将此角色放回持有者卡组最下方作为成本（OP06-016）。
@@ -580,9 +759,11 @@ public static class DslInterpreter
             if (me.TotalDonInCostArea < dr.GetInt32()) return false;
         if (cost.TryGetProperty("donReturnAtLeastOne", out var dra) && dra.ValueKind == JsonValueKind.True
             && me.TotalDonInCostArea < 1) return false;
+        if (cost.TryGetProperty("detachAttachedDon", out var dad) && dad.ValueKind == JsonValueKind.Number
+            && me.CostArea.Count(don => don.State == DonState.Attached) < dad.GetInt32()) return false;
 
         if (cost.TryGetProperty("restSelf", out var rs) && rs.ValueKind == JsonValueKind.True)
-            if (ctx.Source.IsTapped) return false;
+            if (ctx.Source.IsTapped || !AtomicOps.CanRestCard(ctx.State, ctx.Source)) return false;
 
         // selfToTrash: 自送废弃，恒可支付
 
@@ -599,6 +780,21 @@ public static class DslInterpreter
 
         if (cost.TryGetProperty("restActiveDon", out var rad) && rad.ValueKind == JsonValueKind.Number)
             if (me.ActiveDonCount < rad.GetInt32()) return false;
+
+        if (cost.TryGetProperty("restCards", out var restCards))
+        {
+            int n = restCards.ValueKind == JsonValueKind.Number ? restCards.GetInt32() : GetInt(restCards, "n", 1);
+            if (AtomicOps.RestableCount(ctx.State, me) < n) return false;
+        }
+
+        if (cost.TryGetProperty("restCharacters", out var restCharacters))
+        {
+            int n = restCharacters.ValueKind == JsonValueKind.Number ? restCharacters.GetInt32() : GetInt(restCharacters, "n", 1);
+            int available = me.Characters.Count(card => !card.IsTapped
+                && !card.HasRestriction(RestrictionKind.CannotBeRested)
+                && !ctx.State.HasContinuousRestriction(card, RestrictionKind.CannotBeRested));
+            if (available < n) return false;
+        }
 
         if (cost.TryGetProperty("millTop", out var mt) && mt.ValueKind == JsonValueKind.Number)
             if (me.Deck.Count < mt.GetInt32()) return false;
@@ -644,7 +840,8 @@ public static class DslInterpreter
         {
             var kw = rok.TryGetProperty("keyword", out var kwv) ? kwv.GetString() ?? "" : "";
             bool any = (!me.Leader.IsTapped && (kw == "" || me.Leader.Info.HasKeyword(kw)))
-                       || (me.StageCard is not null && !me.StageCard.IsTapped && (kw == "" || me.StageCard.Info.HasKeyword(kw)));
+                       || (me.StageCard is not null && !me.StageCard.IsTapped && (kw == "" || me.StageCard.Info.HasKeyword(kw)))
+                       || (me.ExtraStageCard is not null && !me.ExtraStageCard.IsTapped && (kw == "" || me.ExtraStageCard.Info.HasKeyword(kw)));
             if (!any) return false;
         }
 
@@ -665,14 +862,17 @@ public static class DslInterpreter
             || (cost.TryGetProperty("lifeToTrash", out var ltt) && ltt.ValueKind == JsonValueKind.True))
             if (me.LifeArea.Count == 0) return false;
 
-        if (cost.TryGetProperty("returnOwnStage", out var ros) && (ros.ValueKind == JsonValueKind.Object || ros.ValueKind == JsonValueKind.True))
+        bool anySideStage = cost.TryGetProperty("returnStage", out var ros);
+        if ((anySideStage || cost.TryGetProperty("returnOwnStage", out ros))
+            && (ros.ValueKind == JsonValueKind.Object || ros.ValueKind == JsonValueKind.True))
         {
-            if (me.StageCard is null) return false;
-            if (ros.ValueKind == JsonValueKind.Object)
-            {
-                if (ros.TryGetProperty("originalCostLte", out var ocl) && me.StageCard.Info.Cost > ocl.GetInt32()) return false;
-                if (ros.TryGetProperty("originalCostGte", out var ocg) && me.StageCard.Info.Cost < ocg.GetInt32()) return false;
-            }
+            var stageOwners = anySideStage ? ctx.State.Players : new[] { me };
+            bool anyStage = stageOwners.SelectMany(player => new[] { player.StageCard, player.ExtraStageCard })
+                .OfType<CardInstance>()
+                .Any(stage => ros.ValueKind != JsonValueKind.Object
+                    || (!ros.TryGetProperty("originalCostLte", out var ocl) || stage.Info.Cost <= ocl.GetInt32())
+                    && (!ros.TryGetProperty("originalCostGte", out var ocg) || stage.Info.Cost >= ocg.GetInt32()));
+            if (!anyStage) return false;
         }
 
         if (cost.TryGetProperty("attachDonToNamed", out var adn) && adn.ValueKind == JsonValueKind.Object)
@@ -697,18 +897,21 @@ public static class DslInterpreter
             {
                 case "leaderPowerNotMoreThan":
                     int threshold = p.Value.GetInt32();
-                    int curr = me.Leader.CurrentPower(me.AttachedDonCount(me.Leader.Id), s.CurrentTurnPlayer == ctx.OwnerIndex);
+                    int curr = s.CurrentPowerOf(ctx.OwnerIndex, me.Leader);
                     if (curr > threshold) return false;
                     break;
                 case "leaderHasKeyword":
                     if (!me.Leader.Info.HasKeyword(p.Value.GetString() ?? "")) return false;
+                    break;
+                case "leaderKeywordContains":
+                    if (!me.Leader.Info.HasKeywordContaining(p.Value.GetString() ?? "")) return false;
                     break;
                 case "leaderNameEquals":
                     if (!me.Leader.Info.NameIs(p.Value.GetString() ?? "")) return false;
                     break;
                 case "leaderHasProperty":
                     // 多属性卡（如"斩/打"）按 / 拆分匹配，精确比较会漏掉（反馈#225）
-                    if (!me.Leader.Info.Property.Split('/').Contains(p.Value.GetString() ?? "")) return false;
+                    if (!me.Leader.HasProperty(p.Value.GetString() ?? "")) return false;
                     break;
                 case "leaderColorIncludes":
                     if (!ColorMatches(me.Leader, p.Value.GetString() ?? "")) return false;
@@ -742,6 +945,14 @@ public static class DslInterpreter
                 case "ownLifeCountLte":
                     if (me.LifeCount > p.Value.GetInt32()) return false;
                     break;
+                case "blockerIsSelf":
+                    {
+                        bool expected = p.Value.ValueKind == JsonValueKind.True;
+                        bool isSelf = ctx.Vars.TryGetValue("blockerCardId", out var blockerId)
+                            && string.Equals(blockerId?.ToString(), ctx.Source.Id.ToString(), StringComparison.Ordinal);
+                        if (isSelf != expected) return false;
+                        break;
+                    }
                 case "oppLifeCountLte":
                     if (opp.LifeCount > p.Value.GetInt32()) return false;
                     break;
@@ -787,13 +998,13 @@ public static class DslInterpreter
                     break;
                 case "selfPowerGte":
                 {
-                    int sp = ctx.Source.CurrentPower(me.AttachedDonCount(ctx.Source.Id), s.CurrentTurnPlayer == ctx.OwnerIndex);
+                    int sp = s.CurrentPowerOf(ctx.OwnerIndex, ctx.Source);
                     if (sp < p.Value.GetInt32()) return false;
                     break;
                 }
                 case "selfPowerLte":
                 {
-                    int sp = ctx.Source.CurrentPower(me.AttachedDonCount(ctx.Source.Id), s.CurrentTurnPlayer == ctx.OwnerIndex);
+                    int sp = s.CurrentPowerOf(ctx.OwnerIndex, ctx.Source);
                     if (sp > p.Value.GetInt32()) return false;
                     break;
                 }
@@ -802,7 +1013,7 @@ public static class DslInterpreter
                     break;
                 case "leaderPowerGte":
                 {
-                    int lp = me.Leader.CurrentPower(me.AttachedDonCount(me.Leader.Id), s.CurrentTurnPlayer == ctx.OwnerIndex);
+                    int lp = s.CurrentPowerOf(ctx.OwnerIndex, me.Leader);
                     if (lp < p.Value.GetInt32()) return false;
                     break;
                 }
@@ -814,9 +1025,12 @@ public static class DslInterpreter
                     break;
                 case "donAttachedGteOwn":
                 {
-                    // 己方任意角色被赋予咚数 ≥ N
+                    // “我方场上存在被赋予咚的牌”同时包含领袖和角色；
+                    // OP13-063/072 在咚赋予领袖时也必须满足条件。
                     int nDon = p.Value.GetInt32();
-                    if (!me.Characters.Any(c => me.AttachedDonCount(c.Id) >= nDon)) return false;
+                    if (me.AttachedDonCount(me.Leader.Id) < nDon
+                        && !me.Characters.Any(c => me.AttachedDonCount(c.Id) >= nDon))
+                        return false;
                     break;
                 }
                 case "donAttachedLteOwn":
@@ -856,6 +1070,16 @@ public static class DslInterpreter
                     // 对方场上存在当前力量 ≥ N 的角色
                     if (!opp.Characters.Any(c => s.CurrentPowerOf(1 - ctx.OwnerIndex, c) >= p.Value.GetInt32())) return false;
                     break;
+                case "boardHasCharPowerGte":
+                {
+                    // 双方场上存在当前力量 ≥ N 的角色；“场上存在”不限定控制方。
+                    int minimumPower = p.Value.GetInt32();
+                    bool found = s.Players.SelectMany((player, side) =>
+                            player.Characters.Select(card => (side, card)))
+                        .Any(item => s.CurrentPowerOf(item.side, item.card) >= minimumPower);
+                    if (!found) return false;
+                    break;
+                }
                 case "ownHasCharWithKeyword":
                     // 我方场上存在拥有指定特征的角色（如 OP16-076 反击段"存在《大将》角色"）
                     if (!me.Characters.Any(c => c.Info.HasKeyword(p.Value.GetString() ?? ""))) return false;
@@ -894,7 +1118,8 @@ public static class DslInterpreter
                     // 我方场上处于休息状态的卡牌张数（休息角色 + 休息咚 + 休息舞台）≥ N
                     int rested = me.Characters.Count(c => c.IsTapped)
                                  + me.CostArea.Count(d => d.State == DonState.Rest)
-                                 + (me.StageCard is not null && me.StageCard.IsTapped ? 1 : 0);
+                                 + (me.StageCard is not null && me.StageCard.IsTapped ? 1 : 0)
+                                 + (me.ExtraStageCard is not null && me.ExtraStageCard.IsTapped ? 1 : 0);
                     if (rested < p.Value.GetInt32()) return false;
                     break;
                 }
@@ -929,7 +1154,7 @@ public static class DslInterpreter
         switch (name)
         {
             case "Draw":
-                AtomicOps.Draw(s, ctx.OwnerIndex, GetInt(op, "n", 1));
+                await AtomicOps.DrawAsync(s, ctx.OwnerIndex, GetInt(op, "n", 1));
                 break;
             case "MillTop":
                 AtomicOps.MillTop(me, GetInt(op, "n", 1));
@@ -969,12 +1194,12 @@ public static class DslInterpreter
                         c.OriginalPowerOverride = GetInt(op, "value", 0);
                     break;
                 }
-            // 「原本的力量变为 N，直到下个对方的结束阶段结束时为止」：以 delta = N - 卡面Power 经
-            // AddPowerUntilOppEnd 近似（与库内"变为X"持续实现惯例一致）。如 ST26-005 草帽领袖变7000。
+            // 「原本的力量变为 N，直到下个对方的结束阶段结束时为止」：记录精确原本力量值，
+            // 与普通力量±N分离；多条“变为”效果同时存在时由统一查询取最高值。
             case "SetOriginalPowerUntilOppEnd":
                 {
                     foreach (var target in ResolveTargets(op, "target", ctx))
-                        AtomicOps.AddPowerUntilOppEnd(target, GetInt(op, "value", 0) - target.Info.Power, ctx.OwnerIndex);
+                        AtomicOps.SetOriginalPowerUntilOppEnd(target, GetInt(op, "value", 0), ctx.OwnerIndex);
                     break;
                 }
             // 「对方将其 N 张手牌放回卡组最下方」（对方自选，如 EB04-025）。手牌不足时按实有张数。
@@ -1023,7 +1248,10 @@ public static class DslInterpreter
                     if (target is not null)
                     {
                         int owner = FindOwner(s, target);
-                        if (owner >= 0 && !s.IsLeaveGuarded(target, "effect"))
+                        if (owner >= 0 &&
+                            !s.IsLeaveGuarded(target, "effect") &&
+                            !await AtomicOps.TryEffectLeaveGuard(
+                                s, owner, target, ctx.Prompts, "trash"))
                         {
                             BattleEngine.KOCard(s, owner, target);
                             EffectRuntime.NotifyWatcher(EffectTrigger.OnCharLeaveField,
@@ -1044,8 +1272,8 @@ public static class DslInterpreter
                 break;
             case "Activate":
                 {
-                    var target = ResolveTarget(op, "target", ctx);
-                    if (target is not null) AtomicOps.ActivateCard(target);
+                    foreach (var target in ResolveTargets(op, "target", ctx))
+                        AtomicOps.ActivateCard(target);
                     break;
                 }
             case "GiveKeyword":
@@ -1078,11 +1306,19 @@ public static class DslInterpreter
                     string promptKind = op.GetProperty("prompt").GetString() ?? "OpponentCharacter";
                     int max = GetInt(op, "max", 1);
                     int min = GetInt(op, "min", 0);
-                    var candidates = BuildCandidates(promptKind, ctx);
+                    var text = op.TryGetProperty("text", out var tx) ? tx.GetString() ?? promptKind : promptKind;
+                    // 旧定义把未写“原本”的场上费用/力量也编码成 original*，并且部分旧 prompt
+                    // 自带卡面费用预筛。场上效果默认按当前值；明确标注 valueBasis=original（旧定义
+                    // 则兼容提示文本中的“原本”）时按卡面值。手牌/卡组/废弃区等非场上区域仍按卡面值。
+                    string? valueBasis = op.TryGetProperty("valueBasis", out var vb) ? vb.GetString() : null;
+                    bool explicitlyOriginal = string.Equals(valueBasis, "original", StringComparison.OrdinalIgnoreCase)
+                        || (valueBasis is null && text.Contains("原本"));
+                    bool fieldUsesCurrentValues = IsFieldCandidatePrompt(promptKind) && !explicitlyOriginal;
+                    var candidates = BuildCandidates(promptKind, ctx, legacyCostUsesOriginal: explicitlyOriginal);
                     // 可选 filter：在 prompt 基础候选上再套一层卡牌过滤（力量/费用/特征/名称等，复用 BuildCardFilter）
                     if (op.TryGetProperty("filter", out var chFilter) && chFilter.ValueKind == JsonValueKind.Object)
                     {
-                        var pred = BuildMatchPredicate(chFilter);
+                        var pred = BuildMatchPredicate(chFilter, s, fieldUsesCurrentValues);
                         candidates = candidates.Where(pred).ToList();
 
                         // 费用未写“原本的”时按当前费用判定。该判断需要对局与控制方上下文，
@@ -1105,7 +1341,6 @@ public static class DslInterpreter
                             candidates = candidates.Where(c => ActionValidator.HasKeyword(s, c, keyword)).ToList();
                         }
                     }
-                    var text = op.TryGetProperty("text", out var tx) ? tx.GetString() ?? promptKind : promptKind;
                     // 下发候选卡 {id,number}，让前端能解析"不在场上"区域（废弃区/卡组等）候选的卡图；
                     // 对场上候选也等价（前端 findCardById 优先用此映射），纯增益。
                     var chExtra = new Dictionary<string, object?>
@@ -1177,18 +1412,43 @@ public static class DslInterpreter
                 }
             case "ReturnToDeckBottom":
                 {
-                    var target = ResolveTarget(op, "target", ctx);
-                    if (target is null) break;
+                    var targets = ResolveTargets(op, "target", ctx)
+                        .DistinctBy(card => card.Id)
+                        .ToList();
+                    if (targets.Count == 0) break;
                     var from = op.TryGetProperty("from", out var fr) ? fr.GetString() : "field";
-                    int owner = FindOwner(s, target);
-                    var ownerP = owner >= 0 ? s.Players[owner] : me;
                     switch (from)
                     {
-                        case "hand":  AtomicOps.ReturnHandToDeckBottom(ownerP, target); break;
-                        case "trash": AtomicOps.ReturnTrashToDeckBottom(ownerP, target); break;
+                        case "hand":
+                            foreach (var target in targets)
+                            {
+                                int owner = FindOwner(s, target);
+                                AtomicOps.ReturnHandToDeckBottom(owner >= 0 ? s.Players[owner] : me, target);
+                            }
+                            break;
+                        case "trash":
+                            foreach (var target in targets)
+                            {
+                                int owner = FindOwner(s, target);
+                                AtomicOps.ReturnTrashToDeckBottom(owner >= 0 ? s.Players[owner] : me, target);
+                            }
+                            break;
                         default:
-                            if (owner >= 0 && !await AtomicOps.TryEffectLeaveGuard(s, owner, target, ctx.Prompts, "deck"))
-                                AtomicOps.ReturnFieldToDeckBottom(s, owner, target);
+                            foreach (var ownerGroup in targets.GroupBy(target => FindOwner(s, target)))
+                            {
+                                int owner = ownerGroup.Key;
+                                if (owner < 0) continue;
+                                var cards = ownerGroup.ToList();
+                                var characters = cards.Where(card => s.Players[owner].Characters.Contains(card)).ToList();
+                                if (characters.Count > 0)
+                                    await AtomicOps.ProcessEffectLeavesAsync(s, owner, characters, ctx.Prompts,
+                                        "deck-bottom", AtomicOps.ReturnFieldToDeckBottom);
+                                foreach (var target in cards.Where(card => !characters.Contains(card)))
+                                {
+                                    if (!await AtomicOps.TryEffectLeaveGuard(s, owner, target, ctx.Prompts, "deck-bottom"))
+                                        AtomicOps.ReturnFieldToDeckBottom(s, owner, target);
+                                }
+                            }
                             break;
                     }
                     break;
@@ -1202,19 +1462,21 @@ public static class DslInterpreter
                     await AtomicOps.PlayFromTrashFree(s, ctx.OwnerIndex, target, rest);
                     break;
                 }
-            // PlaySelf:「此卡牌登场」生命触发——把此卡(发动触发时已被移入废弃区)从废弃区登场到场上(触发其登场时)。
+            // PlaySelf:「此卡牌登场」生命触发——把此卡（发动触发时已被移入废弃区）
+            // 从废弃区登场到场上并触发其【登场时】；角色与舞台共用免费登场入口。
             case "PlaySelf":
-                if (ctx.Source.Info.Kind == CardKind.Character)
+                if (ctx.Source.Info.Kind is CardKind.Character or CardKind.Stage)
                 {
-                    await EnsureRoomForCharacter(ctx, ctx.OwnerIndex, ctx.Source);
+                    if (ctx.Source.Info.Kind == CardKind.Character)
+                        await EnsureRoomForCharacter(ctx, ctx.OwnerIndex, ctx.Source);
                     await AtomicOps.PlayFromTrashFree(s, ctx.OwnerIndex, ctx.Source);
                 }
                 break;
             case "TrashToHand":
                 {
-                    var target = ResolveTarget(op, "target", ctx);
-                    if (target is null) break;
-                    AtomicOps.TrashToHand(me, target);
+                    // 多选回收须处理全部所选卡牌，且同一实体只移动一次。
+                    foreach (var target in ResolveTargets(op, "target", ctx).DistinctBy(card => card.Id))
+                        if (me.Trash.Contains(target)) AtomicOps.TrashToHand(me, target);
                     break;
                 }
             case "SetPower":
@@ -1304,7 +1566,7 @@ public static class DslInterpreter
                 {
                     var target = ResolveTarget(op, "target", ctx);
                     if (target is null) break;
-                    AtomicOps.AddCostModifier(target, GetInt(op, "delta", 0), GetDuration(op));
+                    AtomicOps.AddCostModifier(target, GetInt(op, "delta", 0), GetDuration(op), ctx.OwnerIndex);
                     break;
                 }
             case "Nullify":
@@ -1381,7 +1643,10 @@ public static class DslInterpreter
                     int max = GetInt(op, "max", 1);
                     string restTo = op.TryGetProperty("restTo", out var rt) ? rt.GetString() ?? "bottom" : "bottom";
                     var match = BuildMatchPredicate(op.TryGetProperty("match", out var mm) ? mm : default);
-                    await LookTopRevealImpl(ctx, count, max, match, restTo);
+                    bool playPicked = op.TryGetProperty("pickedTo", out var destination)
+                        && destination.GetString() == "field";
+                    bool revealPicked = !op.TryGetProperty("revealPicked", out var reveal) || reveal.ValueKind != JsonValueKind.False;
+                    await LookTopRevealImpl(ctx, count, max, match, restTo, playPicked, revealPicked);
                     break;
                 }
             // 查看卡组顶 count 张，玩家按点击顺序重排，再整体放回卡组顶或底。
@@ -1477,6 +1742,20 @@ public static class DslInterpreter
                 {
                     // 将己方 N 张休息咚转为活跃状态
                     int n = GetInt(op, "n", 1);
+                    bool chooseCount = op.TryGetProperty("chooseCount", out var chooseCountNode)
+                        && chooseCountNode.ValueKind == JsonValueKind.True;
+                    if (chooseCount)
+                    {
+                        await AtomicOps.PromptChooseAndApplyDonCount(
+                            s,
+                            ctx.Prompts,
+                            ctx.OwnerIndex,
+                            n,
+                            $"选择要转为活跃状态的休息咚!!张数（最多 {n} 张）",
+                            don => don.State == DonState.Rest && don.AttachedToCardId is null,
+                            don => don.State = DonState.Active);
+                        break;
+                    }
                     int actCount = 0;
                     foreach (var d in me.CostArea)
                     {
@@ -1489,9 +1768,37 @@ public static class DslInterpreter
                     }
                     break;
                 }
+            case "ScheduleRefreshOwnDon":
+                ctx.State.EndOfTurnTasks.Add(new EndTurnTask
+                {
+                    Kind = "RefreshOwnDon",
+                    Owner = ctx.OwnerIndex,
+                    Count = GetInt(op, "n", 1),
+                    SourceCardId = ctx.Source.Id.ToString(),
+                });
+                break;
+            case "ProtectOwnCharactersFromKOThisTurn":
+                {
+                    int owner = ctx.OwnerIndex;
+                    var leader = me.Leader;
+                    ctx.State.ContinuousEffects.Add(new ContinuousEffect
+                    {
+                        SourceCardId = $"{leader.Id}:protect-characters-{ctx.State.TurnCount}",
+                        SourceCardNumber = ctx.Source.Info.Number,
+                        ExpiresAtEndOfTurnForSide = ctx.State.CurrentTurnPlayer,
+                        Scope = new ContinuousScope { Side = 0, IncludeLeader = false, IncludeCharacters = true },
+                        KoGuard = "any",
+                        Predicate = (state, side, card) => side == owner,
+                    });
+                    break;
+                }
             case "NoPlayCharacter":
                 // 本回合中我方无法登场角色卡牌（回合结束自动清除）
                 ctx.State.NoPlayCharacterThisTurn.Add(ctx.OwnerIndex);
+                break;
+            case "NoPlayCharacterOriginalCostGte":
+                // 本回合中我方无法登场原本费用不低于 N 的角色卡牌（回合结束自动清除）
+                ctx.State.NoPlayCharacterOriginalCostGteThisTurn[ctx.OwnerIndex] = GetInt(op, "n", 0);
                 break;
             case "SelfToTrash":
                 {
@@ -1506,7 +1813,7 @@ public static class DslInterpreter
                     if (me.LifeArea.Count == 0) break;
                     var top = me.LifeArea[0];
                     me.LifeArea.RemoveAt(0);
-                    me.Hand.Add(top);
+                    LifeRevealManager.AddRevealedLifeToHandOrDeck(me, top);
                     break;
                 }
             case "OppLifeToHand":
@@ -1515,7 +1822,7 @@ public static class DslInterpreter
                     if (opp.LifeArea.Count == 0) break;
                     var top = opp.LifeArea[0];
                     opp.LifeArea.RemoveAt(0);
-                    opp.Hand.Add(top);
+                    LifeRevealManager.AddRevealedLifeToHandOrDeck(opp, top);
                     break;
                 }
             case "OppLifeToTrash":
@@ -1572,6 +1879,10 @@ public static class DslInterpreter
                 {
                     var pred = BuildMatchPredicate(op.TryGetProperty("filter", out var f) ? f : default);
                     var cands = me.Trash.Where(c => c.Info.Kind == CardKind.Character).Where(pred).ToList();
+                    // 发动生命触发的卡在结算前已暂置废弃区，不能被自己的“从废弃区登场”效果选中。
+                    // 真正的自登场由专用 PlaySelf 处理。
+                    if (ctx.Trigger == EffectTrigger.OnLifeRevealTrigger)
+                        cands = cands.Where(c => c.Id != ctx.Source.Id).ToList();
                     if (cands.Count == 0) break;
                     bool rest = op.TryGetProperty("rest", out var rv) && rv.ValueKind == JsonValueKind.True;
                     var text = op.TryGetProperty("text", out var tx) ? tx.GetString() ?? "从废弃区登场最多1张角色" : "从废弃区登场最多1张角色";
@@ -1674,7 +1985,8 @@ public static class DslInterpreter
     }
 
     /// <summary>通用探顶实现</summary>
-    static async Task LookTopRevealImpl(EffectContext ctx, int count, int max, Func<CardInstance, bool> match, string restTo)
+    static async Task LookTopRevealImpl(EffectContext ctx, int count, int max, Func<CardInstance, bool> match, string restTo,
+        bool playPicked = false, bool revealPicked = true)
     {
         var me = ctx.State.Players[ctx.OwnerIndex];
         int peek = Math.Min(count, me.Deck.Count);
@@ -1689,29 +2001,87 @@ public static class DslInterpreter
                 ["choiceCards"] = top.Select(c => new { id = c.Id.ToString(), number = c.Info.Number }).ToList(),
             };
             var chosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "LookTopReveal",
-                $"确认卡组顶 {peek} 张，公开最多 {max} 张并加入手牌",
+                playPicked ? $"确认卡组顶 {peek} 张，将最多 {max} 张角色登场" :
+                    $"确认卡组顶 {peek} 张，{(revealPicked ? "公开" : "选择")}最多 {max} 张并加入手牌",
                 candidates.Select(c => c.Id.ToString()).ToList(), 0, max, extra);
             var revealedNumbers = new List<string>();
-            foreach (var cid in chosen)
+            foreach (var cid in chosen.Distinct().Take(max))
             {
                 var picked = candidates.FirstOrDefault(c => c.Id.ToString() == cid);
-                if (picked is not null) { me.Deck.Remove(picked); me.Hand.Add(picked); revealedNumbers.Add(picked.Info.Number); }
+                if (picked is null || !me.Deck.Contains(picked)) continue;
+                if (playPicked)
+                    await AtomicOps.PlayFromDeckFree(ctx.State, ctx.OwnerIndex, picked);
+                else if (me.Deck.Remove(picked))
+                    me.Hand.Add(picked);
+                if (!me.Deck.Contains(picked)) revealedNumbers.Add(picked.Info.Number);
             }
             // 检索规范：公开加入手牌的牌，短暂向双方展示
-            ctx.Engine?.BroadcastReveal(ctx.OwnerIndex, revealedNumbers);
+            if (revealPicked) ctx.Engine?.BroadcastReveal(ctx.OwnerIndex, revealedNumbers);
         }
-        // 其余仍在顶部的牌按原相对顺序放回卡组最下方 / 废弃区
+        // 废弃区的处理不涉及排序。部分卡牌允许玩家将余卡自选顺序放回卡组顶或底。
         var rest = top.Where(c => me.Deck.Contains(c)).ToList();
+        if (rest.Count == 0) return;
+        if (restTo == "topOrBottom")
+        {
+            var ordered = rest;
+            if (rest.Count > 1)
+            {
+                var orderedIds = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OrderDeckCards",
+                    "将剩余卡牌自选顺序排列（先选的牌在较上方）",
+                    rest.Select(c => c.Id.ToString()).ToList(), rest.Count, rest.Count,
+                    new Dictionary<string, object?>
+                    {
+                        ["choiceCards"] = rest.Select(c => new { id = c.Id.ToString(), number = c.Info.Number }).ToList(),
+                    });
+                ordered = orderedIds
+                    .Select(id => rest.FirstOrDefault(c => c.Id.ToString() == id))
+                    .Where(c => c is not null)
+                    .Cast<CardInstance>()
+                    .Distinct()
+                    .ToList();
+                // 内部重放或兼容服务若返回不完整/重复顺序，仍保持卡牌完整；实时非法响应会在入口被拒绝。
+                ordered.AddRange(rest.Where(c => !ordered.Contains(c)));
+            }
+
+            int placement = await ctx.Prompts.ChooseOption(ctx.OwnerIndex,
+                "将剩余卡牌放置到卡组最上方还是最下方？", new[] { "卡组最上方", "卡组最下方" });
+            foreach (var card in rest) me.Deck.Remove(card);
+            if (placement == 0) me.Deck.InsertRange(0, ordered);
+            else me.Deck.AddRange(ordered);
+            return;
+        }
+
         foreach (var c in rest) me.Deck.Remove(c);
         if (restTo == "trash") me.Trash.AddRange(rest);
-        else me.Deck.AddRange(rest);
+        else if (rest.Count <= 1) me.Deck.AddRange(rest);
+        else
+        {
+            var orderedIds = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "ReorderToDeckBottom",
+                "将剩余卡牌自选顺序放回卡组最下方（先选的牌在较上方）",
+                rest.Select(c => c.Id.ToString()).ToList(), 0, rest.Count,
+                new Dictionary<string, object?>
+                {
+                    ["choiceCards"] = rest.Select(c => new { id = c.Id.ToString(), number = c.Info.Number }).ToList(),
+                    ["allowDefaultOrder"] = true,
+                });
+            var ordered = orderedIds
+                .Select(id => rest.FirstOrDefault(c => c.Id.ToString() == id))
+                .Where(c => c is not null)
+                .Cast<CardInstance>()
+                .Distinct()
+                .ToList();
+            // 网络异常或旧客户端提交不完整时，不丢失卡牌；未提交的余卡保持原顺序。
+            ordered.AddRange(rest.Where(c => !ordered.Contains(c)));
+            me.Deck.AddRange(ordered);
+        }
     }
 
     static bool ColorMatches(CardInstance c, string color)
         => c.Info.ColorList.Contains(color);
 
     /// <summary>解析 DSL 中的 filter 节点，返回卡牌过滤谓词</summary>
-    static Func<CardInstance, bool> BuildCardFilter(JsonElement node)
+    static Func<CardInstance, bool> BuildCardFilter(
+        JsonElement node, GameState? state = null, bool fieldUsesCurrentValues = false)
     {
         if (node.ValueKind != JsonValueKind.Object) return _ => true;
         return c =>
@@ -1737,17 +2107,22 @@ public static class DslInterpreter
             // property: 属性（斩/打/特/知/…）。多属性卡形如"斩/打"，按 / 拆分匹配（反馈#225：精确比较漏双属性卡）
             if (node.TryGetProperty("property", out var prop))
             {
-                if (!c.Info.Property.Split('/').Contains(prop.GetString() ?? "")) return false;
+                if (!c.HasProperty(prop.GetString() ?? "")) return false;
             }
+            // 明确写了“原本”的费用过滤看卡面值；原本力量还须应用“原本力量变为X”的持续覆盖。
+            // fieldUsesCurrentValues 仅用于未标明基准的场上筛选，不能把贴咚或普通力量修正混入原本力量。
             if (node.TryGetProperty("originalCostLte", out var oc) && c.Info.Cost > oc.GetInt32()) return false;
             if (node.TryGetProperty("originalCostGte", out var oc2) && c.Info.Cost < oc2.GetInt32()) return false;
-            if (node.TryGetProperty("originalPowerLte", out var pp) && c.Info.Power > pp.GetInt32()) return false;
-            if (node.TryGetProperty("originalPowerGte", out var pp2) && c.Info.Power < pp2.GetInt32()) return false;
+            if (node.TryGetProperty("originalPowerLte", out var pp) && OriginalPowerOfCard(c) > pp.GetInt32()) return false;
+            if (node.TryGetProperty("originalPowerGte", out var pp2) && OriginalPowerOfCard(c) < pp2.GetInt32()) return false;
             // currentPowerLte/Gte: 按"当前力量"判定（卡面「力量X以下」未写"原本的"时的默认口径）。
             // 场上卡走 CurrentPowerOf（含贴咚/回合加成/持续光环），非场上候选回退原本力量。
             if (node.TryGetProperty("currentPowerLte", out var cpl) && CurrentPowerOfCard(c) > cpl.GetInt32()) return false;
             if (node.TryGetProperty("currentPowerGte", out var cpg) && CurrentPowerOfCard(c) < cpg.GetInt32()) return false;
             if (node.TryGetProperty("nameEquals", out var nm) && !c.MatchesName(nm.GetString() ?? "")) return false;
+            // “此角色以外”按实例排除，另一张同名角色仍可成为目标。
+            if (node.TryGetProperty("excludeSelf", out var exs) && exs.ValueKind == JsonValueKind.True
+                && c.Id == EffectRuntime.CurrentSource?.Id) return false;
             // excludeName: 排除指定卡名（对应「…以外的角色」，如 OP14-091「Mr.2·冯·克雷以外」排除自身同名）
             if (node.TryGetProperty("excludeName", out var exn) && c.MatchesName(exn.GetString() ?? "")) return false;
             // keywordContains: 特征"包含"指定子串（对应「特征中包含〈X〉」语义，区别于精确匹配的 keyword）
@@ -1780,6 +2155,15 @@ public static class DslInterpreter
         return side >= 0 ? st.CurrentPowerOf(side, c) : c.Info.Power;
     }
 
+    /// <summary>场上卡按规则计算“原本力量”（含变为X的覆盖）；非场上候选回退卡面值。</summary>
+    static int OriginalPowerOfCard(CardInstance c)
+    {
+        var st = EffectRuntime.CurrentState;
+        if (st is null) return c.Info.Power;
+        int side = st.SideOf(c);
+        return side >= 0 ? st.OriginalPowerOf(side, c) : c.Info.Power;
+    }
+
     /// <summary>场上卡按当前费用判定；非场上候选回退卡面原本费用。</summary>
     static int CurrentCostOfCard(CardInstance c, GameState state)
     {
@@ -1791,18 +2175,20 @@ public static class DslInterpreter
     /// 解析"匹配规格"：支持 anyOf（任一子过滤命中即可，用于"X或Y"）+ excludeName（"某名字以外"）。
     /// 无 anyOf 时把节点本身当单个 filter。
     /// </summary>
-    static Func<CardInstance, bool> BuildMatchPredicate(JsonElement node)
+    static Func<CardInstance, bool> BuildMatchPredicate(
+        JsonElement node, GameState? state = null, bool fieldUsesCurrentValues = false)
     {
         if (node.ValueKind != JsonValueKind.Object) return _ => true;
         Func<CardInstance, bool> basePred;
         if (node.TryGetProperty("anyOf", out var anyOf) && anyOf.ValueKind == JsonValueKind.Array)
         {
-            var preds = anyOf.EnumerateArray().Select(BuildCardFilter).ToList();
+            var preds = anyOf.EnumerateArray()
+                .Select(item => BuildCardFilter(item, state, fieldUsesCurrentValues)).ToList();
             basePred = c => preds.Any(p => p(c));
         }
         else
         {
-            basePred = BuildCardFilter(node);
+            basePred = BuildCardFilter(node, state, fieldUsesCurrentValues);
         }
         if (node.TryGetProperty("excludeName", out var ex))
         {
@@ -1869,18 +2255,35 @@ public static class DslInterpreter
             if (p.Leader == c) return i;
             if (p.Characters.Contains(c)) return i;
             if (p.StageCard == c) return i;
+            if (p.ExtraStageCard == c) return i;
         }
         return -1;
     }
 
-    static List<CardInstance> BuildCandidates(string promptKind, EffectContext ctx)
+    static bool IsFieldCandidatePrompt(string promptKind)
+        => promptKind is "OpponentCharacter" or "OpponentActiveCharacter" or "OpponentRestingCharacter"
+            or "OpponentCharacterWithDon" or "OpponentCharacterWithDonGe2"
+            or "OpponentLeaderOrCharacter" or "OwnCharacter" or "OwnLeaderOrCharacter"
+            or "AnyCharacter" or "OwnStage" or "OpponentStage" or "AnyStage"
+            || promptKind.StartsWith("OpponentCharacterCostLe", StringComparison.Ordinal)
+            || promptKind.StartsWith("OwnCharacterCostLe", StringComparison.Ordinal);
+
+    static List<CardInstance> BuildCandidates(
+        string promptKind, EffectContext ctx, bool legacyCostUsesOriginal = false)
     {
         var s = ctx.State;
         var me = s.Players[ctx.OwnerIndex];
         var opp = s.Players[1 - ctx.OwnerIndex];
+        int OwnFieldCost(CardInstance card) => legacyCostUsesOriginal
+            ? card.Info.Cost
+            : s.CurrentCostOf(ctx.OwnerIndex, card);
+        int OpponentFieldCost(CardInstance card) => legacyCostUsesOriginal
+            ? card.Info.Cost
+            : s.CurrentCostOf(1 - ctx.OwnerIndex, card);
         return promptKind switch
         {
             "OpponentCharacter"           => opp.Characters.ToList(),
+            "OpponentActiveCharacter"     => opp.Characters.Where(c => !c.IsTapped).ToList(),
             "AnyCharacter"                => me.Characters.Concat(opp.Characters).ToList(),
             "OpponentCharacterWithDon"    => opp.Characters.Where(c => opp.AttachedDonCount(c.Id) >= 1).ToList(),
             "OpponentCharacterWithDonGe2" => opp.Characters.Where(c => opp.AttachedDonCount(c.Id) >= 2).ToList(),
@@ -1895,28 +2298,28 @@ public static class DslInterpreter
             "OwnTrashCharacter"           => me.Trash.Where(c => c.Info.Kind == CardKind.Character).ToList(),
             "OwnTrashEvent"               => me.Trash.Where(c => c.Info.Kind == CardKind.Event).ToList(),
             "OwnTrash"                    => me.Trash.ToList(),
-            "OwnStage"                    => me.StageCard is { } sc ? new List<CardInstance> { sc } : new(),
-            "OpponentStage"               => opp.StageCard is { } osc ? new List<CardInstance> { osc } : new(),
-            "AnyStage"                    => new[] { me.StageCard, opp.StageCard }.Where(c => c is not null).Cast<CardInstance>().ToList(),
-            "OpponentCharacterCostLe5"    => opp.Characters.Where(c => c.Info.Cost <= 5).ToList(),
+            "OwnStage"                    => new[] { me.StageCard, me.ExtraStageCard }.OfType<CardInstance>().ToList(),
+            "OpponentStage"               => new[] { opp.StageCard, opp.ExtraStageCard }.OfType<CardInstance>().ToList(),
+            "AnyStage"                    => new[] { me.StageCard, me.ExtraStageCard, opp.StageCard, opp.ExtraStageCard }.OfType<CardInstance>().ToList(),
+            "OpponentCharacterCostLe5"    => opp.Characters.Where(c => OpponentFieldCost(c) <= 5).ToList(),
             // C2 看对手私有区域：候选 ID 仍是卡 GUID，但仅向查看方暴露
             "OpponentHand"                => opp.Hand.ToList(),
             "OpponentLifeAll"             => opp.LifeArea.ToList(),
             // D 阶段新增：更丰富的候选范围
-            "OpponentCharacterCostLe0"    => opp.Characters.Where(c => s.CurrentCostOf(1 - ctx.OwnerIndex, c) <= 0).ToList(),
-            "OpponentCharacterCostLe1"    => opp.Characters.Where(c => c.Info.Cost <= 1).ToList(),
-            "OpponentCharacterCostLe2"    => opp.Characters.Where(c => c.Info.Cost <= 2).ToList(),
-            "OpponentCharacterCostLe3"    => opp.Characters.Where(c => c.Info.Cost <= 3).ToList(),
-            "OpponentCharacterCostLe4"    => opp.Characters.Where(c => c.Info.Cost <= 4).ToList(),
-            "OpponentCharacterCostLe6"    => opp.Characters.Where(c => c.Info.Cost <= 6).ToList(),
-            "OpponentCharacterCostLe7"    => opp.Characters.Where(c => c.Info.Cost <= 7).ToList(),
-            "OpponentCharacterCostLe8"    => opp.Characters.Where(c => c.Info.Cost <= 8).ToList(),
-            "OpponentCharacterCostLe9"    => opp.Characters.Where(c => c.Info.Cost <= 9).ToList(),
-            "OwnCharacterCostLe2"         => me.Characters.Where(c => c.Info.Cost <= 2).ToList(),
-            "OwnCharacterCostLe3"         => me.Characters.Where(c => c.Info.Cost <= 3).ToList(),
-            "OwnCharacterCostLe4"         => me.Characters.Where(c => c.Info.Cost <= 4).ToList(),
-            "OwnCharacterCostLe5"         => me.Characters.Where(c => c.Info.Cost <= 5).ToList(),
-            "OwnCharacterCostLe6"         => me.Characters.Where(c => c.Info.Cost <= 6).ToList(),
+            "OpponentCharacterCostLe0"    => opp.Characters.Where(c => OpponentFieldCost(c) <= 0).ToList(),
+            "OpponentCharacterCostLe1"    => opp.Characters.Where(c => OpponentFieldCost(c) <= 1).ToList(),
+            "OpponentCharacterCostLe2"    => opp.Characters.Where(c => OpponentFieldCost(c) <= 2).ToList(),
+            "OpponentCharacterCostLe3"    => opp.Characters.Where(c => OpponentFieldCost(c) <= 3).ToList(),
+            "OpponentCharacterCostLe4"    => opp.Characters.Where(c => OpponentFieldCost(c) <= 4).ToList(),
+            "OpponentCharacterCostLe6"    => opp.Characters.Where(c => OpponentFieldCost(c) <= 6).ToList(),
+            "OpponentCharacterCostLe7"    => opp.Characters.Where(c => OpponentFieldCost(c) <= 7).ToList(),
+            "OpponentCharacterCostLe8"    => opp.Characters.Where(c => OpponentFieldCost(c) <= 8).ToList(),
+            "OpponentCharacterCostLe9"    => opp.Characters.Where(c => OpponentFieldCost(c) <= 9).ToList(),
+            "OwnCharacterCostLe2"         => me.Characters.Where(c => OwnFieldCost(c) <= 2).ToList(),
+            "OwnCharacterCostLe3"         => me.Characters.Where(c => OwnFieldCost(c) <= 3).ToList(),
+            "OwnCharacterCostLe4"         => me.Characters.Where(c => OwnFieldCost(c) <= 4).ToList(),
+            "OwnCharacterCostLe5"         => me.Characters.Where(c => OwnFieldCost(c) <= 5).ToList(),
+            "OwnCharacterCostLe6"         => me.Characters.Where(c => OwnFieldCost(c) <= 6).ToList(),
             "OwnTrashCharacterCostLe1"    => me.Trash.Where(c => c.Info.Kind == CardKind.Character && c.Info.Cost <= 1).ToList(),
             "OwnTrashCharacterCostLe2"    => me.Trash.Where(c => c.Info.Kind == CardKind.Character && c.Info.Cost <= 2).ToList(),
             "OwnTrashCharacterCostLe3"    => me.Trash.Where(c => c.Info.Kind == CardKind.Character && c.Info.Cost <= 3).ToList(),

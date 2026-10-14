@@ -1,15 +1,18 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import type { CardData } from "@/types/card";
 import Modal from "@/components/ui/Modal";
 import { toDisplayColor, primaryDisplayColor, COLOR_STYLES } from "@/lib/colorMap";
 import { CARD_BACK_SRC, displaySrc, nextCardImageSrc } from "@/lib/sprite";
+import { useSlowImageFallback } from "@/hooks/useSlowImageFallback";
 
 interface Props {
   card: CardData | null;
   onClose: () => void;
   mobileSheet?: boolean;
+  /** 组牌页手机竖屏使用较小卡图，避免详情占满视口。 */
+  compactMobile?: boolean;
   initialArtwork?: "default" | "latest";
 }
 
@@ -24,6 +27,7 @@ export default function CardInfoPanel({
   card,
   onClose,
   mobileSheet = false,
+  compactMobile = false,
   initialArtwork = "default",
 }: Props) {
   return (
@@ -31,10 +35,16 @@ export default function CardInfoPanel({
       open={!!card}
       onClose={onClose}
       title={card?.name}
-      maxWidthClass="w-[calc(100vw-2rem)] max-w-4xl"
+      maxWidthClass="max-w-5xl"
       mobileSheet={mobileSheet}
     >
-      {card && <CardInfoContent card={card} initialArtwork={initialArtwork} />}
+      {card && (
+        <CardInfoContent
+          card={card}
+          initialArtwork={initialArtwork}
+          compactMobile={compactMobile}
+        />
+      )}
     </Modal>
   );
 }
@@ -42,9 +52,11 @@ export default function CardInfoPanel({
 function CardInfoContent({
   card,
   initialArtwork,
+  compactMobile,
 }: {
   card: CardData;
   initialArtwork: NonNullable<Props["initialArtwork"]>;
+  compactMobile: boolean;
 }) {
   const displayColor = toDisplayColor(card.color);
   const primary      = primaryDisplayColor(card.color);
@@ -55,6 +67,8 @@ function CardInfoContent({
   const initialSpriteIndex = initialArtwork === "latest" ? sprites.length - 1 : 0;
   const [spriteIndex, setSpriteIndex] = useState(initialSpriteIndex);
   const [imageSrc, setImageSrc] = useState(displaySrc(sprites[initialSpriteIndex]));
+  const imageRef = useRef<HTMLImageElement>(null);
+  useSlowImageFallback(imageRef, imageSrc, setImageSrc);
 
   useEffect(() => {
     setSpriteIndex(initialSpriteIndex);
@@ -74,12 +88,20 @@ function CardInfoContent({
   };
 
   return (
-    <div className="max-h-[78vh] overflow-y-auto pr-1">
-      <div className="flex flex-col items-center gap-5 lg:flex-row lg:items-start">
+    <div className="max-h-[78cqh] overflow-y-auto pr-1">
+      <div className="flex flex-col items-center gap-5 @[720px]:flex-row @[720px]:items-start">
         {/* 卡图 */}
-        <div className="relative aspect-[0.717] w-full max-w-[22rem] shrink-0 overflow-hidden rounded-lg bg-gray-800">
+        <div
+          data-card-info-image
+          className={`relative aspect-[0.717] shrink-0 overflow-hidden rounded-lg bg-gray-800 ${
+            compactMobile
+              ? "w-[min(62cqw,14rem)] @[640px]:w-full @[640px]:max-w-[22rem]"
+              : "w-full max-w-[22rem]"
+          }`}
+        >
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
+            ref={imageRef}
             src={imageSrc}
             alt={card.name}
             className="w-full h-full object-cover"
@@ -101,7 +123,7 @@ function CardInfoContent({
                 type="button"
                 onClick={() => moveSprite(-1)}
                 aria-label="上一张异画"
-                className="absolute bottom-1/2 left-2 flex h-9 w-9 translate-y-1/2 items-center justify-center rounded-full bg-black/70 text-xl text-white transition-colors hover:bg-black/90"
+                className="absolute bottom-1/2 left-2 flex h-12 w-12 translate-y-1/2 items-center justify-center rounded-full bg-black/70 text-xl text-white transition-colors hover:bg-black/90"
               >
                 ‹
               </button>
@@ -109,7 +131,7 @@ function CardInfoContent({
                 type="button"
                 onClick={() => moveSprite(1)}
                 aria-label="下一张异画"
-                className="absolute bottom-1/2 right-2 flex h-9 w-9 translate-y-1/2 items-center justify-center rounded-full bg-black/70 text-xl text-white transition-colors hover:bg-black/90"
+                className="absolute bottom-1/2 right-2 flex h-12 w-12 translate-y-1/2 items-center justify-center rounded-full bg-black/70 text-xl text-white transition-colors hover:bg-black/90"
               >
                 ›
               </button>
@@ -122,6 +144,15 @@ function CardInfoContent({
 
         {/* 卡片信息 */}
         <div className="flex w-full min-w-0 flex-col gap-3 text-base">
+          {card.playability === "pending" && (
+            <div
+              data-card-playability="pending"
+              className="rounded-lg border border-amber-500/60 bg-amber-950/50 px-3 py-2 text-sm leading-relaxed text-amber-100"
+            >
+              <p className="font-bold text-amber-300">效果开发中</p>
+              <p>资料与卡图可查阅，当前暂不可用于对战。</p>
+            </div>
+          )}
           {/* 编号 + 颜色 + 类型 */}
           <div className="flex flex-wrap gap-1.5 items-center">
             <span className="text-orange-400 font-bold text-sm">{card.number}</span>

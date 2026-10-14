@@ -1,4 +1,5 @@
 import { DATA_VERSION } from "@/data/dataVersion";
+import { CARD_IMAGE_BASE_VERSION, CARD_IMAGE_REVISIONS } from "@/data/cardImageVersions";
 
 // 浏览器统一使用 WebP 派生图；PNG/JPG 原图仅作为缺失派生图时的回退。
 // - /cards-thumb/：宽 128，小卡、网格和列表使用。
@@ -7,9 +8,25 @@ import { DATA_VERSION } from "@/data/dataVersion";
 // 外部 URL、data URL 和已经是派生图的路径保持原样。
 
 export const CARD_BACK_SRC = "/sprites-thumb/CardBack.webp";
+const PRODUCTION_HOSTS = new Set(["ygo.grand-umi.com", "grand-umi.com"]);
+const PRODUCTION_DIRECT_ORIGIN = "https://direct.grand-umi.com";
+const CONFIGURED_ASSET_ORIGIN = (process.env.NEXT_PUBLIC_ASSET_ORIGIN ?? "").replace(/\/+$/, "");
+// 保留已上线图片的缓存地址；以后只对内容变化的图片追加独立修订。
 
 const CARD_SOURCE_RE = /^\/cards\/(.+?)\.(png|jpe?g)([?#].*)?$/i;
 const SPRITE_SOURCE_RE = /^\/sprites\/(.+?)\.(png|jpe?g)([?#].*)?$/i;
+
+function withCardAssetVersion(path: string, suffix?: string): string {
+  const revision = CARD_IMAGE_REVISIONS[path] ?? CARD_IMAGE_BASE_VERSION;
+  if (!suffix) return `?v=${revision}`;
+  if (suffix.startsWith("?")) {
+    const hashIndex = suffix.indexOf("#");
+    const query = hashIndex < 0 ? suffix : suffix.slice(0, hashIndex);
+    const hash = hashIndex < 0 ? "" : suffix.slice(hashIndex);
+    return `${query}&r=${revision}${hash}`;
+  }
+  return `?v=${revision}${suffix}`;
+}
 
 function mapLocalSource(
   src: string,
@@ -17,7 +34,7 @@ function mapLocalSource(
 ): string {
   const cardMatch = src.match(CARD_SOURCE_RE);
   if (cardMatch) {
-    return `/${cardDirectory}/${cardMatch[1]}.webp${cardMatch[3] ?? `?v=${DATA_VERSION}`}`;
+    return `/${cardDirectory}/${cardMatch[1]}.webp${withCardAssetVersion(cardMatch[1], cardMatch[3])}`;
   }
 
   const spriteMatch = src.match(SPRITE_SOURCE_RE);
@@ -28,14 +45,68 @@ function mapLocalSource(
   return src;
 }
 
+/** 配置静态资源域名后，将本地 public 资源统一交给该域名。 */
+export function assetSrc(src: string): string {
+  if (!CONFIGURED_ASSET_ORIGIN || !src.startsWith("/") || src.startsWith("//")) return src;
+  return `${CONFIGURED_ASSET_ORIGIN}${src}`;
+}
+
 /** 小尺寸展示图：对战卡牌、网格、列表、领袖头像等。 */
 export function thumbSrc(src?: string | null): string {
-  return mapLocalSource(src || CARD_BACK_SRC, "cards-thumb");
+  return assetSrc(mapLocalSource(src || CARD_BACK_SRC, "cards-thumb"));
 }
 
 /** 大尺寸展示图：悬停预览、详情面板、Leader 开场和全屏大图。 */
 export function displaySrc(src?: string | null): string {
-  return mapLocalSource(src || CARD_BACK_SRC, "cards-webp");
+  return assetSrc(mapLocalSource(src || CARD_BACK_SRC, "cards-webp"));
+}
+
+/**
+ * Cloudflare 线路迟迟没有返回首字节时，允许图片切换到同一台源站的 IPv4 直连入口。
+ * 只在正式主域启用，避免本地和测试环境意外跨环境读取资源。
+ */
+export function directAssetSrc(src: string): string | null {
+  if (typeof window === "undefined" || !PRODUCTION_HOSTS.has(window.location.hostname)) return null;
+
+  const source = new URL(src, window.location.href);
+  const configuredOrigin = CONFIGURED_ASSET_ORIGIN
+    ? new URL(CONFIGURED_ASSET_ORIGIN).origin
+    : window.location.origin;
+  if (source.origin !== window.location.origin && source.origin !== configuredOrigin) return null;
+  return new URL(`${source.pathname}${source.search}${source.hash}`, PRODUCTION_DIRECT_ORIGIN).href;
+}
+
+function imageFallbackSources(candidates: Array<string | null | undefined>): string[] {
+  const sources: string[] = [];
+  for (const source of candidates) {
+    if (!source || sources.includes(source)) continue;
+    const localSource = CONFIGURED_ASSET_ORIGIN && source.startsWith(`${CONFIGURED_ASSET_ORIGIN}/`)
+      ? source.slice(CONFIGURED_ASSET_ORIGIN.length) : source;
+    const original = localSource.match(CARD_SOURCE_RE);
+    const hashIndex = source.indexOf("#");
+    const beforeHash = hashIndex < 0 ? source : source.slice(0, hashIndex);
+    const hash = hashIndex < 0 ? "" : source.slice(hashIndex);
+    const originals = original
+      ? [assetSrc(`/cards/${original[1]}.webp${withCardAssetVersion(original[1], original[3])}`),
+          `${beforeHash}${beforeHash.includes("?") ? "&" : "?"}fallback=original-v1${hash}`]
+      : [source];
+    for (const candidate of originals) {
+      if (!sources.includes(candidate)) sources.push(candidate);
+      const directSource = directAssetSrc(candidate);
+      if (directSource && !sources.includes(directSource)) sources.push(directSource);
+    }
+  }
+  return sources;
+}
+
+function absoluteImageSrc(src: string): string {
+  return typeof window === "undefined" ? src : new URL(src, window.location.href).href;
+}
+
+/** 异画资源缺失时回退同卡默认画面，避免整张卡退化为文字占位。 */
+function alternateBaseCardSrc(src: string): string | null {
+  const base = src.replace(/_\d{2}(?=\.(?:png|jpe?g)(?:[?#]|$))/i, "");
+  return base === src ? null : base;
 }
 
 /** React 图片状态在加载失败时取得下一个候选，确保不会在原图和外部图之间循环。 */
@@ -46,9 +117,26 @@ export function nextCardImageSrc(
   variant: "thumb" | "display",
 ): string {
   const derivedSrc = variant === "thumb" ? thumbSrc(rawSrc) : displaySrc(rawSrc);
-  if (currentSrc === derivedSrc && derivedSrc !== rawSrc) return rawSrc;
-  if (externalSrc && currentSrc !== externalSrc) return externalSrc;
-  return CARD_BACK_SRC;
+  const lowResolutionSrc = variant === "display" ? thumbSrc(rawSrc) : null;
+  const baseRawSrc = alternateBaseCardSrc(rawSrc);
+  const baseDerivedSrc = baseRawSrc
+    ? (variant === "thumb" ? thumbSrc(baseRawSrc) : displaySrc(baseRawSrc))
+    : null;
+  const baseLowResolutionSrc = variant === "display" && baseRawSrc
+    ? thumbSrc(baseRawSrc)
+    : null;
+  const sources = imageFallbackSources([
+    derivedSrc,
+    lowResolutionSrc,
+    baseDerivedSrc,
+    baseLowResolutionSrc,
+    derivedSrc !== rawSrc ? rawSrc : null,
+    baseRawSrc,
+    externalSrc,
+    CARD_BACK_SRC,
+  ]);
+  const currentIndex = sources.findIndex((source) => absoluteImageSrc(source) === absoluteImageSrc(currentSrc));
+  return currentIndex >= 0 ? (sources[currentIndex + 1] ?? currentSrc) : (sources[0] ?? currentSrc);
 }
 
 /** 判断路径是否为缩略图(用于加载失败时回退原图) */
@@ -69,7 +157,7 @@ export function advanceImageFallback(
   image: HTMLImageElement,
   candidates: Array<string | null | undefined>,
 ): void {
-  const sources = [...new Set([...candidates.filter((src): src is string => !!src), CARD_BACK_SRC])];
+  const sources = imageFallbackSources([...candidates, CARD_BACK_SRC]);
   const signature = sources.join("\n");
   if (image.dataset.fallbackSignature !== signature) {
     image.dataset.fallbackSignature = signature;

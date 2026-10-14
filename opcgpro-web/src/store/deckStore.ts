@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { CardData } from "@/types/card";
 import { colorMatch, compareCards } from "@/lib/cardSearch";
+import { parseCardColors } from "@/lib/colorMap";
 
 export { colorMatch, compareCards } from "@/lib/cardSearch";
 
@@ -51,16 +52,51 @@ function setCodeOf(card: CardData): string {
   return card.number.split("-")[0];
 }
 
+export function isCardAllowedByLeaderRule(
+  leader: CardData,
+  card: CardData,
+): { ok: boolean; reason?: string } {
+  if (leader.number === "P-117" && !card.keyWords.includes("东海")) {
+    return {
+      ok: false,
+      reason: `无法加入卡组：P-117 奈美只能使用拥有《东海》特征的卡牌（${card.number}）`,
+    };
+  }
+  if (leader.number === "ST37-001"
+      && !card.keyWords.includes("阿拉巴斯坦王国")) {
+    return {
+      ok: false,
+      reason: `无法加入卡组：ST37-001 路飞只能使用拥有《阿拉巴斯坦王国》特征的卡牌（${card.number}）`,
+    };
+  }
+  return { ok: true };
+}
+
 // 不受「同名卡 ≤ 4」限制的卡（卡面注明"规则上，可以将任意张数的此卡牌放入卡组"）。
 // 与服务端 DeckValidator.UnlimitedCopyCards 保持一致；新增同类卡时两处同步登记。
 export const UNLIMITED_COPY_CARDS = new Set<string>([
   "OP01-075", // 和平主义者
   "OP08-072", // 饼干士兵
   "OP16-042", // 因佩尔地狱的囚犯
+  "OP18-093", // MMA
 ]);
 
+const DECK_TYPE_ORDER: Record<string, number> = {
+  Character: 0,
+  Event: 1,
+  Stage: 2,
+};
+
+/** 卡组构成按角色、事件、场地分组；组内沿用牌池的确定性排序。 */
+export function compareDeckCards(a: CardData, b: CardData): number {
+  const typeOrderA = DECK_TYPE_ORDER[a.type] ?? 99;
+  const typeOrderB = DECK_TYPE_ORDER[b.type] ?? 99;
+  if (typeOrderA !== typeOrderB) return typeOrderA - typeOrderB;
+  return compareCards(a, b);
+}
+
 function sortEntries(entries: DeckEntry[]): DeckEntry[] {
-  return [...entries].sort((a, b) => compareCards(a.card, b.card));
+  return [...entries].sort((a, b) => compareDeckCards(a.card, b.card));
 }
 
 export interface DeckEntry {
@@ -97,6 +133,7 @@ interface DeckStore {
   filterCost: number | null;   // 费用筛选，null = 全部
   filterSets: string[];        // 弹数（卡集）筛选，空数组 = 显示全部
   filterShowSub1: boolean;     // 是否显示角标=1 的卡（默认 false 隐藏）
+  filterHasTrigger: boolean;   // 是否只显示拥有【触发】效果的卡
   gridColumns: number;
 
   setFormat: (f: DeckFormat) => void;
@@ -114,6 +151,7 @@ interface DeckStore {
   toggleFilterSet: (set: string) => void;
   clearFilterSets: () => void;
   setFilterShowSub1: (v: boolean) => void;
+  setFilterHasTrigger: (v: boolean) => void;
   setGridColumns: (n: number) => void;
   clearDeck: () => void;
 
@@ -125,6 +163,9 @@ interface DeckStore {
 }
 
 function isCardAllowedInFormat(card: CardData, format: DeckFormat, isLeader: boolean): { ok: boolean; reason?: string } {
+  if (card.playability === "pending") {
+    return { ok: false, reason: `卡牌效果开发中，暂不可用于对战：${card.number}` };
+  }
   const rule = FORMAT_RULES[format];
   const set = setCodeOf(card);
   const whitelist = isLeader ? rule.leaderSetWhitelist : rule.mainSetWhitelist;
@@ -147,6 +188,7 @@ export const useDeckStore = create<DeckStore>((set, get) => ({
   filterCost: null,
   filterSets: [],
   filterShowSub1: false,
+  filterHasTrigger: false,
   gridColumns: 8,
 
   setFormat: (f) => {
@@ -208,20 +250,22 @@ export const useDeckStore = create<DeckStore>((set, get) => ({
       return;
     }
     set((s) => {
+      const compatible = (entry: DeckEntry) =>
+        colorMatch(card.color, entry.card.color) && isCardAllowedByLeaderRule(card, entry.card).ok;
       const removed = s.entries.reduce(
-        (sum, e) => (!colorMatch(card.color, e.card.color) ? sum + e.count : sum),
-        0
+        (sum, entry) => (!compatible(entry) ? sum + entry.count : sum),
+        0,
       );
-      const entries = s.entries.filter((e) => colorMatch(card.color, e.card.color));
+      const entries = s.entries.filter(compatible);
       // 颜色筛选自动收缩为领航颜色：单色直接选中该色，双色置「全部」（两色都显示，可再按需多选）
-      const leaderColors = card.color.split("/");
+      const leaderColors = parseCardColors(card.color);
       const filterColors = leaderColors.length === 1 ? leaderColors : [];
       return {
         leader: card,
         entries,
         filterColors,
         notice: removed > 0
-          ? { message: `已自动移除 ${removed} 张颜色不符的卡牌`, type: "info" as const }
+          ? { message: `已自动移除 ${removed} 张颜色或领航规则不符的卡牌`, type: "info" as const }
           : null,
       };
     });
@@ -240,6 +284,10 @@ export const useDeckStore = create<DeckStore>((set, get) => ({
       }
       if (s.leader && !colorMatch(s.leader.color, card.color)) {
         return { notice: { message: "无法加入卡组：颜色与领航卡不符", type: "error" as const } };
+      }
+      const leaderRule = isCardAllowedByLeaderRule(s.leader, card);
+      if (!leaderRule.ok) {
+        return { notice: { message: leaderRule.reason!, type: "error" as const } };
       }
       const existing = s.entries.find((e) => e.card.number === card.number);
       if (existing) {
@@ -288,6 +336,7 @@ export const useDeckStore = create<DeckStore>((set, get) => ({
     })),
   clearFilterSets: () => set({ filterSets: [] }),
   setFilterShowSub1: (v) => set({ filterShowSub1: v }),
+  setFilterHasTrigger: (v) => set({ filterHasTrigger: v }),
   setGridColumns: (n) => {
     const clamped = Math.min(MAX_COLS, Math.max(MIN_COLS, n));
     if (typeof window !== "undefined")
@@ -304,16 +353,22 @@ export const useDeckStore = create<DeckStore>((set, get) => ({
     const s = get();
     const rule = FORMAT_RULES[s.format];
     if (!s.leader) return { ok: false, reason: "请先选择领航卡" };
+    const leaderAvailability = isCardAllowedInFormat(s.leader, s.format, true);
+    if (!leaderAvailability.ok) return leaderAvailability;
     if (s.totalCards() !== rule.mainSize)
       return { ok: false, reason: `主卡组应为 ${rule.mainSize} 张（当前 ${s.totalCards()}）` };
     // 颜色一致性 + 卡集白名单已在 add 时校验，这里二次复检
     for (const e of s.entries) {
+      const availability = isCardAllowedInFormat(e.card, s.format, false);
+      if (!availability.ok) return availability;
       if (rule.mainSetWhitelist && !rule.mainSetWhitelist.includes(setCodeOf(e.card))) {
         return { ok: false, reason: `卡牌 ${e.card.number} 不属于 ${rule.label}` };
       }
       if (!colorMatch(s.leader.color, e.card.color)) {
         return { ok: false, reason: `卡牌 ${e.card.number} 颜色与领航不符` };
       }
+      const leaderRule = isCardAllowedByLeaderRule(s.leader, e.card);
+      if (!leaderRule.ok) return leaderRule;
     }
     return { ok: true };
   },

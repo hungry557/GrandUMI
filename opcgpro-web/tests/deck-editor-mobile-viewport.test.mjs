@@ -6,7 +6,7 @@ const readSource = (path) => readFile(new URL(path, import.meta.url), "utf8");
 
 test("卡组编辑器使用动态视口高度", async () => {
   const source = await readSource("../src/app/deck-editor/page.tsx");
-  const dynamicViewportContainers = source.match(/style=\{\{ height: "100dvh" \}\}/g) ?? [];
+  const dynamicViewportContainers = source.match(/height: "100dvh"/g) ?? [];
 
   assert.equal(dynamicViewportContainers.length, 3, "加载、错误和编辑状态均应以内联动态视口高度覆盖 h-screen 回退");
   assert.doesNotMatch(source, /h-screen h-\[100dvh\]/, "不得依赖 Tailwind 工具类生成顺序覆盖静态视口高度");
@@ -42,5 +42,16 @@ test("桌面端仍保持筛选、牌池、卡组三栏布局", async () => {
   assert.ok(deckPanel);
   assert.match(searchPanel[1], /md:static md:flex md:w-48/);
   assert.match(cardPool[1], /md:block/);
-  assert.match(deckPanel[1], /md:block md:w-80/);
+  assert.match(deckPanel[1], /md:block md:w-96/);
+});
+
+test("手机端底部主要操作按钮满足最小触控尺寸", async () => {
+  const source = await readSource("../src/components/deck-editor/DeckInfoPanel.tsx");
+  const exportButton = source.match(/onClick=\{handleImageExport\}[\s\S]*?className=\{`([^`]+)`\}/);
+  const saveButton = source.match(/onClick=\{handleSave\}[\s\S]*?className=\{`([^`]+)`\}/);
+
+  assert.ok(exportButton, "应找到一图流导出按钮");
+  assert.ok(saveButton, "应找到保存卡组按钮");
+  assert.match(exportButton[1], /\bmin-h-11\b/);
+  assert.match(saveButton[1], /\bmin-h-11\b/);
 });

@@ -13,15 +13,36 @@ import type {
   MsgPlayerReconnected,
   MsgDuelOver,
   MsgActionRejected,
+  MsgGameRecoveryPaused,
   MsgGameChat,
   MsgFriendChat,
   MsgSpectatorList,
+  MsgSpectatorHandRequest,
+  MsgSpectatorHandStatus,
+  MsgSpectatorHandResponse,
+  MsgKickSpectator,
+  MsgSpectatorKicked,
+  MsgRulesetUpdated,
 } from "@/types/net";
 import { useGameStore } from "@/store/gameStore";
 import { useNetStore } from "@/store/netStore";
 import { matchRecorder } from "@/data/matchRecorder";
-import { completePendingActionLatency, completeRejectedActionLatency } from "./GameRequest";
+import {
+  completePendingActionLatency,
+  completeRejectedActionLatency,
+} from "./GameRequest";
 import { showMessage } from "@/components/ui/MessageBox";
+
+type GameChatWire = MsgGameChat & {
+  displaySide?: "self" | "opponent" | null;
+  sentAt?: number;
+};
+
+type ChatDecorationSendResultWire = MsgBase & {
+  proto: "MsgChatDecorationSend";
+  result?: boolean;
+  logStr?: string | null;
+};
 
 let registered = false;
 
@@ -34,7 +55,10 @@ export function registerGameProtocols() {
       case "MsgGameState": {
         const gs = msg as MsgGameState;
         completePendingActionLatency(gs.requestId, gs.tick ?? 0);
-        useGameStore.getState().syncFromServer(gs);
+        useGameStore.getState().syncFromServer(
+          gs,
+          useNetStore.getState().connectionEpoch,
+        );
         // 本地录制对局快照流（仅玩家视角；观战不记）→ 供首页战绩/回放
         matchRecorder.onSnapshot(gs);
         // 重启恢复/刷新后：若收到己方对局快照（非观战、未结束）但当前不在 /game，
@@ -59,6 +83,18 @@ export function registerGameProtocols() {
         console.warn("[GameProtocol] action rejected:", (msg as MsgActionRejected).reason);
         break;
 
+      case "MsgGameRecoveryPaused": {
+        const paused = msg as MsgGameRecoveryPaused;
+        useGameStore.getState().rollbackOptimistic();
+        useGameStore.getState().setPending(false);
+        showMessage(
+          paused.message || "恢复存储暂时不可用，对局已安全暂停，请稍后重新连接。",
+          "error",
+        );
+        console.error("[GameProtocol] recovery paused:", paused.roomId, paused.reason);
+        break;
+      }
+
       case "MsgPlayerDisconnected":
         eventBus.emit("opponentDisconnected", {
           gracePeriodSeconds: (msg as MsgPlayerDisconnected).gracePeriodSeconds,
@@ -69,18 +105,43 @@ export function registerGameProtocols() {
         eventBus.emit("opponentReconnected");
         break;
 
-      case "MsgDuelOver":
-        useGameStore.getState().setPending(false);
+      case "MsgRulesetUpdated": {
+        const update = msg as MsgRulesetUpdated;
+        const changedCards = update.changedCards?.length
+          ? `（涉及 ${update.changedCards.join("、")}）`
+          : "";
+        showMessage(
+          `${update.logStr ?? "卡牌效果已更新，将从下一局开始生效"}${changedCards}`,
+          "info",
+        );
+        break;
+      }
+
+      case "MsgDuelOver": {
+        const duelOver = msg as MsgDuelOver;
+        useGameStore.getState().finishFromDuelOver(
+          duelOver.IsWin,
+          duelOver.Description,
+        );
         useNetStore.getState().setMatchState("idle");
         useNetStore.getState().setOpponentName("");
         eventBus.emit("duelOver", {
-          isWin: (msg as MsgDuelOver).IsWin,
-          description: (msg as MsgDuelOver).Description,
+          isWin: duelOver.IsWin,
+          description: duelOver.Description,
         });
         break;
+      }
+
+      case "MsgChatDecorationSend": {
+        const response = msg as ChatDecorationSendResultWire;
+        if (response.result === false) {
+          showMessage(response.logStr?.trim() || "聊天装饰发送失败，请稍后重试。", "error");
+        }
+        break;
+      }
 
       case "MsgGameChat": {
-        const m = msg as MsgGameChat;
+        const m = msg as GameChatWire;
         eventBus.emit("gameChat", {
           text: m.text ?? "",
           code: m.code ?? null,
@@ -88,6 +149,8 @@ export function registerGameProtocols() {
           fromAccount: m.fromAccount,
           fromName: m.fromName ?? "玩家",
           fromRole: m.fromRole ?? "spectator",
+          displaySide: m.displaySide ?? null,
+          sentAt: m.sentAt,
         });
         break;
       }
@@ -111,9 +174,57 @@ export function registerGameProtocols() {
         break;
       }
 
-      case "MsgSpectatorList":
-        useGameStore.getState().setSpectatorNames((msg as MsgSpectatorList).spectators ?? []);
+      case "MsgSpectatorList": {
+        const spectatorList = msg as MsgSpectatorList;
+        useGameStore.getState().setSpectatorNames(spectatorList.spectators ?? []);
+        useGameStore.getState().setSpectatorDetails(spectatorList.details ?? []);
         break;
+      }
+
+      case "MsgSpectatorHandRequest": {
+        const request = msg as MsgSpectatorHandRequest;
+        useGameStore.getState().addSpectatorHandRequest(request);
+        showMessage(`${request.spectatorName} 申请查看你的手牌`, "info");
+        break;
+      }
+
+      case "MsgSpectatorHandStatus": {
+        const status = msg as MsgSpectatorHandStatus;
+        if (status.status === "pending") {
+          useGameStore.getState().setObserverHandRequestStatus("pending");
+        } else if (status.status === "approved") {
+          useGameStore.getState().setObserverHandRequestStatus("idle");
+        } else {
+          useGameStore.getState().setObserverHandRequestStatus(
+            status.retryAfterMs ? "cooldown" : "idle",
+            status.retryAfterMs ? Date.now() + status.retryAfterMs : 0,
+          );
+        }
+        if (status.logStr) showMessage(status.logStr, status.status === "denied" ? "error" : "info");
+        break;
+      }
+
+      case "MsgSpectatorHandResponse": {
+        const response = msg as MsgSpectatorHandResponse;
+        if (response.requestId) useGameStore.getState().removeSpectatorHandRequest(response.requestId);
+        if (response.result === false) showMessage(response.logStr ?? "手牌申请处理失败", "error");
+        break;
+      }
+
+      case "MsgKickSpectator": {
+        const response = msg as MsgKickSpectator;
+        if (response.result === false) showMessage(response.logStr ?? "移出观战者失败", "error");
+        break;
+      }
+
+      case "MsgSpectatorKicked": {
+        const kicked = msg as MsgSpectatorKicked;
+        useNetStore.getState().setSpectate("idle");
+        useGameStore.getState().resetGame();
+        useNetStore.getState().setNavigateTo("/home");
+        showMessage(kicked.logStr ?? "你已被移出观战", "error");
+        break;
+      }
     }
   });
 

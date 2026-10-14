@@ -33,7 +33,7 @@ public class OP10_114_XDrake : IScriptedEffect
         if (me.LifeCount > opp.LifeCount) return;
 
         // 收益候选：对方费用≤4 的活跃/任意角色
-        var cands = opp.Characters.Where(c => c.Info.Cost <= 4).ToList();
+        var cands = opp.Characters.Where(c => ctx.State.CurrentCostOf(c) <= 4).ToList();
         if (cands.Count == 0) return;
 
         bool use = await ctx.Prompts.ConfirmOptional(ctx.OwnerIndex,
@@ -41,7 +41,7 @@ public class OP10_114_XDrake : IScriptedEffect
         if (!use) return;
 
         // 支付成本：横置自身
-        AtomicOps.RestCard(self);
+        if (!AtomicOps.RestCard(self)) return;
 
         // 收益：横置对方最多 1 张费用≤4 的角色
         var chosen = await ctx.Prompts.ChooseCards(ctx.OwnerIndex, "OpponentCharacter",

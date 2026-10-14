@@ -1,5 +1,10 @@
 import { eventBus, type ConnectionState } from "./eventBus";
+import { EndpointPreferences } from "./endpointPreference";
 import type { MsgBase, MsgGameState, MsgGameStateDelta, MsgPing, MsgRequestState } from "@/types/net";
+import {
+  DEFAULT_SESSION_REPLACED_NOTICE,
+  SESSION_REPLACED_CLOSE_CODE,
+} from "./sessionReplacement";
 
 // 客户端版本号，与服务器 MsgSecret 握手时校验
 export const CLIENT_VERSION = "0.999";
@@ -8,6 +13,12 @@ export const CLIENT_VERSION = "0.999";
 const DEFAULT_WS_URL = "ws://localhost:8080/ws";
 
 export interface NetworkDiagnostics {
+  endpointHost: string;
+  connectionGeneration: number;
+  handshakeMs: number | null;
+  reconnectCount: number;
+  endpointFailureCount: number;
+  lastDisconnectReason: string | null;
   rttMs: number | null;
   rttP95Ms: number | null;
   parseMaxMs: number;
@@ -20,20 +31,44 @@ export interface NetworkDiagnostics {
   fullStateCount: number;
 }
 
+interface EndpointHealth {
+  consecutiveFailures: number;
+  totalFailures: number;
+  circuitOpenUntil: number;
+  lastSuccessAt: number;
+}
+
 class NetManagerClass {
   private ws: WebSocket | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectCountdownTimer: ReturnType<typeof setInterval> | null = null;
+  private connectionTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   private msgQueue: MsgBase[] = [];
   private isProcessing = false;
   private _state: ConnectionState = "disconnected";
   private url = DEFAULT_WS_URL;
+  private endpoints = [DEFAULT_WS_URL];
+  private endpointIndex = 0;
+  private endpointFailuresInCycle = 0;
+  private endpointHealth = new Map<string, EndpointHealth>();
+  private endpointPreferences = new EndpointPreferences();
+  private connectionStartedAt = 0;
+  private handshakeMs: number | null = null;
+  private reconnectCount = 0;
+  private lastDisconnectReason: string | null = null;
+  private rttReportedGeneration = 0;
 
   // 重连参数
   private reconnectAttempts = 0;
   private readonly RECONNECT_BASE_DELAY = 1500; // ms
   private readonly RECONNECT_MAX_DELAY = 5000; // 赛前房保留 30 秒，重试间隔不能膨胀到窗口之外
+  private readonly CONNECTION_TIMEOUT_MS = 5_000;
+  // 正式服首选直连通常数百毫秒即可完成握手。它发生故障时应尽快切到备用线路，
+  // 不能让玩家每轮都先被坏线路完整阻塞五秒。
+  private readonly FALLBACK_SWITCH_TIMEOUT_MS = 1_500;
+  private readonly CIRCUIT_FAILURE_THRESHOLD = 2;
+  private readonly CIRCUIT_OPEN_MS = 45_000;
   /// 标记重连：握手完成后会自动触发 reconnected 事件，由 NetProvider 决定是否重新登录 + 请求状态
   private wasConnectedBefore = false;
   private manualClose = false;
@@ -43,6 +78,7 @@ class NetManagerClass {
   private pingSequence = 0;
   private pendingPings = new Map<string, number>();
   private rttSamples: number[] = [];
+  private endpointRttSamples: number[] = [];
   private actionLatencySamples: number[] = [];
   private parseMaxMs = 0;
   private handlerMaxMs = 0;
@@ -66,7 +102,14 @@ class NetManagerClass {
   }
 
   getDiagnostics(): NetworkDiagnostics {
+    const health = this.getEndpointHealth(this.url);
     return {
+      endpointHost: endpointHost(this.url),
+      connectionGeneration: this.socketGeneration,
+      handshakeMs: this.handshakeMs,
+      reconnectCount: this.reconnectCount,
+      endpointFailureCount: health.totalFailures,
+      lastDisconnectReason: this.lastDisconnectReason,
       rttMs: this.rttSamples.at(-1) ?? null,
       rttP95Ms: percentile(this.rttSamples, 0.95),
       parseMaxMs: this.parseMaxMs,
@@ -90,15 +133,70 @@ class NetManagerClass {
     this.deltaResyncRequested = false;
   }
 
-  connect(url: string = DEFAULT_WS_URL) {
+  connect(url: string | readonly string[] = DEFAULT_WS_URL) {
     if (["connecting", "handshaking", "connected", "reconnecting", "recovering"].includes(this._state)) {
       return;
     }
-    this.url = url;
+    this.endpoints = this.rankEndpoints(normalizeEndpoints(url));
+    this.endpointIndex = 0;
+    this.endpointFailuresInCycle = 0;
+    this.url = this.endpoints[0];
     this.manualClose = false;
     this.reconnectAttempts = 0;
     this.clearTimers();
-    this.openSocket(url);
+    this.openSocket(this.url);
+  }
+
+  /**
+   * 跳过当前等待并立即换一条线路重试。
+   * 用于浏览器恢复联网以及玩家主动重试；旧连接通过 generation 失效，
+   * 它随后触发的 close/error 不会再启动第二套重连计时器。
+   */
+  retryNow(url?: string | readonly string[]) {
+    const socketUsable = this.ws?.readyState === WebSocket.OPEN;
+    if (socketUsable && (this._state === "connected" || this._state === "recovering")) return;
+    this.restartConnectionNow(url, "立即切换线路重连");
+  }
+
+  /**
+   * 操作发送失败说明连接状态与真实 WebSocket 已不一致，不能继续停留在“已连接”。
+   * 此入口强制废弃旧 generation，并只启动一套新的恢复流程。
+   */
+  recoverAfterSendFailure(url?: string | readonly string[]) {
+    if (["connecting", "handshaking", "reconnecting", "recovering"].includes(this._state)) return;
+    this.restartConnectionNow(url, "操作发送失败，立即切换线路重连");
+  }
+
+  private restartConnectionNow(
+    url: string | readonly string[] | undefined,
+    closeReason: string,
+  ) {
+    if (url !== undefined) this.endpoints = this.rankEndpoints(normalizeEndpoints(url));
+    this.endpointIndex = this.endpoints.indexOf(this.url);
+
+    this.clearTimers();
+    const socket = this.ws;
+    this.ws = null;
+    this.socketGeneration++;
+    this.stateBaseline = null;
+    this.deltaResyncRequested = false;
+    this.pendingPings.clear();
+    this.lastDisconnectReason = closeReason;
+    if (this.wasConnectedBefore && !this.lossNotified) {
+      this.lossNotified = true;
+      eventBus.emit("close");
+    }
+    try {
+      socket?.close(4002, closeReason);
+    } catch {
+      // 浏览器可能已经回收异常连接；继续建立新连接即可。
+    }
+
+    this.manualClose = false;
+    this.endpointFailuresInCycle = 0;
+    this.endpointIndex = (this.endpointIndex + 1) % this.endpoints.length;
+    this.url = this.endpoints[this.endpointIndex];
+    this.openSocket(this.url);
   }
 
   private openSocket(url: string) {
@@ -106,6 +204,7 @@ class NetManagerClass {
     this.setState(isReconnectAttempt ? "reconnecting" : "connecting");
 
     const generation = ++this.socketGeneration;
+    this.connectionStartedAt = now();
     this.resetConnectionMeasurements();
     let socket: WebSocket;
 
@@ -117,6 +216,8 @@ class NetManagerClass {
       return;
     }
 
+    this.startConnectionTimeout(socket, generation);
+
     socket.onopen = () => {
       if (!this.isCurrentSocket(socket, generation)) return;
       this.setState(isReconnectAttempt ? "recovering" : "handshaking");
@@ -125,15 +226,22 @@ class NetManagerClass {
         proto: "MsgSecret",
         vesion: CLIENT_VERSION,
         supportsStateDelta: true,
+        supportsOpeningPreparation: true,
       } as MsgBase);
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       if (!this.isCurrentSocket(socket, generation)) return;
       this.ws = null;
+      this.clearConnectionTimeout();
       this.stopHeartbeat();
       this.stateBaseline = null;
       this.pendingPings.clear();
+      this.lastDisconnectReason = event.reason || `WebSocket ${event.code}`;
+      if (event.code === SESSION_REPLACED_CLOSE_CODE) {
+        this.stopForSessionReplacement(event.reason);
+        return;
+      }
       if (this.manualClose) {
         this.setState("disconnected");
         return;
@@ -143,7 +251,7 @@ class NetManagerClass {
         this.lossNotified = true;
         eventBus.emit("close");
       }
-      this.scheduleReconnect();
+      this.onConnectionFailed();
     };
 
     socket.onerror = () => {
@@ -180,6 +288,14 @@ class NetManagerClass {
   }
 
   private onMessage(msg: MsgBase) {
+    if (msg.proto === "MsgSessionReplaced") {
+      this.stopForSessionReplacement(
+        (msg as { reason?: string; logStr?: string }).reason
+          ?? (msg as { logStr?: string }).logStr,
+      );
+      return;
+    }
+
     // 心跳回包：直接处理，不入队
     if (msg.proto === "MsgPing") {
       this.lastPongAt = Date.now();
@@ -190,6 +306,14 @@ class NetManagerClass {
         if (startedAt !== undefined) {
           const rtt = now() - startedAt;
           pushBounded(this.rttSamples, rtt);
+          if (typeof document === "undefined" || document.visibilityState === "visible") {
+            pushBounded(this.endpointRttSamples, rtt);
+            this.endpointPreferences.recordRtt(this.url, percentile(this.endpointRttSamples.slice(-5), 0.5) ?? rtt);
+          }
+          if (this.rttReportedGeneration !== this.socketGeneration) {
+            this.rttReportedGeneration = this.socketGeneration;
+            this.reportNetworkDiagnostics();
+          }
           if (rtt >= 80) console.info(`[延迟] WebSocket RTT ${rtt.toFixed(1)}ms`);
         }
       }
@@ -199,7 +323,12 @@ class NetManagerClass {
     // 握手回包：更新状态后继续分发
     if (msg.proto === "MsgSecret") {
       if (this._state === "handshaking" || this._state === "recovering") {
+        this.clearConnectionTimeout();
+        this.endpointFailuresInCycle = 0;
         const isReconnect = this.wasConnectedBefore;
+        this.handshakeMs = Math.max(0, now() - this.connectionStartedAt);
+        this.markEndpointSuccess(this.url);
+        if (isReconnect) this.reconnectCount++;
         this.reconnectAttempts = 0;
         this.wasConnectedBefore = true;
         this.lossNotified = false;
@@ -209,6 +338,7 @@ class NetManagerClass {
         this.setState(isReconnect ? "recovering" : "connected");
         eventBus.emit("connectSucc");
         if (isReconnect) eventBus.emit("reconnected");
+        this.reportNetworkDiagnostics();
       }
     }
 
@@ -263,10 +393,26 @@ class NetManagerClass {
     if (this._state === "recovering") this.setState("connected");
   }
 
+  /** 浏览器从后台或休眠恢复时立即验证当前连接，坏连接不再等待下一轮定时心跳。 */
+  handleForegroundResume(url?: string | readonly string[]) {
+    if (url !== undefined) this.endpoints = this.rankEndpoints(normalizeEndpoints(url));
+    const socket = this.ws;
+    if (socket?.readyState === WebSocket.OPEN && this.isConnected) {
+      if (Date.now() - this.lastPongAt > 20_000) {
+        socket.close(4003, "页面恢复时心跳已过期");
+      } else {
+        this.sendHeartbeat(socket);
+      }
+      return;
+    }
+    this.retryNow(this.endpoints);
+  }
+
   disconnect() {
     this.clearTimers();
     this.manualClose = true;
     this.reconnectAttempts = 0;
+    this.endpointFailuresInCycle = 0;
     this.wasConnectedBefore = false;
     const socket = this.ws;
     this.ws = null;
@@ -277,18 +423,70 @@ class NetManagerClass {
     this.setState("disconnected");
   }
 
+  private stopForSessionReplacement(reason?: string | null) {
+    const notice = reason?.trim() || DEFAULT_SESSION_REPLACED_NOTICE;
+    this.clearTimers();
+    this.manualClose = true;
+    this.reconnectAttempts = 0;
+    this.endpointFailuresInCycle = 0;
+    this.wasConnectedBefore = false;
+    const socket = this.ws;
+    this.ws = null;
+    this.socketGeneration++;
+    this.stateBaseline = null;
+    this.pendingPings.clear();
+    try { socket?.close(1000, "会话已被新登录替代"); } catch { /* 关闭帧可能已经由服务端发出。 */ }
+    this.setState("disconnected");
+    eventBus.emit("sessionReplaced", { reason: notice });
+  }
+
   private onConnectionFailed() {
+    this.markEndpointFailure(this.url);
     eventBus.emit("connectFail");
+    if (this.endpointFailuresInCycle < this.endpoints.length - 1) {
+      this.endpointFailuresInCycle++;
+      this.endpointIndex = this.findNextEndpointIndex();
+      this.url = this.endpoints[this.endpointIndex];
+      console.warn(`[NetManager] 当前线路不可用，切换备用线路：${this.url}`);
+      this.openSocket(this.url);
+      return;
+    }
+
+    this.endpointFailuresInCycle = 0;
+    this.endpointIndex = this.findNextEndpointIndex();
+    this.url = this.endpoints[this.endpointIndex];
     this.scheduleReconnect();
+  }
+
+  private startConnectionTimeout(socket: WebSocket, generation: number) {
+    this.clearConnectionTimeout();
+    const hasUnusedFallback = this.endpointFailuresInCycle < this.endpoints.length - 1;
+    const timeoutMs = hasUnusedFallback
+      ? this.FALLBACK_SWITCH_TIMEOUT_MS
+      : this.CONNECTION_TIMEOUT_MS;
+    this.connectionTimeoutTimer = setTimeout(() => {
+      if (!this.isCurrentSocket(socket, generation)) return;
+      console.warn(`[NetManager] 连接握手超时，准备切换线路：${this.url}`);
+      this.ws = null;
+      this.socketGeneration++;
+      this.connectionTimeoutTimer = null;
+      try {
+        socket.close(4001, "连接握手超时");
+      } finally {
+        this.onConnectionFailed();
+      }
+    }, timeoutMs);
   }
 
   private scheduleReconnect() {
     this.clearReconnectTimers();
     // 持续重试并封顶间隔，避免网络在房间宽限期内恢复后，客户端却因长退避或停止重试而必须刷新。
-    const delay = Math.min(
+    const baseDelay = Math.min(
       this.RECONNECT_BASE_DELAY * Math.pow(2, Math.min(this.reconnectAttempts, 8)),
       this.RECONNECT_MAX_DELAY,
     );
+    // 加入抖动，避免入口短暂恢复时大量玩家在同一毫秒重连形成惊群。
+    const delay = Math.round(baseDelay * (0.75 + Math.random() * 0.5));
     this.reconnectAttempts++;
     console.log(`[NetManager] ${delay / 1000}s 后尝试第 ${this.reconnectAttempts} 次重连`);
     this.setState("reconnecting");
@@ -310,6 +508,7 @@ class NetManagerClass {
     this.stopHeartbeat();
     const socket = this.ws;
     if (!socket) return;
+    this.sendHeartbeat(socket);
     this.pingTimer = setInterval(() => {
       if (this.ws !== socket || socket.readyState !== WebSocket.OPEN) return;
       if (Date.now() - this.lastPongAt > 30_000) {
@@ -317,15 +516,85 @@ class NetManagerClass {
         socket.close(4000, "心跳超时");
         return;
       }
-      const id = `${this.socketGeneration}-${++this.pingSequence}`;
-      const sentAt = now();
-      if (this.sendOn(socket, { proto: "MsgPing", id } as MsgPing)) {
-        this.pendingPings.set(id, sentAt);
-        for (const [pendingId, pendingAt] of this.pendingPings) {
-          if (sentAt - pendingAt > 30_000) this.pendingPings.delete(pendingId);
-        }
-      }
+      this.sendHeartbeat(socket);
     }, 10_000);
+  }
+
+  private sendHeartbeat(socket: WebSocket) {
+    if (this.ws !== socket || socket.readyState !== WebSocket.OPEN) return;
+    const id = `${this.socketGeneration}-${++this.pingSequence}`;
+    const sentAt = now();
+    if (this.sendOn(socket, { proto: "MsgPing", id } as MsgPing)) {
+      this.pendingPings.set(id, sentAt);
+      for (const [pendingId, pendingAt] of this.pendingPings) {
+        if (sentAt - pendingAt > 30_000) this.pendingPings.delete(pendingId);
+      }
+    }
+  }
+
+  private getEndpointHealth(url: string): EndpointHealth {
+    let health = this.endpointHealth.get(url);
+    if (!health) {
+      health = { consecutiveFailures: 0, totalFailures: 0, circuitOpenUntil: 0, lastSuccessAt: 0 };
+      this.endpointHealth.set(url, health);
+    }
+    return health;
+  }
+
+  private markEndpointFailure(url: string) {
+    const health = this.getEndpointHealth(url);
+    health.consecutiveFailures++;
+    health.totalFailures++;
+    if (health.consecutiveFailures >= this.CIRCUIT_FAILURE_THRESHOLD) {
+      health.circuitOpenUntil = Date.now() + this.CIRCUIT_OPEN_MS;
+    }
+  }
+
+  private markEndpointSuccess(url: string) {
+    const health = this.getEndpointHealth(url);
+    health.consecutiveFailures = 0;
+    health.circuitOpenUntil = 0;
+    health.lastSuccessAt = Date.now();
+    this.endpointPreferences.recordSuccess(url);
+  }
+
+  private rankEndpoints(endpoints: string[]): string[] {
+    const ranked = this.endpointPreferences.rank(endpoints);
+    return [...ranked].sort((a, b) => {
+      const aOpen = this.getEndpointHealth(a).circuitOpenUntil > Date.now() ? 1 : 0;
+      const bOpen = this.getEndpointHealth(b).circuitOpenUntil > Date.now() ? 1 : 0;
+      if (aOpen !== bOpen) return aOpen - bOpen;
+      return ranked.indexOf(a) - ranked.indexOf(b);
+    });
+  }
+
+  private findNextEndpointIndex(): number {
+    const nowMs = Date.now();
+    for (let offset = 1; offset <= this.endpoints.length; offset++) {
+      const candidate = (this.endpointIndex + offset) % this.endpoints.length;
+      if (this.getEndpointHealth(this.endpoints[candidate]).circuitOpenUntil <= nowMs) return candidate;
+    }
+    // 全部熔断时仍选择最早允许半开探测的一条，避免永久停止恢复。
+    let best = 0;
+    for (let index = 1; index < this.endpoints.length; index++) {
+      if (this.getEndpointHealth(this.endpoints[index]).circuitOpenUntil
+          < this.getEndpointHealth(this.endpoints[best]).circuitOpenUntil) best = index;
+    }
+    return best;
+  }
+
+  private reportNetworkDiagnostics() {
+    const diagnostics = this.getDiagnostics();
+    this.send({
+      proto: "MsgNetworkDiagnostics",
+      endpointHost: diagnostics.endpointHost,
+      handshakeMs: diagnostics.handshakeMs,
+      rttMs: diagnostics.rttMs,
+      rttP95Ms: diagnostics.rttP95Ms,
+      reconnectCount: diagnostics.reconnectCount,
+      endpointFailureCount: diagnostics.endpointFailureCount,
+      lastDisconnectReason: diagnostics.lastDisconnectReason?.slice(0, 120) ?? null,
+    } as MsgBase);
   }
 
   private stopHeartbeat() {
@@ -336,8 +605,16 @@ class NetManagerClass {
   }
 
   private clearTimers() {
+    this.clearConnectionTimeout();
     this.stopHeartbeat();
     this.clearReconnectTimers();
+  }
+
+  private clearConnectionTimeout() {
+    if (this.connectionTimeoutTimer) {
+      clearTimeout(this.connectionTimeoutTimer);
+      this.connectionTimeoutTimer = null;
+    }
   }
 
   private clearReconnectTimers() {
@@ -390,10 +667,20 @@ class NetManagerClass {
     this.stateDeltaEnabled = false;
     this.pendingPings.clear();
     this.pingSequence = 0;
+    this.endpointRttSamples = [];
   }
 }
 
 export const NetManager = new NetManagerClass();
+
+function normalizeEndpoints(url: string | readonly string[]): string[] {
+  const endpoints = (typeof url === "string" ? [url] : url).filter(Boolean);
+  return [...new Set(endpoints.length > 0 ? endpoints : [DEFAULT_WS_URL])];
+}
+
+function endpointHost(raw: string): string {
+  try { return new URL(raw).host; } catch { return "unknown"; }
+}
 
 function now(): number {
   return typeof performance === "undefined" ? Date.now() : performance.now();

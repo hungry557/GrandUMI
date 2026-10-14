@@ -70,6 +70,9 @@ const ABILITY_OVERRIDES = new Map([
   ['OP12-036', ['无法通过效果登场']],
   ['OP04-001', ['此角色无法攻击']],
   ['OP04-039', ['此角色无法攻击']],
+  // 运行时用同一个基础限制表示“此卡无法攻击”，不区分领袖/角色。
+  // OP11-022 的原文使用“此领袖无法进行攻击”，不命中上面的角色通用句式。
+  ['OP11-022', ['此角色无法攻击']],
 ])
 
 const ALSO_NAME_OVERRIDES = new Map([
@@ -80,6 +83,13 @@ const ALSO_NAME_OVERRIDES = new Map([
 
 // 手写脚本/监听器所需的触发连线。这里只补充，不删除已有人工标签。
 const EFFECT_TAG_OVERRIDES = new Map([
+  ['OP18-017', ['PreKO', 'OnAllyWillBeKOd', 'OnAllyWillLeaveField']],
+  ['OP18-069', ['PreKO', 'OnAllyWillBeKOd']],
+  ['OP18-011', ['OnEnterField']],
+  ['OP18-001', ['OnGameStart', 'OnAnyCharKOd']],
+  ['OP18-041', ['OnAnyCharKOd']],
+  ['OP18-031', ['OnAllyWillLeaveField']],
+  ['EB02-030', ['EventCounter']],
   ['OP12-021', ['OnEnterField']],
   ['OP12-036', ['OnEnterField']],
   ['OP12-072', ['OnDonReturnedToDeck']],
@@ -140,6 +150,10 @@ const EFFECT_TAG_OVERRIDES = new Map([
   ['ST02-001', ['ActivatedMain']],
   ['P-133', ['OnEnterField']],
   ['ST19-004', ['OnEnterField', 'ActivatedMain']],
+  ['OP18-060', ['OnAllyCharEnter']],
+  ['EB05-010', ['OnAnyCharKOd']],
+  ['EB05-052', ['PreDamageToLeader']],
+  ['EB05-061', ['PreKO', 'OnAllyWillBeKOd', 'OnAllyWillLeaveField']],
 ])
 
 function computeEffectTags(text) {
@@ -153,8 +167,9 @@ function computeEffectTags(text) {
 function isDeclaredBaseKeyword(text, keyword) {
   const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const anyKeyword = ABILITY_KEYWORDS.map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
-  const prefix = `(?:【(?:${anyKeyword})】(?:\\s*（[^）]*）)?\\s*)*`
-  return new RegExp(`(^|[。\\r\\n])\\s*${prefix}【${escaped}】(?=\\s*(?:（|【|$))`).test(text)
+  const annotation = '(?:（[^）]*）|\\([^)]*\\))'
+  const prefix = `(?:【(?:${anyKeyword})】(?:\\s*${annotation})?\\s*)*`
+  return new RegExp(`(^|[。\\r\\n])\\s*${prefix}【${escaped}】(?=\\s*(?:（|\\(|【|$))`).test(text)
 }
 
 function computeAbilities(text, number) {
@@ -209,7 +224,8 @@ async function processDir(dir, originals) {
   try {
     files = (await readdir(dir)).filter(
       f => f.endsWith('.json')
-        && !['allCards.json', 'imageManifest.json', '_index.json'].includes(f)
+        && !f.startsWith('_')
+        && !['allCards.json', 'imageManifest.json'].includes(f)
         && (SET_FILTER.size === 0 || SET_FILTER.has(f)),
     )
   } catch {
@@ -260,7 +276,8 @@ async function syncRuleMetadata() {
   const publicDir = TARGET_DIRS[1]
   const files = (await readdir(primaryDir)).filter(
     f => f.endsWith('.json')
-      && !['allCards.json', 'imageManifest.json', '_index.json'].includes(f)
+      && !f.startsWith('_')
+      && !['allCards.json', 'imageManifest.json'].includes(f)
       && (SET_FILTER.size === 0 || SET_FILTER.has(f)),
   )
   let changedCards = 0

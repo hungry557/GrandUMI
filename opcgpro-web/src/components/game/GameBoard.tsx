@@ -1,6 +1,10 @@
 "use client";
+import { RANK_AFFILIATION_NAMES, isHunterAffiliation } from "@/lib/rankAffiliation";
+import { SeaNameBadge } from "@/components/ui/HunterIdentity";
+import PlayerName from "@/components/ui/PlayerName";
+import { snapshotSeasonTitle } from "@/lib/seasonTitles";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, type MouseEvent as ReactMouseEvent } from "react";
 import HandArea from "@/components/game/HandArea";
 import FieldArea from "@/components/game/FieldArea";
 import LeaderCard from "@/components/game/LeaderCard";
@@ -19,9 +23,17 @@ import CardZoneTransitionLayer from "@/components/game/CardZoneTransitionLayer";
 import RevealOverlay from "@/components/game/RevealOverlay";
 import GameChatPanel from "@/components/game/GameChatPanel";
 import { useGameStore } from "@/store/gameStore";
+import { elapsedMillisecondsFromServerSync } from "@/lib/serverCountdown.mjs";
 import { useStageScale } from "@/hooks/useStageScale";
 import { CardSizeOverride } from "@/hooks/useResponsive";
 import { PHASE_LABELS } from "@/game/battle/BattlePhase";
+import { LeaderChampionBadge } from "@/components/ui/LeaderChampionBadge";
+import type { PlayerRankIdentitySnapshot, RankFaction } from "@/types/net";
+import { GameRequest } from "@/net/GameRequest";
+import { useLayoutQuarterTurn } from "@/components/ui/ResponsiveScope";
+import TurnExtensionIcon from "@/components/game/TurnExtensionIcon";
+import HexOwnedSlots from "@/components/game/HexOwnedPanel";
+import { LeaderCinematicAnchor } from "@/components/game/GameCinematicLayer";
 
 // 对战页固定设计画布尺寸：内容按此基准布局，整体等比缩放铺满视口
 const STAGE_W = 1280;
@@ -32,28 +44,33 @@ function PlayerMat({
   isObserver,
   isPlayback,
   revealHands,
+  revealObserverHand = false,
 }: {
   side: "my" | "opponent";
   isObserver: boolean;
   isPlayback: boolean;
   revealHands: boolean;
+  revealObserverHand?: boolean;
 }) {
   const isOpponent = side === "opponent";
-  const canShowDon = !isPlayback;
   const leaderStage = (
     <div className="flex items-end justify-center gap-4 md:gap-5">
-      <LeaderCard side={side} />
+      <div className="relative">
+        <LeaderCard side={side} />
+        <LeaderCinematicAnchor side={side === "my" ? "self" : "opponent"} />
+      </div>
       <StageSlot side={side} />
     </div>
   );
-  const donZone = canShowDon ? (
+  // 回放快照同样携带双方费用区与咚卡组数量；保持可见才能完整复盘出牌和贴咚。
+  const donZone = (
     <div className="flex w-full max-w-[32rem] items-center gap-2">
       <DonDeckPile side={side} />
       <div className="min-w-0 flex-1">
         <DonArea side={side} />
       </div>
     </div>
-  ) : null;
+  );
   const fieldZone = (
     <div className="min-w-0 flex-1 self-stretch">
       <FieldArea side={side} />
@@ -102,7 +119,7 @@ function PlayerMat({
           </div>
         ) : (
           <div className="relative -ml-[233px] min-h-0 min-w-0">
-            <HandArea side={side} hidden={isObserver && !revealHands} />
+            <HandArea side={side} hidden={isObserver && !revealHands && !revealObserverHand} />
           </div>
         )}
       </div>
@@ -115,60 +132,18 @@ const TURN_FLOW = ["Reset", "Draw", "Don", "Main", "End"];
 // 战斗子流程（攻击宣言后显示后端真实的 4 个步骤）
 const BATTLE_FLOW = ["Attack", "Block", "Counter", "Damage"];
 const BATTLE_PHASES = new Set(BATTLE_FLOW);
-// #238 每回合倒计时基准秒数（纯前端提示，不判负；后端无权威计时）
-const TURN_SECONDS = 300;
-
-// #238 回合倒计时徽章：每次 turnCount 变化即从 TURN_SECONDS 重新倒数；仅对局中（live）走秒
-function TurnTimer({ turnCount, live }: { turnCount: number; live: boolean }) {
-  const [remain, setRemain] = useState(TURN_SECONDS);
-
-  // 回合切换即重置（turnCount 由后端权威快照驱动，天然与实际回合对齐）
-  useEffect(() => {
-    setRemain(TURN_SECONDS);
-  }, [turnCount]);
-
-  useEffect(() => {
-    if (!live) return;
-    const id = setInterval(() => {
-      setRemain((r) => (r > 0 ? r - 1 : 0));
-    }, 1000);
-    return () => clearInterval(id);
-  }, [live, turnCount]);
-
-  const mm = Math.floor(remain / 60);
-  const ss = remain % 60;
-  const low = remain <= 30;
-  return (
-    <span
-      className={[
-        "shrink-0 rounded-md px-2 py-1 font-mono text-[11px] font-black tabular-nums",
-        low
-          ? "bg-red-500/25 text-red-200 ring-1 ring-red-400/50"
-          : "bg-slate-700/50 text-slate-200 ring-1 ring-white/10",
-      ].join(" ")}
-      title="本回合计时（前端提示，不判负）"
-    >
-      ⏱ {mm}:{ss.toString().padStart(2, "0")}
-    </span>
-  );
-}
 
 function PhaseTrack({
   currentTurn,
   phase,
-  turnCount,
-  live,
 }: {
   currentTurn: boolean;
   phase: string;
-  turnCount: number;
-  live: boolean;
 }) {
   const inBattle = BATTLE_PHASES.has(phase);
   const flow = inBattle ? BATTLE_FLOW : TURN_FLOW;
   return (
     <div className="flex shrink-0 items-center justify-center gap-2 py-0.5">
-      <TurnTimer turnCount={turnCount} live={live} />
       <span
         className={[
           "shrink-0 rounded-md px-2.5 py-1 text-[11px] font-black",
@@ -215,47 +190,202 @@ function LeftRail() {
   );
 }
 
+const RANK_FACTION_NAMES = RANK_AFFILIATION_NAMES;
+
+function rankTierLabel(rank: PlayerRankIdentitySnapshot): string {
+  if (rank.placementGames < rank.placementRequired) {
+    return `定级 ${rank.placementGames}/${rank.placementRequired}`;
+  }
+  return `${rank.tier}${rank.division ? ` ${["", "I", "II", "III"][rank.division]}` : ""}`;
+}
+
+function PlayerRankIdentity({ rank }: { rank?: PlayerRankIdentitySnapshot | null }) {
+  if (!rank) return null;
+  const label = `${RANK_FACTION_NAMES[rank.faction]} · ${rankTierLabel(rank)}`;
+  return (
+    <p
+      className="mt-0.5 truncate text-[10px] font-bold leading-4 text-violet-200"
+      title={label}
+      aria-label={`排位身份：${label}`}
+    >
+      {isHunterAffiliation(rank.faction) ? <><SeaNameBadge sea={rank.faction} /> · {rankTierLabel(rank)}</> : label}
+    </p>
+  );
+}
+
 function RightRail({
   myName,
   opponentName,
+  mySeasonTitle,
+  opponentSeasonTitle,
+  myRankIdentity,
+  opponentRankIdentity,
+  myChampionLeaderNumber,
+  opponentChampionLeaderNumber,
   isObserver,
   isPlayback,
-  onOpenFeedback,
 }: {
   myName: string;
   opponentName: string;
+  mySeasonTitle?: string | null;
+  opponentSeasonTitle?: string | null;
+  myRankIdentity?: PlayerRankIdentitySnapshot | null;
+  opponentRankIdentity?: PlayerRankIdentitySnapshot | null;
+  myChampionLeaderNumber?: string | null;
+  opponentChampionLeaderNumber?: string | null;
   isObserver: boolean;
   isPlayback: boolean;
-  onOpenFeedback?: () => void;
 }) {
+  const matchKind = useGameStore((state) => state.matchKind);
+  const hexState = useGameStore((state) => state.hexState);
+  // 旧快照可能没有 matchKind；只要仍携带海克斯公开状态，就继续展示双方槽位。
+  const showHexSlots = matchKind === "Hex" || hexState?.enabled === true;
+
   return (
-    <aside className="relative z-40 flex h-full min-h-0 w-44 shrink-0 flex-col gap-3">
+    <aside
+      data-game-right-rail
+      className="relative z-40 flex h-full min-h-0 w-52 shrink-0 flex-col gap-3 overflow-x-clip [padding-bottom:var(--layout-safe-bottom,0px)] [padding-right:var(--layout-safe-right,0px)] [padding-top:var(--layout-safe-top,0px)]"
+    >
       <section className="rounded-md border border-sky-200/15 bg-slate-950/65 p-3 shadow-inner shadow-black/30">
-        <p className="text-xs font-black text-slate-300">对手</p>
-        <p className="mt-1 truncate text-sm font-black text-white">{opponentName || "对手"}</p>
+        <div
+          data-player-info-card="opponent"
+          className="relative grid min-h-11 grid-cols-[minmax(0,1fr)_auto] items-start gap-1"
+        >
+          <div className="min-w-0">
+            <p className="text-xs font-black text-slate-300">对手</p>
+            <p className="mt-1 text-sm font-black text-white"><PlayerName name={opponentName || "对手"} seasonTitle={opponentSeasonTitle} /></p>
+            <PlayerRankIdentity rank={opponentRankIdentity} />
+          </div>
+          {showHexSlots && (
+            <HexOwnedSlots side="opponent" label="对方" items={hexState?.opponentOwned ?? []} />
+          )}
+        </div>
+        <LeaderChampionBadge leaderNumber={opponentChampionLeaderNumber} className="mt-1" />
+        <OperationClock side="opponent" allowExtension={false} />
         <div className="my-3 h-px bg-white/10" />
-        <p className="text-xs font-black text-slate-300">我</p>
-        <p className="mt-1 truncate text-sm font-black text-sky-100">{myName || "我"}</p>
+        <div
+          data-player-info-card="my"
+          className="relative grid min-h-11 grid-cols-[minmax(0,1fr)_auto] items-start gap-1"
+        >
+          <div className="min-w-0">
+            <p className="text-xs font-black text-slate-300">我</p>
+            <p className="mt-1 text-sm font-black text-sky-100"><PlayerName name={myName || "我"} seasonTitle={mySeasonTitle} /></p>
+            <PlayerRankIdentity rank={myRankIdentity} />
+          </div>
+          {showHexSlots && (
+            <HexOwnedSlots side="my" label="我方" items={hexState?.myOwned ?? []} />
+          )}
+        </div>
+        <LeaderChampionBadge leaderNumber={myChampionLeaderNumber} className="mt-1" />
+        <OperationClock side="my" allowExtension={!isObserver && !isPlayback} />
       </section>
       <div className="mt-auto flex flex-col gap-3">
         {!isObserver && !isPlayback && (
-          <section className="rounded-md border border-sky-200/15 bg-slate-950/65 p-3 shadow-inner shadow-black/30">
+          <section
+            data-game-actions-panel
+            className="rounded-md border border-sky-200/15 bg-slate-950/65 p-3 shadow-inner shadow-black/30"
+          >
             <h2 className="mb-2 text-xs font-black text-slate-300">操作</h2>
             <GameActions />
           </section>
         )}
-        {onOpenFeedback && (
-          <button
-            type="button"
-            onClick={onOpenFeedback}
-            className="rounded-md border border-amber-300/30 bg-amber-500/10 px-3 py-2 text-left text-xs font-black text-amber-100 transition-colors hover:border-amber-200/60 hover:bg-amber-400/20"
-            aria-label="打开 Bug 和建议反馈（快捷键 F）"
-          >
-            F · 反馈 Bug 和建议
-          </button>
-        )}
       </div>
     </aside>
+  );
+}
+
+function formatOperationTime(milliseconds: number): string {
+  const safe = Math.max(0, milliseconds);
+  const minutes = Math.floor(safe / 60_000);
+  const seconds = Math.floor((safe % 60_000) / 1000);
+  if (safe < 10_000) return `${minutes}:${String(seconds).padStart(2, "0")}.${Math.floor((safe % 1000) / 100)}`;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function monotonicNow(): number {
+  return typeof performance === "undefined" ? 0 : performance.now();
+}
+
+function OperationClock({
+  side,
+  allowExtension,
+}: {
+  side: "my" | "opponent";
+  allowExtension: boolean;
+}) {
+  const rotateQuarterTurn = useLayoutQuarterTurn();
+  const enabled = useGameStore((s) => s.operationClockEnabled);
+  const totalBase = useGameStore((s) => side === "my" ? s.myOperationTimeMs : s.opponentOperationTimeMs);
+  const turnBase = useGameStore((s) => side === "my" ? s.myTurnOperationTimeMs : s.opponentTurnOperationTimeMs);
+  const active = useGameStore((s) => s.operationClockActive);
+  const syncUtc = useGameStore((s) => s.operationClockSyncUtc);
+  const serverNowUtc = useGameStore((s) => s.serverNowUtc);
+  const paused = useGameStore((s) => s.operationClockPaused);
+  const extensionUsed = useGameStore((s) => side === "my" ? s.myTurnExtensionUsed : s.opponentTurnExtensionUsed);
+  const matchKind = useGameStore((s) => s.matchKind);
+  const [anchor, setAnchor] = useState(() => ({ syncUtc, serverNowUtc, receivedAt: monotonicNow() }));
+  const [now, setNow] = useState(() => monotonicNow());
+
+  useEffect(() => {
+    const receivedAt = monotonicNow();
+    setAnchor({ syncUtc, serverNowUtc, receivedAt });
+    setNow(receivedAt);
+  }, [serverNowUtc, syncUtc]);
+
+  useEffect(() => {
+    if (!enabled || active !== side || paused) return;
+    setNow(monotonicNow());
+    const timer = window.setInterval(() => setNow(monotonicNow()), Math.min(totalBase, turnBase) < 12_000 ? 100 : 500);
+    return () => window.clearInterval(timer);
+  }, [active, enabled, paused, side, syncUtc, totalBase, turnBase]);
+
+  if (!enabled) return null;
+  const anchorMatchesSnapshot = anchor.syncUtc === syncUtc && anchor.serverNowUtc === serverNowUtc;
+  const elapsed = active === side && !paused && syncUtc
+    ? elapsedMillisecondsFromServerSync(
+        syncUtc,
+        serverNowUtc,
+        anchorMatchesSnapshot ? now - anchor.receivedAt : 0,
+      )
+    : 0;
+  const totalRemaining = Math.max(0, totalBase - elapsed);
+  const turnRemaining = Math.min(totalRemaining, Math.max(0, turnBase - elapsed));
+  const urgent = Math.min(totalRemaining, turnRemaining) <= 60_000;
+  return (
+    <div className={`mt-1.5 grid grid-cols-[auto_1fr] items-center gap-x-2 rounded border px-2 py-1 font-mono font-black tabular-nums ${
+      active === side && !paused
+        ? urgent ? "border-red-400/70 bg-red-500/20 text-red-200" : "border-sky-400/60 bg-sky-500/15 text-sky-100"
+        : "border-white/10 bg-black/20 text-slate-400"
+    }`}>
+      <span className="text-[9px] font-bold tracking-wide">{
+        matchKind === "Hex" ? "海克斯"
+          : matchKind === "RankedWild" ? "狂野排位"
+          : matchKind === "Ranked" ? "标准排位"
+            : matchKind === "CasualWild" ? "狂野休闲"
+              : matchKind === "CasualStandard" ? "标准休闲"
+                : "休闲"
+      }</span>
+      <span className="justify-self-end text-sm" aria-label={`本回合剩余 ${formatOperationTime(turnRemaining)}`}>
+        回合 {formatOperationTime(turnRemaining)}
+      </span>
+      <span className="col-span-2 justify-self-end text-[9px] font-bold opacity-75" aria-label={`总操作剩余 ${formatOperationTime(totalRemaining)}`}>
+        总计 {formatOperationTime(totalRemaining)}
+      </span>
+      {allowExtension && !rotateQuarterTurn && side === "my" && active === "my" && !paused && !extensionUsed && (
+        <button
+          type="button"
+          onClick={() => GameRequest.requestTurnExtension()}
+          className="col-span-2 mt-1 flex h-11 w-11 min-h-11 min-w-11 items-center justify-center justify-self-end rounded-full border border-amber-300/50 bg-amber-400/15 text-amber-100 transition-colors hover:bg-amber-400/25 focus-visible:outline-2 focus-visible:outline-amber-200"
+          aria-label="使用本局唯一一次回合加时，增加两分钟"
+          title="回合加时 +2:00"
+        >
+          <TurnExtensionIcon />
+        </button>
+      )}
+      {extensionUsed && (
+        <span className="col-span-2 justify-self-end text-[9px] font-bold text-amber-200/75">加时已用</span>
+      )}
+    </div>
   );
 }
 
@@ -277,14 +407,35 @@ export default function GameBoard({
 }) {
   const currentTurn = useGameStore((s) => s.currentTurn);
   const phase = useGameStore((s) => s.phase);
-  const turnCount = useGameStore((s) => s.turnCount);
   const isGameOver = useGameStore((s) => s.isGameOver);
+  const spectatorHandVisible = useGameStore((s) => s.spectatorHandVisible);
   const myName = useGameStore((s) => s.myName);
   const opponentName = useGameStore((s) => s.opponentName);
+  const mySeasonTitle = useGameStore((s) => snapshotSeasonTitle(s.my));
+  const opponentSeasonTitle = useGameStore((s) => snapshotSeasonTitle(s.opponent));
+  const myRankIdentity = useGameStore((s) => s.my?.rankIdentity);
+  const opponentRankIdentity = useGameStore((s) => s.opponent?.rankIdentity);
+  const myChampionLeaderNumber = useGameStore((s) => s.my?.championLeaderNumber);
+  const opponentChampionLeaderNumber = useGameStore((s) => s.opponent?.championLeaderNumber);
+  const selectedDonIndex = useGameStore((s) => s.selectedDonIndex);
+  const setSelectedDon = useGameStore((s) => s.setSelectedDon);
+  const cinematicPhase = useGameStore((s) => s.cinematic.phase);
 
   const viewportRef = useRef<HTMLDivElement>(null);
   const stageScale = useStageScale(STAGE_W, STAGE_H, viewportRef);
   const stageRef = useRef<HTMLDivElement>(null);
+
+  const handleBoardBlankClick = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (selectedDonIndex === null || !(event.target instanceof Element)) return;
+
+    // 卡牌、按钮等真实操作目标继续处理自身点击；只有牌桌空白区域取消待依附的咚。
+    const interactiveTarget = event.target.closest(
+      "button, a, input, textarea, select, [role='button'], [data-game-board-interactive='true']",
+    );
+    if (interactiveTarget) return;
+
+    setSelectedDon(null);
+  };
 
   return (
     <>
@@ -295,7 +446,11 @@ export default function GameBoard({
       <RevealOverlay />
 
       {/* 固定设计画布 + 整体等比缩放居中（scale-to-fit），保证任何宽高比下比例恒定、不裁切 */}
-      <div ref={viewportRef} className="absolute inset-0 z-10 flex items-center justify-center">
+      <div
+        ref={viewportRef}
+        className="absolute inset-0 z-10 flex items-center justify-center"
+        onClick={handleBoardBlankClick}
+      >
         <CardSizeOverride.Provider value="sm">
           <div
             ref={stageRef}
@@ -307,50 +462,62 @@ export default function GameBoard({
               transformOrigin: "center",
             }}
           >
-            <BattleRelationLayer />
-            <EffectActivationLayer />
-            <CardZoneTransitionLayer />
-            <div className="absolute inset-3 flex gap-3">
-              <LeftRail />
+            <div
+              data-game-cinematic-board
+              className={`absolute inset-0 ${cinematicPhase === "impact" ? "game-cinematic-board-impact" : ""}`}
+            >
+              <BattleRelationLayer />
+              <EffectActivationLayer />
+              <CardZoneTransitionLayer />
+              <div className="absolute inset-3 flex gap-3">
+                <LeftRail />
 
-              <main className="relative z-0 flex min-w-0 flex-1 flex-col gap-2">
-                <PlayerMat
-                  side="opponent"
+                <main className="relative z-0 flex min-w-0 flex-1 flex-col gap-2">
+                  <PlayerMat
+                    side="opponent"
+                    isObserver={isObserver}
+                    isPlayback={isPlayback}
+                    revealHands={isGameOver}
+                  />
+
+                  <PhaseTrack
+                    currentTurn={currentTurn}
+                    phase={phase}
+                  />
+
+                  <PlayerMat
+                    side="my"
+                    isObserver={isObserver}
+                    isPlayback={isPlayback}
+                    revealHands={isGameOver}
+                    revealObserverHand={isObserver && spectatorHandVisible}
+                  />
+                </main>
+
+                <RightRail
+                  myName={myName}
+                  opponentName={opponentName}
+                  mySeasonTitle={mySeasonTitle}
+                  opponentSeasonTitle={opponentSeasonTitle}
+                  myRankIdentity={myRankIdentity}
+                  opponentRankIdentity={opponentRankIdentity}
+                  myChampionLeaderNumber={myChampionLeaderNumber}
+                  opponentChampionLeaderNumber={opponentChampionLeaderNumber}
                   isObserver={isObserver}
                   isPlayback={isPlayback}
-                  revealHands={isGameOver}
                 />
-
-                <PhaseTrack
-                  currentTurn={currentTurn}
-                  phase={phase}
-                  turnCount={turnCount}
-                  live={!isObserver && !isPlayback}
-                />
-
-                <PlayerMat
-                  side="my"
-                  isObserver={isObserver}
-                  isPlayback={isPlayback}
-                  revealHands={isGameOver}
-                />
-              </main>
-
-              <RightRail
-                myName={myName}
-                opponentName={opponentName}
-                isObserver={isObserver}
-                isPlayback={isPlayback}
-                onOpenFeedback={onOpenFeedback}
-              />
+              </div>
             </div>
-
           </div>
         </CardSizeOverride.Provider>
       </div>
 
       {/* 局内聊天（固定屏幕角，不随画布缩放；回放模式内部自隐） */}
-      <GameChatPanel isPlayback={isPlayback} isObserver={isObserver} />
+      <GameChatPanel
+        isPlayback={isPlayback}
+        isObserver={isObserver}
+        onOpenFeedback={onOpenFeedback}
+      />
     </>
   );
 }

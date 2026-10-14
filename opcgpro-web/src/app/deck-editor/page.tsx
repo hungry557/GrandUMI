@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { loadAllCards, loadCardSet } from "@/data/CardLoader";
 import { getSelectedDeckName, loadDeck } from "@/data/DeckMapper";
 import { DEFAULT_SEARCH_SETS, ALL_SET_NAMES } from "@/data/cardSets";
@@ -100,15 +101,28 @@ export default function DeckEditorPage() {
 
   return (
     <div
-      className="relative flex h-screen flex-col overflow-hidden bg-gray-950 md:flex-row"
-      style={{ height: "100dvh" }}
+      data-deck-editor-page
+      className="relative box-border flex h-screen flex-col overflow-hidden bg-gray-950 transition-[padding] duration-200 md:flex-row"
+      style={{
+        height: "100dvh",
+        paddingTop: "max(var(--layout-safe-top, env(safe-area-inset-top)), var(--global-announcement-height, 0px))",
+      }}
     >
       {/* 手机竖屏主导航：牌池与卡组各自占满可用宽度，避免三栏互相挤压。 */}
       <nav
         data-deck-mobile-nav
-        className="grid h-12 shrink-0 grid-cols-[auto_1fr_1fr] border-b border-gray-800 bg-gray-950 md:hidden"
+        className="grid h-12 shrink-0 grid-cols-[auto_auto_1fr_1fr] border-b border-gray-800 bg-gray-950 md:hidden"
         aria-label="卡组编辑视图"
       >
+        <Link
+          href="/home"
+          data-deck-mobile-back
+          className="flex min-h-11 min-w-11 items-center justify-center border-r border-gray-800 px-2 text-sm text-gray-400 transition-colors hover:bg-gray-900 hover:text-white"
+          title="返回大厅"
+          aria-label="返回大厅"
+        >
+          ←
+        </Link>
         <button
           type="button"
           onClick={() => setMobileFiltersOpen(true)}
@@ -159,7 +173,7 @@ export default function DeckEditorPage() {
       </main>
       <aside
         data-deck-editor-panel
-        className={`${mobilePanel === "deck" ? "block" : "hidden"} min-h-0 min-w-0 flex-1 overflow-hidden border-gray-800 pb-[env(safe-area-inset-bottom)] md:block md:w-80 md:flex-none md:border-l`}
+        className={`${mobilePanel === "deck" ? "block" : "hidden"} min-h-0 min-w-0 flex-1 overflow-hidden border-gray-800 pb-[env(safe-area-inset-bottom)] md:block md:w-96 md:flex-none md:border-l`}
       >
         <DeckInfoPanel />
       </aside>

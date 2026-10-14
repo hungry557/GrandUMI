@@ -25,6 +25,8 @@ public class SpectatorPerspectiveTests
             snapshot.GetProperty("opponent").GetProperty("name").GetString());
         Assert.Empty(snapshot.GetProperty("my").GetProperty("handCardNumbers").EnumerateArray());
         Assert.Empty(snapshot.GetProperty("opponent").GetProperty("handCardNumbers").EnumerateArray());
+        Assert.Empty(snapshot.GetProperty("my").GetProperty("handCardIds").EnumerateArray());
+        Assert.Empty(snapshot.GetProperty("opponent").GetProperty("handCardIds").EnumerateArray());
     }
 
     [Fact]
@@ -45,6 +47,24 @@ public class SpectatorPerspectiveTests
         Assert.Equal(
             state.Players[0].Hand.Select(card => card.Info.Number),
             ReadStrings(snapshot.GetProperty("opponent").GetProperty("handCardNumbers")));
+    }
+
+    [Fact]
+    public void 观战快照_授权后仅公开主视角手牌()
+    {
+        var state = TestScene.MaxScenario();
+
+        var snapshot = JsonSerializer.SerializeToElement(StateSnapshotBuilder.Build(
+            state,
+            viewerIndex: -1,
+            spectatorPlayerIndex: 1,
+            revealSpectatorMainHand: true));
+
+        Assert.True(snapshot.GetProperty("spectatorHandVisible").GetBoolean());
+        Assert.Equal(
+            state.Players[1].Hand.Select(card => card.Info.Number),
+            ReadStrings(snapshot.GetProperty("my").GetProperty("handCardNumbers")));
+        Assert.Empty(snapshot.GetProperty("opponent").GetProperty("handCardNumbers").EnumerateArray());
     }
 
     [Fact]

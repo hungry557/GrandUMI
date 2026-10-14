@@ -1,6 +1,6 @@
 import type { CardData } from "@/types/card";
 import { CARD_SET_PATHS } from "./cardSets";
-import { DATA_VERSION } from "./dataVersion";
+import { fetchCardData } from "./fetchCardData";
 
 interface RawCardData {
   number: string;
@@ -30,8 +30,14 @@ const TYPE_MAP: Record<string, CardData["type"]> = {
 
 const cardCache = new Map<string, CardData>();
 
+function parseNumericField(value: string | number | undefined): number {
+  const parsed = Number(String(value ?? "").normalize("NFKC"));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 // 图片 manifest：cardNumber → 所有版本 URL（正画在 [0]）
 let imageManifest: Record<string, string[]> = {};
+let pendingCardNumbers = new Set<string>();
 let manifestLoaded = false;
 let manifestPromise: Promise<void> | null = null;
 
@@ -40,16 +46,26 @@ async function ensureManifest(): Promise<void> {
   // 记忆化 Promise：并发加载多个卡集时，manifest 只请求一次
   if (!manifestPromise) {
     manifestPromise = (async () => {
-      try {
-        const res = await fetch("/data/imageManifest.json");
-        if (res.ok) imageManifest = await res.json();
-      } catch {
-        // manifest 加载失败时降级：每张卡只有默认正画
+      const [images, availability] = await Promise.allSettled([
+        fetchCardData<Record<string, string[]>>("/data/imageManifest.json"),
+        fetchCardData<{ cards?: Array<{ number?: string; state?: string }> }>("/data/_playability.v1.json"),
+      ]);
+      if (images.status === "fulfilled") imageManifest = images.value;
+      if (availability.status === "fulfilled") {
+          const playability = availability.value;
+          pendingCardNumbers = new Set(
+            (playability.cards ?? [])
+              .filter((entry) => entry.state === "pending" && typeof entry.number === "string")
+              .map((entry) => entry.number!),
+          );
       }
-      manifestLoaded = true;
+      manifestLoaded = images.status === "fulfilled" && availability.status === "fulfilled";
+      if (!manifestLoaded) console.warn("部分卡牌资料暂不可用，已保留成功加载的资料并允许重试。");
     })();
   }
-  return manifestPromise;
+  const pending = manifestPromise;
+  await pending;
+  if (!manifestLoaded && manifestPromise === pending) manifestPromise = null;
 }
 
 function parseCard(raw: RawCardData): CardData {
@@ -62,15 +78,16 @@ function parseCard(raw: RawCardData): CardData {
     color: raw.color,
     type: (TYPE_MAP[raw.type] ?? raw.type) as CardData["type"],
     property: raw.property as CardData["property"],
-    power: Number(raw.power) || 0,
-    cost: Number(raw.cost) || 0,
+    power: parseNumericField(raw.power),
+    cost: parseNumericField(raw.cost),
     counter: (() => {
-      const v = raw.counter;
+      const v = String(raw.counter ?? "").normalize("NFKC");
       if (!v) return 0;
-      const match = String(v).match(/\+?(\d+)/);
+      const match = v.match(/\+?(\d+)/);
       return match ? parseInt(match[1], 10) : 0;
     })(),
-    keyWords: raw.keyWords ? raw.keyWords.split("/").filter(Boolean) : [],
+    // 与服务端卡表解析保持一致，不能把逗号连接的多个特征当成一个特征。
+    keyWords: raw.keyWords ? raw.keyWords.split(/[\/,，]/).map(keyword => keyword.trim()).filter(Boolean) : [],
     effectTags: raw.effectTags ?? [],
     abilities: raw.abilities ?? [],
     effectEvent: raw.effectEvent ?? "",
@@ -78,24 +95,35 @@ function parseCard(raw: RawCardData): CardData {
     image: raw.image,
     sprites,
     rarity: raw.rarity ?? "",
-    subscript: Number(raw.subscript) || 0,
+    subscript: parseNumericField(raw.subscript),
     trigger: raw.trigger ?? "",
+    playability: pendingCardNumbers.has(raw.number) ? "pending" : "playable",
   };
 }
 
-export async function loadCardSet(setName: string): Promise<CardData[]> {
+const cardSetPromises = new Map<string, Promise<CardData[]>>();
+
+export function loadCardSet(setName: string): Promise<CardData[]> {
+  const existing = cardSetPromises.get(setName);
+  if (existing) return existing;
   const path = CARD_SET_PATHS[setName];
-  if (!path) throw new Error(`未知卡集: ${setName}`);
+  if (!path) return Promise.reject(new Error(`未知卡集：${setName}`));
+  const pending = (async () => {
+    // 卡集本体与附属资料同时下载，避免一个慢清单阻止全部卡集请求。
+    const [raw] = await Promise.all([fetchCardData<RawCardData[]>(path), ensureManifest()]);
+    const cards = raw.map(parseCard);
+    cards.forEach((card) => cardCache.set(card.number, card));
+    return cards;
+  })();
+  cardSetPromises.set(setName, pending);
+  pending.catch(() => { if (cardSetPromises.get(setName) === pending) cardSetPromises.delete(setName); });
+  return pending;
+}
 
-  await ensureManifest();
-
-  const res = await fetch(path);
-  if (!res.ok) throw new Error(`加载卡集失败: ${setName} (${res.status})`);
-
-  const raw: RawCardData[] = await res.json();
-  const cards = raw.map(parseCard);
-  cards.forEach((c) => cardCache.set(c.number, c));
-  return cards;
+/** 只预加载当前卡组涉及的卡集，供匹配等待和准备界面复用。 */
+export async function preloadDeckCards(deck: string): Promise<void> {
+  const sets = new Set([...deck.matchAll(/\b([A-Z][A-Z0-9]*)-\d+/g)].map(match => match[1]));
+  await Promise.all([...sets].filter(set => set in CARD_SET_PATHS).map(loadCardSet));
 }
 
 /**
@@ -109,15 +137,23 @@ export function loadAllCards(): Promise<void> {
   // 记忆化：全量包只下载一次（对战页与卡组编辑器共享缓存，避免重复请求）
   if (allCardsPromise) return allCardsPromise;
   allCardsPromise = (async () => {
-    const res = await fetch(`/data/allCards.json?v=${DATA_VERSION}`);
-    if (!res.ok) throw new Error(`加载卡牌总包失败 (${res.status})`);
-
-    const bundle: { manifest?: Record<string, string[]>; cards: RawCardData[] } = await res.json();
+    const bundle: {
+      manifest?: Record<string, string[]>;
+      playability?: { cards?: Array<{ number?: string; state?: string }> };
+      cards: RawCardData[];
+    } = await fetchCardData("/data/allCards.json");
 
     // 单包自带 manifest，直接填充，避免再发一次 imageManifest.json 请求
     if (bundle.manifest) {
       imageManifest = bundle.manifest;
       manifestLoaded = true;
+    }
+    if (bundle.playability?.cards) {
+      pendingCardNumbers = new Set(
+        bundle.playability.cards
+          .filter((entry) => entry.state === "pending" && typeof entry.number === "string")
+          .map((entry) => entry.number!),
+      );
     }
 
     bundle.cards.map(parseCard).forEach((c) => cardCache.set(c.number, c));
